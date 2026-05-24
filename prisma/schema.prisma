@@ -1,0 +1,113 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum TonhubPaymentInvoiceStatus {
+  PENDING
+  PARTIAL
+  PAID
+  EXPIRED
+  CANCELLED
+  FAILED
+}
+
+model TonhubPaymentInvoice {
+  id                      String                     @id @default(cuid())
+  externalId              String?                    @unique
+  network                 String
+  asset                   String                     @default("TON")
+  fiatAmountCents         Int
+  fiatCurrency            String                     @default("EUR")
+  address                 String
+  addressRaw              String
+  addressStrategy         String                     @default("unique-address")
+  walletVersion           String
+  walletWorkchain         Int
+  walletContext           Int
+  walletNetworkGlobalId   Int
+  walletPublicKeyHash     String
+  amountNano              String
+  paidNano                String                     @default("0")
+  reference               String                     @unique
+  status                  TonhubPaymentInvoiceStatus @default(PENDING)
+  providerName            String                     @default("ton-direct")
+  observedTransactionHash String?                    @unique
+  observedAt              DateTime?
+  partialPaymentStartedAt DateTime?
+  partialPaymentExpiresAt DateTime?
+  expiresAt               DateTime?
+  priceLockedAt           DateTime?
+  priceLockedUntil        DateTime?
+  observedPayments        Json?
+  createdAt               DateTime                   @default(now())
+  updatedAt               DateTime                   @updatedAt
+  metadata                Json?
+  payload                 Json?
+  depositAddress          TonhubDepositAddress?
+  transactions            TonhubPaymentTransaction[]
+
+  @@index([network, address, status])
+  @@index([network, status, createdAt])
+  @@index([status, expiresAt])
+  @@index([status, priceLockedUntil])
+  @@index([status, partialPaymentExpiresAt])
+}
+
+model TonhubDepositAddress {
+  id                    String   @id @default(cuid())
+  invoiceId             String?  @unique
+  network               String
+  address               String   @unique
+  addressRaw            String
+  walletVersion         String
+  walletWorkchain       Int
+  walletContext         Int
+  walletNetworkGlobalId Int
+  walletPublicKeyHash   String
+  invoiceKind           String   @default("tonhub-payment")
+  status                String   @default("RESERVED")
+  createdAt             DateTime @default(now())
+  updatedAt             DateTime @updatedAt
+  assignedAt            DateTime?
+  paidAt                DateTime?
+  sweepStatus           String   @default("NOT_STARTED")
+  sweepAmountNano       String?
+  sweepReserveNano      String?
+  sweepRecipientAddress String?
+  sweepTransactionHash  String?
+  sweepSeqno            Int?
+  sweepStartedAt        DateTime?
+  sweepSentAt           DateTime?
+  sweepConfirmedAt      DateTime?
+  sweepLastError        String?
+  sweepAttempts         Int      @default(0)
+  invoice               TonhubPaymentInvoice? @relation(fields: [invoiceId], references: [id], onDelete: SetNull)
+
+  @@unique([network, walletVersion, walletPublicKeyHash, walletContext])
+  @@index([network, status, createdAt])
+  @@index([network, sweepStatus, paidAt])
+  @@index([invoiceKind, status])
+  @@index([sweepStatus, updatedAt])
+}
+
+model TonhubPaymentTransaction {
+  id                    String                  @id @default(cuid())
+  invoiceId             String
+  providerName          String                  @default("ton-direct")
+  providerTransactionId String?
+  status                TonhubPaymentInvoiceStatus
+  amountNano            String
+  asset                 String                  @default("TON")
+  payload               Json?
+  createdAt             DateTime                @default(now())
+  invoice               TonhubPaymentInvoice    @relation(fields: [invoiceId], references: [id], onDelete: Cascade)
+
+  @@index([invoiceId])
+  @@index([providerTransactionId])
+}
+

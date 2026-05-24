@@ -1,0 +1,48 @@
+{
+  "name": "tonhub-payments",
+  "version": "0.1.0",
+  "type": "module",
+  "private": false,
+  "exports": {
+    "./frontend": "./frontend/src/index.ts",
+    "./frontend/styles.css": "./frontend/src/styles.css",
+    "./backend": "./backend/src/app.ts",
+    "./worker/sweep": "./worker/src/sweep.ts"
+  },
+  "overrides": {
+    "axios": "^1.15.2"
+  },
+  "scripts": {
+    "dev": "vite --config vite.config.ts",
+    "backend:dev": "bun run backend/src/server.ts",
+    "backend:start": "bun run backend/src/server.ts",
+    "worker:sweep": "bun run worker/src/sweep-worker.ts",
+    "db:generate": "prisma generate",
+    "db:migrate": "prisma migrate dev",
+    "db:migrate:deploy": "prisma migrate deploy",
+    "db:push": "prisma db push",
+    "typecheck": "tsc --noEmit",
+    "test": "tsx tests/tonhub-payments.test.ts",
+    "build": "vite build --config vite.config.ts",
+    "preview": "vite preview --config vite.config.ts"
+  },
+  "dependencies": {
+    "@prisma/client": "^5.22.0",
+    "@ton/core": "^0.63.1",
+    "@ton/ton": "16.2.2",
+    "hono": "^4.12.15",
+    "react": "^19.2.0",
+    "react-dom": "^19.2.0",
+    "zod": "^3.24.1"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.2",
+    "@types/react": "^19.2.14",
+    "@types/react-dom": "^19.2.3",
+    "@vitejs/plugin-react": "^6.0.1",
+    "prisma": "^5.22.0",
+    "tsx": "^4.19.2",
+    "typescript": "^5.7.2",
+    "vite": "^8.0.10"
+  }
+}
