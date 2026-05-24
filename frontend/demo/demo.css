@@ -1,0 +1,18 @@
+html,
+body,
+#root {
+  min-height: 100%;
+}
+
+body {
+  margin: 0;
+  background: #070707;
+}
+
+.tonhub-payment-demo {
+  display: grid;
+  min-height: 100vh;
+  place-items: center;
+  padding: clamp(18px, 5vw, 56px);
+  background: #070707;
+}

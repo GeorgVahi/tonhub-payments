@@ -1,4 +1,11 @@
 import { useEffect, useMemo, useState } from "react";
+import {
+  AlertTriangle,
+  CheckCircle2,
+  Clock3,
+  XCircle,
+  type LucideIcon
+} from "lucide-react";
 import { createTonQrSvg } from "./createTonQrSvg";
 import {
   copyableTonAmount,
@@ -8,6 +15,14 @@ import {
 type TonNetwork = "testnet" | "mainnet";
 type FiatCurrency = "EUR" | "USD";
 type InvoiceStatus = "PENDING" | "PARTIAL" | "PAID" | "EXPIRED" | "CANCELLED" | "FAILED";
+type NoticeTone = "info" | "success" | "warning" | "error";
+
+type WidgetNotice = {
+  tone: NoticeTone;
+  title: string;
+  message: string;
+  code?: string;
+};
 
 type TonhubInvoice = {
   id: string;
@@ -54,10 +69,21 @@ export type TonhubPaymentWidgetProps = {
 const statusLabels: Record<InvoiceStatus, string> = {
   PENDING: "Waiting for payment",
   PARTIAL: "Partially paid",
-  PAID: "Paid",
+  PAID: "Payment successful",
   EXPIRED: "Expired",
   CANCELLED: "Cancelled",
   FAILED: "Failed"
+};
+
+const errorMessages: Record<string, string> = {
+  INVALID_INVOICE_REQUEST: "Check the amount, currency, and network, then try again.",
+  TON_INVOICE_CREATE_FAILED: "We could not create a TON invoice right now. Check the payment configuration and try again.",
+  TON_INVOICE_NOT_FOUND: "This invoice could not be found. Create a new invoice and try again.",
+  TON_INVOICE_NOT_PAYABLE: "This invoice is no longer payable. Create a new invoice to continue.",
+  TON_INVOICE_EXPIRED: "The payment window has expired. Create a new invoice to get a fresh rate.",
+  TON_INVOICE_NETWORK_INVALID: "The invoice network is not available for this checkout.",
+  TON_INVOICE_CHECK_FAILED: "We could not check the blockchain status right now. Try again in a moment.",
+  TON_RATE_UNAVAILABLE: "The TON exchange rate is unavailable right now. Try again in a moment."
 };
 
 function normalizeApiBase(apiBase: string) {
@@ -76,6 +102,85 @@ function isPayable(status: InvoiceStatus) {
   return status === "PENDING" || status === "PARTIAL";
 }
 
+function readableApiMessage(error: string | undefined, errorCode: string | undefined, fallback: string) {
+  if (errorCode && errorMessages[errorCode]) {
+    return errorMessages[errorCode];
+  }
+
+  const trimmed = error?.trim();
+  if (trimmed && !/^[A-Z0-9_]+$/.test(trimmed)) {
+    return trimmed;
+  }
+
+  return fallback;
+}
+
+function errorNotice(input: {
+  title: string;
+  fallback: string;
+  error?: string;
+  errorCode?: string;
+}): WidgetNotice {
+  return {
+    tone: "error",
+    title: input.title,
+    message: readableApiMessage(input.error, input.errorCode, input.fallback),
+    code: input.errorCode
+  };
+}
+
+function formatDateTime(value: string | null) {
+  if (!value) {
+    return "None";
+  }
+
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) {
+    return "None";
+  }
+
+  return date.toLocaleString();
+}
+
+function terminalState(invoice: TonhubInvoice): {
+  tone: Exclude<NoticeTone, "info">;
+  icon: LucideIcon;
+  title: string;
+  message: string;
+} {
+  switch (invoice.status) {
+    case "PAID":
+      return {
+        tone: "success",
+        icon: CheckCircle2,
+        title: "Payment successful",
+        message: "Your TON payment has been confirmed. The invoice is settled and ready to continue."
+      };
+    case "EXPIRED":
+      return {
+        tone: "warning",
+        icon: Clock3,
+        title: "Invoice expired",
+        message: "The locked rate window ended before the full payment arrived. Create a new invoice to continue."
+      };
+    case "CANCELLED":
+      return {
+        tone: "warning",
+        icon: XCircle,
+        title: "Invoice cancelled",
+        message: "This invoice is no longer active. Create a new invoice to start a fresh payment."
+      };
+    case "FAILED":
+    default:
+      return {
+        tone: "error",
+        icon: AlertTriangle,
+        title: "Payment failed",
+        message: "The payment could not be completed for this invoice. Create a new invoice or contact support."
+      };
+  }
+}
+
 export function TonhubPaymentWidget({
   apiBase = "/api/tonhub-payments",
   initialAmount = "10.00",
@@ -91,7 +196,7 @@ export function TonhubPaymentWidget({
   const [network, setNetwork] = useState<TonNetwork>(initialNetwork ?? "testnet");
   const [allowedNetworks, setAllowedNetworks] = useState<TonNetwork[]>(["testnet", "mainnet"]);
   const [invoice, setInvoice] = useState<TonhubInvoice | null>(null);
-  const [notice, setNotice] = useState("");
+  const [notice, setNotice] = useState<WidgetNotice | null>(null);
   const [busy, setBusy] = useState(false);
 
   useEffect(() => {
@@ -130,7 +235,7 @@ export function TonhubPaymentWidget({
 
   async function createInvoice() {
     setBusy(true);
-    setNotice("");
+    setNotice(null);
 
     try {
       const response = await fetch(`${base}/invoices`, {
@@ -148,18 +253,31 @@ export function TonhubPaymentWidget({
       });
       const body = (await response.json().catch(() => ({}))) as {
         invoice?: TonhubInvoice;
+        finalized?: boolean;
         error?: string;
         errorCode?: string;
       };
 
       if (!response.ok || !body.invoice) {
-        setNotice(body.error || body.errorCode || "Unable to create invoice.");
+        setNotice(errorNotice({
+          title: "Invoice was not created",
+          fallback: "Unable to create invoice.",
+          error: body.error,
+          errorCode: body.errorCode
+        }));
         return;
       }
 
       setInvoice(body.invoice);
+      if (body.finalized || body.invoice.status === "PAID") {
+        onPaid?.(body.invoice);
+      }
     } catch {
-      setNotice("Unable to create invoice.");
+      setNotice({
+        tone: "error",
+        title: "Invoice was not created",
+        message: "The payment service did not respond. Check your connection and try again."
+      });
     } finally {
       setBusy(false);
     }
@@ -172,7 +290,7 @@ export function TonhubPaymentWidget({
 
     if (!options.quiet) {
       setBusy(true);
-      setNotice("");
+      setNotice(null);
     }
 
     try {
@@ -186,23 +304,48 @@ export function TonhubPaymentWidget({
         errorCode?: string;
       };
 
-      if (!response.ok || !body.invoice) {
+      if (!body.invoice) {
         if (!options.quiet) {
-          setNotice(body.error || body.errorCode || "Unable to check invoice.");
+          setNotice(errorNotice({
+            title: "Payment status unavailable",
+            fallback: "Unable to check invoice.",
+            error: body.error,
+            errorCode: body.errorCode
+          }));
         }
         return;
       }
 
       setInvoice(body.invoice);
+      if (!response.ok) {
+        if (!options.quiet) {
+          setNotice(errorNotice({
+            title: "Payment status unavailable",
+            fallback: "Unable to check invoice.",
+            error: body.error,
+            errorCode: body.errorCode
+          }));
+        }
+        return;
+      }
+
       if (body.finalized || body.invoice.status === "PAID") {
-        setNotice("Payment confirmed.");
+        setNotice(null);
         onPaid?.(body.invoice);
       } else if (!options.quiet) {
-        setNotice("Payment is not complete yet.");
+        setNotice({
+          tone: "info",
+          title: "Payment is still pending",
+          message: "No complete matching transfer was found yet. Keep the wallet transaction open and check again shortly."
+        });
       }
     } catch {
       if (!options.quiet) {
-        setNotice("Unable to check invoice.");
+        setNotice({
+          tone: "error",
+          title: "Payment status unavailable",
+          message: "The payment service did not respond. Check your connection and try again."
+        });
       }
     } finally {
       if (!options.quiet) {
@@ -211,8 +354,15 @@ export function TonhubPaymentWidget({
     }
   }
 
-  const qrSvg = invoice ? createTonQrSvg(invoice.deeplink, "dark-on-light") : null;
-  const terminal = invoice && !isPayable(invoice.status);
+  function resetInvoice() {
+    setInvoice(null);
+    setNotice(null);
+  }
+
+  const qrSvg = invoice ? createTonQrSvg(invoice.deeplink, "light-on-dark") : null;
+  const terminal = invoice ? !isPayable(invoice.status) : false;
+  const result = invoice && terminal ? terminalState(invoice) : null;
+  const ResultIcon = result?.icon;
 
   return (
     <section className="tonhub-payment-widget" data-tonhub-payment-widget>
@@ -302,17 +452,26 @@ export function TonhubPaymentWidget({
             ) : null}
             <div>
               <span>Locked until</span>
-              <strong>{invoice.priceLockedUntil ? new Date(invoice.priceLockedUntil).toLocaleString() : "None"}</strong>
+              <strong>{formatDateTime(invoice.priceLockedUntil)}</strong>
             </div>
           </div>
 
           {qrSvg && isPayable(invoice.status) ? (
             <div className="tonhub-payment-widget__paybox">
-              <div
-                className="tonhub-payment-widget__qr"
-                aria-hidden="true"
-                dangerouslySetInnerHTML={{ __html: qrSvg }}
-              />
+              <div className="tonhub-payment-widget__paybox-header">
+                <div>
+                  <span>Wallet checkout</span>
+                  <strong>{invoice.status === "PARTIAL" ? "Finish the remaining payment" : "Scan to pay"}</strong>
+                </div>
+                <span className="tonhub-payment-widget__status-pill">{statusLabels[invoice.status]}</span>
+              </div>
+              <div className="tonhub-payment-widget__qr-shell">
+                <div
+                  className="tonhub-payment-widget__qr"
+                  aria-hidden="true"
+                  dangerouslySetInnerHTML={{ __html: qrSvg }}
+                />
+              </div>
               <TonManualTransferFields
                 address={invoice.address}
                 amount={invoice.amountTon}
@@ -336,16 +495,48 @@ export function TonhubPaymentWidget({
             </div>
           ) : null}
 
-          {terminal ? (
-            <p className="tonhub-payment-widget__terminal">{statusLabels[invoice.status]}</p>
+          {result ? (
+            <div className={`tonhub-payment-widget__result tonhub-payment-widget__result--${result.tone}`}>
+              <div className="tonhub-payment-widget__result-icon" aria-hidden="true">
+                {ResultIcon ? <ResultIcon /> : null}
+              </div>
+              <h3>{result.title}</h3>
+              <p>{result.message}</p>
+              <div className="tonhub-payment-widget__result-details">
+                <div>
+                  <span>Amount</span>
+                  <strong>{invoice.fiatAmountFormatted}</strong>
+                </div>
+                <div>
+                  <span>TON total</span>
+                  <strong>{invoice.expectedAmountTon}</strong>
+                </div>
+                <div>
+                  <span>Network</span>
+                  <strong>{invoice.network}</strong>
+                </div>
+                <div>
+                  <span>Invoice</span>
+                  <strong>{invoice.externalId || invoice.id}</strong>
+                </div>
+              </div>
+              <button className="tonhub-payment-widget__primary" type="button" onClick={resetInvoice}>
+                Create another invoice
+              </button>
+            </div>
           ) : null}
         </div>
       ) : null}
 
       {notice ? (
-        <p className="tonhub-payment-widget__notice" role="status">
-          {notice}
-        </p>
+        <div
+          className={`tonhub-payment-widget__notice tonhub-payment-widget__notice--${notice.tone}`}
+          role={notice.tone === "error" ? "alert" : "status"}
+        >
+          <strong>{notice.title}</strong>
+          <span>{notice.message}</span>
+          {notice.code ? <code>{notice.code}</code> : null}
+        </div>
       ) : null}
     </section>
   );
