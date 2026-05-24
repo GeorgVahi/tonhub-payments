@@ -35,6 +35,18 @@ npm run dev
 The API listens on `http://localhost:3008`; the Vite demo proxies `/api/**` to
 that API and runs on `http://localhost:5173`.
 
+For a full local payment flow, run three runtimes:
+
+```bash
+npm run backend:dev
+npm run dev
+npm run worker:sweep -- --network=testnet --watch --interval-seconds=15
+```
+
+The frontend and backend are enough to create invoices and detect payments, but
+they do not sweep funds to the main wallet. The sweep worker must be running for
+paid deposit-wallet balances to move to `TON_*_SWEEP_RECIPIENT_ADDRESS`.
+
 ## Environment
 
 `.env.example` contains separate placeholders for testnet and mainnet:
@@ -81,6 +93,52 @@ The server returns `PENDING`, `PARTIAL`, `PAID`, `EXPIRED`, `CANCELLED`, or
 `FAILED`. A partial payment keeps the same address and creates a remaining
 amount until `TON_PARTIAL_PAYMENT_TTL_HOURS` expires.
 
+## Payment Flow
+
+This module uses unique-address direct TON payments:
+
+1. The backend creates one TON V5R1 deposit wallet address per invoice. The
+   address is derived from the configured deposit public key plus invoice wallet
+   context metadata stored in PostgreSQL.
+2. The frontend shows that invoice-specific address as a QR/deeplink and polls
+   the backend.
+3. The backend checks TON Center for incoming transfers to the invoice address.
+   When the expected amount is observed, it marks the invoice `PAID` and marks
+   the related deposit address `PAID`.
+4. The sweep worker queries PostgreSQL for `PAID` deposit addresses with
+   `sweepStatus` `NOT_STARTED` or retryable `FAILED`, reconstructs the matching
+   V5R1 wallet from the stored metadata and worker secret key, and sends
+   `balance - TON_SWEEP_RESERVE_NANO` to `TON_*_SWEEP_RECIPIENT_ADDRESS`.
+
+The worker does not independently scan every known address on-chain. It only
+sweeps addresses that the backend has already marked `PAID`, so invoice polling
+or an explicit `POST /api/tonhub-payments/invoices/:id/check` must happen before
+the sweep candidate exists.
+
+Current sweep state is stored on `TonhubDepositAddress`. A successful broadcast
+sets `sweepStatus` to `SENT` and stores `sweepAmountNano`, `sweepReserveNano`,
+`sweepRecipientAddress`, `sweepSeqno`, and `sweepSentAt`. The current worker
+does not persist a transaction hash or advance `SENT` to on-chain
+`CONFIRMED`.
+
+## Database Schema
+
+The Prisma schema is intentionally small and standalone:
+
+- `TonhubPaymentInvoice` stores the invoice lifecycle, fiat amount, locked TON
+  amount, invoice address, payment status, observed payment metadata, expiration
+  windows, and optional application metadata.
+- `TonhubDepositAddress` stores the generated unique wallet address and the V5R1
+  reconstruction metadata: workchain, wallet context, network global id, and
+  public-key hash. It also stores sweep state and the main-wallet recipient used
+  by the worker.
+- `TonhubPaymentTransaction` stores invoice transaction records for observed
+  payment transitions.
+
+Each invoice has at most one `TonhubDepositAddress`; the deposit address can be
+reconstructed only when the worker's secret key matches the public-key hash
+stored with that address.
+
 ## Frontend
 
 ```tsx
@@ -120,6 +178,10 @@ npm run worker:sweep -- --network=all --watch --interval-seconds=15
 
 The worker signs from paid unique deposit wallets and sends
 `balance - TON_SWEEP_RESERVE_NANO` to the configured recipient address.
+
+Keep the worker running in any environment where paid invoices should be swept
+automatically. Running only the API and frontend leaves funds on the
+invoice-specific deposit addresses until the worker is started.
 
 ## Validation
 
