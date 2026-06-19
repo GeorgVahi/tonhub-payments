@@ -6,6 +6,7 @@ import {
 } from "../payments";
 import { parseFiatCurrency, resolveAllowedNetworks, resolveDefaultNetwork } from "../config";
 import { fetchTonFiatRate } from "../rates";
+import { gramAsset } from "../ton/direct-payments";
 
 export function createTonhubPaymentRoutes() {
   const app = new Hono();
@@ -38,6 +39,7 @@ export function createTonhubPaymentRoutes() {
         rate: {
           source: rate.source,
           currency: rate.currency,
+          fiatPerGram: rate.fiatPerTon,
           fiatPerTon: rate.fiatPerTon,
           updatedAt: rate.updatedAt?.toISOString() ?? null,
           fetchedAt: rate.fetchedAt.toISOString()
@@ -47,7 +49,7 @@ export function createTonhubPaymentRoutes() {
       return context.json(
         {
           errorCode: "TON_RATE_UNAVAILABLE",
-          error: error instanceof Error ? error.message : "Unable to fetch TON rate."
+          error: error instanceof Error ? error.message : `Unable to fetch ${gramAsset.label} rate.`
         },
         503
       );

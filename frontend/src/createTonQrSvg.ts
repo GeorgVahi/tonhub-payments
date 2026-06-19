@@ -483,7 +483,7 @@ export function createTonQrSvg(payload: string, tone: TonQrTone = "dark-on-light
     .join("");
 
   return [
-    `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ${viewSize} ${viewSize}" role="img" aria-label="TON payment QR" class="tonhub-qr-svg ${toneClass}">`,
+    `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ${viewSize} ${viewSize}" role="img" aria-label="GRAM (ex TON) payment QR" class="tonhub-qr-svg ${toneClass}">`,
     `<rect width="${viewSize}" height="${viewSize}" rx="2.2" ry="2.2" class="tonhub-qr-bg-fill"/>`,
     `<g class="tonhub-qr-fg-fill">${finders}${dataDots}</g>`,
     "</svg>"

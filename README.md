@@ -1,9 +1,9 @@
 # Tonhub Payments
 
-Portable TON direct-payment module extracted from an existing production-style TON payment flow.
+Portable GRAM (ex TON) direct-payment module extracted from an existing production-style TON network payment flow.
 
 The module creates a unique TON V5R1 deposit wallet for each invoice, locks a
-live TON/EUR or TON/USD quote, exposes a QR/deeplink payment UI, verifies
+live GRAM/EUR or GRAM/USD quote, exposes a QR/deeplink payment UI, verifies
 incoming transfers server-side, supports partial payments with a separate time
 window, and includes a sweep worker that moves paid deposit balances to a main
 wallet.
@@ -95,7 +95,7 @@ amount until `TON_PARTIAL_PAYMENT_TTL_HOURS` expires.
 
 ## Payment Flow
 
-This module uses unique-address direct TON payments:
+This module uses unique-address direct GRAM (ex TON) payments on the TON network:
 
 1. The backend creates one TON V5R1 deposit wallet address per invoice. The
    address is derived from the configured deposit public key plus invoice wallet
@@ -125,9 +125,9 @@ does not persist a transaction hash or advance `SENT` to on-chain
 
 The Prisma schema is intentionally small and standalone:
 
-- `TonhubPaymentInvoice` stores the invoice lifecycle, fiat amount, locked TON
-  amount, invoice address, payment status, observed payment metadata, expiration
-  windows, and optional application metadata.
+- `TonhubPaymentInvoice` stores the invoice lifecycle, fiat amount, locked GRAM
+  (ex TON) amount, invoice address, payment status, observed payment metadata,
+  expiration windows, and optional application metadata.
 - `TonhubDepositAddress` stores the generated unique wallet address and the V5R1
   reconstruction metadata: workchain, wallet context, network global id, and
   public-key hash. It also stores sweep state and the main-wallet recipient used

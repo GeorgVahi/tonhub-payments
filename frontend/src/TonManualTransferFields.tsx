@@ -56,7 +56,7 @@ async function copyWithFallback(value: string) {
 }
 
 export function copyableTonAmount(value: string) {
-  return value.replace(/\s*TON$/i, "").trim();
+  return value.replace(/\s*(?:GRAM\s*\(ex\s*TON\)|GRAM|TON)$/i, "").trim();
 }
 
 export function TonManualTransferFields({

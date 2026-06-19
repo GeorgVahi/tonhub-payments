@@ -6,6 +6,7 @@ export type TonhubPaymentStatus = "PENDING" | "PARTIAL" | "PAID" | "EXPIRED" | "
 export type TonhubObservedPayment = {
   transactionId: string;
   amountNano: string;
+  amountGram: string;
   amountTon: string;
   createdAt: string | null;
   status: TonInvoiceMatch["status"];
@@ -17,8 +18,10 @@ export type TonhubRateQuote = {
   fiatAmountCents: number;
   fiatAmount: number;
   fiatCurrency: FiatCurrency;
+  fiatPerGram: number;
   fiatPerTon: number;
   amountNano: string;
+  amountGram: string;
   amountTon: string;
   updatedAt: Date | null;
   fetchedAt: Date;

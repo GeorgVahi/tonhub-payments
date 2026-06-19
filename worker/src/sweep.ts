@@ -498,7 +498,7 @@ export async function sweepTonDepositAddress(input: {
     const amountNano = balanceNano - input.config.reserveNano;
 
     if (amountNano <= BigInt(0) || amountNano < input.config.minSweepNano) {
-      const error = `TON deposit balance ${formatNanoTon(balanceNano.toString())} does not exceed sweep reserve ${formatNanoTon(input.config.reserveNano.toString())}.`;
+      const error = `GRAM (ex TON) deposit balance ${formatNanoTon(balanceNano.toString())} does not exceed sweep reserve ${formatNanoTon(input.config.reserveNano.toString())}.`;
       await repository.markSweepFailed({
         id: claimed.id,
         error,

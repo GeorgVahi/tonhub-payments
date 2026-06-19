@@ -1,4 +1,5 @@
 import type { FiatCurrency } from "./config";
+import { gramAsset } from "./ton/direct-payments";
 
 export type TonFiatRate = {
   source: "coingecko";
@@ -40,7 +41,7 @@ export async function fetchTonFiatRate(
   });
 
   if (!response.ok) {
-    throw new Error(`CoinGecko TON/${currency} request failed: ${response.status}`);
+    throw new Error(`CoinGecko ${gramAsset.symbol}/${currency} request failed: ${response.status}`);
   }
 
   const body = await response.json().catch(() => null) as {
@@ -50,7 +51,7 @@ export async function fetchTonFiatRate(
   const price = token?.[currency.toLowerCase()];
 
   if (typeof price !== "number" || !Number.isFinite(price) || price <= 0) {
-    throw new Error(`CoinGecko TON/${currency} response did not include a valid price.`);
+    throw new Error(`CoinGecko ${gramAsset.symbol}/${currency} response did not include a valid price.`);
   }
 
   const lastUpdatedAt = token?.last_updated_at;
@@ -83,7 +84,7 @@ export function ceilTonAmountNanoFromFiat(input: {
   const amountNano = Math.ceil((input.amountCents * 10_000_000) / input.fiatPerTon);
 
   if (!Number.isFinite(amountNano) || amountNano <= 0) {
-    throw new Error("Unable to calculate TON amount from fiat price.");
+    throw new Error(`Unable to calculate ${gramAsset.label} amount from fiat price.`);
   }
 
   return BigInt(amountNano).toString();

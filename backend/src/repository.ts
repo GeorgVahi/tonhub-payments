@@ -5,7 +5,7 @@ import type {
   TonhubPaymentInvoiceRecord,
   TonhubRateQuote
 } from "./types";
-import type { TonNetwork } from "./ton/direct-payments";
+import { gramAsset, type TonNetwork } from "./ton/direct-payments";
 
 type PrismaLike = {
   $transaction: <T>(handler: (tx: any) => Promise<T>) => Promise<T>;
@@ -96,7 +96,7 @@ export const prismaTonhubPaymentRepository: TonhubPaymentRepository = {
         data: {
           externalId: input.externalId || null,
           network: input.network,
-          asset: "TON",
+          asset: gramAsset.symbol,
           fiatAmountCents: input.amountCents,
           fiatCurrency: input.currency,
           address: input.depositAddress.address,
@@ -238,7 +238,7 @@ export const prismaTonhubPaymentRepository: TonhubPaymentRepository = {
           providerTransactionId: input.transactionId,
           status: "PAID",
           amountNano: input.paidNano,
-          asset: "TON",
+          asset: gramAsset.symbol,
           payload: toInputJson({
             observedPayments: input.observedPayments
           })

@@ -26,7 +26,7 @@ process.env.TON_DEFAULT_NETWORK = "testnet";
 process.env.TON_INVOICE_REFERENCE_PREFIX = "TESTPAY";
 
 assert.equal(parseTonAmountToNano("0.01"), "10000000");
-assert.equal(formatNanoTon("1234567890"), "1.23456789 TON");
+assert.equal(formatNanoTon("1234567890"), "1.23456789 GRAM (ex TON)");
 
 const deeplink = buildTonTransferLink({
   address: "EQ_TEST_ADDRESS",
@@ -83,7 +83,7 @@ const repository: TonhubPaymentRepository = {
       id: "tonhub-invoice-1",
       externalId: input.externalId || null,
       network: input.network,
-      asset: "TON",
+      asset: "GRAM",
       fiatAmountCents: input.amountCents,
       fiatCurrency: input.currency,
       address: input.depositAddress.address,
@@ -182,6 +182,7 @@ const created = await createTonhubPaymentInvoice(
 );
 assert.equal(created.status, 200);
 assert.equal((created.body.invoice as { amountNano: string }).amountNano, "2000000000");
+assert.equal((created.body.invoice as { amountGram: string }).amountGram, "2 GRAM (ex TON)");
 assert.equal((created.body.invoice as { fiatCurrency: string }).fiatCurrency, "USD");
 assert.equal((created.body.invoice as { network: string }).network, "testnet");
 assert.equal((created.body.invoice as { address: string }).address, depositAddress.address);
@@ -235,4 +236,4 @@ const depositMatches = findTonDepositAddressPayments({
 });
 assert.equal(depositMatches.length, 2);
 
-console.log("ok - tonhub-payments creates unique-address TON invoices and settles partial/full payments");
+console.log("ok - tonhub-payments creates unique-address GRAM (ex TON) invoices and settles partial/full payments");

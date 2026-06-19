@@ -14,6 +14,7 @@ import {
   fetchTonTransactions,
   findTonInvoicePayments,
   formatNanoTon,
+  gramAsset,
   maskValue,
   parseTonNetwork,
   type TonCenterTransactionsResponse,
@@ -148,11 +149,13 @@ function compareMatchesByCreatedAt(left: TonInvoiceMatch, right: TonInvoiceMatch
 
 function observedPayment(match: TonInvoiceMatch): TonhubObservedPayment {
   const transactionId = transactionIdentity(match) || `${match.createdAt ?? "unknown"}:${match.amountNano}`;
+  const amountFormatted = formatNanoTon(match.amountNano);
 
   return {
     transactionId,
     amountNano: match.amountNano,
-    amountTon: formatNanoTon(match.amountNano),
+    amountGram: amountFormatted,
+    amountTon: amountFormatted,
     createdAt: match.createdAt,
     status: match.status,
     comment: match.comment ?? ""
@@ -189,10 +192,13 @@ function normalizeStoredObservedPayment(value: unknown): TonhubObservedPayment |
     return null;
   }
 
+  const amountFormatted = formatNanoTon(amountNano);
+
   return {
     transactionId,
     amountNano,
-    amountTon: typeof value.amountTon === "string" ? value.amountTon : formatNanoTon(amountNano),
+    amountGram: amountFormatted,
+    amountTon: amountFormatted,
     createdAt: typeof value.createdAt === "string" ? value.createdAt : null,
     status: "observed",
     comment: typeof value.comment === "string" ? value.comment : ""
@@ -256,9 +262,12 @@ function extractQuote(invoice: TonhubPaymentInvoiceRecord): TonhubRateQuote | nu
   const fiatAmountCents = typeof quote.fiatAmountCents === "number" ? quote.fiatAmountCents : null;
   const fiatAmount = typeof quote.fiatAmount === "number" ? quote.fiatAmount : null;
   const fiatCurrency = quote.fiatCurrency === "EUR" || quote.fiatCurrency === "USD" ? quote.fiatCurrency : null;
-  const fiatPerTon = typeof quote.fiatPerTon === "number" ? quote.fiatPerTon : null;
+  const fiatPerGram = typeof quote.fiatPerGram === "number"
+    ? quote.fiatPerGram
+    : typeof quote.fiatPerTon === "number"
+      ? quote.fiatPerTon
+      : null;
   const amountNano = typeof quote.amountNano === "string" ? quote.amountNano : null;
-  const amountTon = typeof quote.amountTon === "string" ? quote.amountTon : null;
   const updatedAt = typeof quote.updatedAt === "string" && quote.updatedAt ? new Date(quote.updatedAt) : null;
   const fetchedAt = typeof quote.fetchedAt === "string" ? new Date(quote.fetchedAt) : null;
 
@@ -266,9 +275,8 @@ function extractQuote(invoice: TonhubPaymentInvoiceRecord): TonhubRateQuote | nu
     fiatAmountCents === null ||
     fiatAmount === null ||
     !fiatCurrency ||
-    fiatPerTon === null ||
+    fiatPerGram === null ||
     !amountNano ||
-    !amountTon ||
     !fetchedAt ||
     Number.isNaN(fetchedAt.getTime()) ||
     (updatedAt && Number.isNaN(updatedAt.getTime()))
@@ -276,14 +284,18 @@ function extractQuote(invoice: TonhubPaymentInvoiceRecord): TonhubRateQuote | nu
     return null;
   }
 
+  const amountFormatted = formatNanoTon(amountNano);
+
   return {
     source: "coingecko",
     fiatAmountCents,
     fiatAmount,
     fiatCurrency,
-    fiatPerTon,
+    fiatPerGram,
+    fiatPerTon: fiatPerGram,
     amountNano,
-    amountTon,
+    amountGram: amountFormatted,
+    amountTon: amountFormatted,
     updatedAt,
     fetchedAt
   };
@@ -296,8 +308,10 @@ function serializeQuote(quote: TonhubRateQuote | null) {
         fiatAmountCents: quote.fiatAmountCents,
         fiatAmount: quote.fiatAmount,
         fiatCurrency: quote.fiatCurrency,
+        fiatPerGram: quote.fiatPerGram,
         fiatPerTon: quote.fiatPerTon,
         amountNano: quote.amountNano,
+        amountGram: quote.amountGram,
         amountTon: quote.amountTon,
         updatedAt: quote.updatedAt?.toISOString() ?? null,
         fetchedAt: quote.fetchedAt.toISOString()
@@ -309,12 +323,16 @@ function serializeInvoice(invoice: TonhubPaymentInvoiceRecord, quote = extractQu
   const paidNano = invoice.paidNano || "0";
   const remainingNano = subtractNano(invoice.amountNano, paidNano);
   const payableNano = remainingNano === "0" ? invoice.amountNano : remainingNano;
+  const amountGram = formatNanoTon(payableNano);
+  const expectedAmountGram = formatNanoTon(invoice.amountNano);
+  const paidGram = formatNanoTon(paidNano);
+  const remainingGram = formatNanoTon(remainingNano);
 
   return {
     id: invoice.id,
     externalId: invoice.externalId,
     network: invoice.network,
-    asset: invoice.asset,
+    asset: invoice.asset === "TON" ? gramAsset.symbol : invoice.asset,
     fiatAmountCents: invoice.fiatAmountCents,
     fiatAmount: invoice.fiatAmountCents / 100,
     fiatCurrency: invoice.fiatCurrency,
@@ -323,13 +341,17 @@ function serializeInvoice(invoice: TonhubPaymentInvoiceRecord, quote = extractQu
     addressMasked: maskValue(invoice.address),
     addressStrategy: invoice.addressStrategy,
     amountNano: payableNano,
-    amountTon: formatNanoTon(payableNano),
+    amountGram,
+    amountTon: amountGram,
     expectedAmountNano: invoice.amountNano,
-    expectedAmountTon: formatNanoTon(invoice.amountNano),
+    expectedAmountGram,
+    expectedAmountTon: expectedAmountGram,
     paidNano,
-    paidTon: formatNanoTon(paidNano),
+    paidGram,
+    paidTon: paidGram,
     remainingNano,
-    remainingTon: formatNanoTon(remainingNano),
+    remainingGram,
+    remainingTon: remainingGram,
     reference: invoice.reference,
     deeplink: buildTonTransferLink({
       address: invoice.address,
@@ -624,8 +646,10 @@ export async function createTonhubPaymentInvoice(
       fiatAmountCents: amountCents,
       fiatAmount: amountCents / 100,
       fiatCurrency: currency,
+      fiatPerGram: rate.fiatPerTon,
       fiatPerTon: rate.fiatPerTon,
       amountNano,
+      amountGram: formatNanoTon(amountNano),
       amountTon: formatNanoTon(amountNano),
       updatedAt: rate.updatedAt,
       fetchedAt: rate.fetchedAt
@@ -658,7 +682,7 @@ export async function createTonhubPaymentInvoice(
       status: 503,
       body: {
         errorCode: "TON_INVOICE_CREATE_FAILED",
-        error: error instanceof Error ? error.message : "Unable to create TON invoice."
+        error: error instanceof Error ? error.message : `Unable to create ${gramAsset.label} invoice.`
       }
     };
   }
@@ -780,7 +804,7 @@ export async function checkTonhubPaymentInvoice(
       status: 503,
       body: {
         errorCode: "TON_INVOICE_CHECK_FAILED",
-        error: error instanceof Error ? error.message : "Unable to check TON invoice."
+        error: error instanceof Error ? error.message : `Unable to check ${gramAsset.label} invoice.`
       }
     };
   }

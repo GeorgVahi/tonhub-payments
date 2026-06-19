@@ -20,7 +20,7 @@ model TonhubPaymentInvoice {
   id                      String                     @id @default(cuid())
   externalId              String?                    @unique
   network                 String
-  asset                   String                     @default("TON")
+  asset                   String                     @default("GRAM")
   fiatAmountCents         Int
   fiatCurrency            String                     @default("EUR")
   address                 String
@@ -102,7 +102,7 @@ model TonhubPaymentTransaction {
   providerTransactionId String?
   status                TonhubPaymentInvoiceStatus
   amountNano            String
-  asset                 String                  @default("TON")
+  asset                 String                  @default("GRAM")
   payload               Json?
   createdAt             DateTime                @default(now())
   invoice               TonhubPaymentInvoice    @relation(fields: [invoiceId], references: [id], onDelete: Cascade)

@@ -28,15 +28,20 @@ type TonhubInvoice = {
   id: string;
   externalId: string | null;
   network: TonNetwork;
+  asset: string;
   fiatAmountCents: number;
   fiatAmount: number;
   fiatCurrency: FiatCurrency;
   fiatAmountFormatted: string;
   address: string;
   amountNano: string;
+  amountGram: string;
   amountTon: string;
+  expectedAmountGram: string;
   expectedAmountTon: string;
+  paidGram: string;
   paidTon: string;
+  remainingGram: string;
   remainingTon: string;
   reference: string;
   deeplink: string;
@@ -44,6 +49,7 @@ type TonhubInvoice = {
   priceLockedUntil: string | null;
   partialPaymentExpiresAt: string | null;
   quote: {
+    fiatPerGram: number;
     fiatPerTon: number;
     fetchedAt: string;
     updatedAt: string | null;
@@ -77,13 +83,13 @@ const statusLabels: Record<InvoiceStatus, string> = {
 
 const errorMessages: Record<string, string> = {
   INVALID_INVOICE_REQUEST: "Check the amount, currency, and network, then try again.",
-  TON_INVOICE_CREATE_FAILED: "We could not create a TON invoice right now. Check the payment configuration and try again.",
+  TON_INVOICE_CREATE_FAILED: "We could not create a GRAM (ex TON) invoice right now. Check the payment configuration and try again.",
   TON_INVOICE_NOT_FOUND: "This invoice could not be found. Create a new invoice and try again.",
   TON_INVOICE_NOT_PAYABLE: "This invoice is no longer payable. Create a new invoice to continue.",
   TON_INVOICE_EXPIRED: "The payment window has expired. Create a new invoice to get a fresh rate.",
   TON_INVOICE_NETWORK_INVALID: "The invoice network is not available for this checkout.",
   TON_INVOICE_CHECK_FAILED: "We could not check the blockchain status right now. Try again in a moment.",
-  TON_RATE_UNAVAILABLE: "The TON exchange rate is unavailable right now. Try again in a moment."
+  TON_RATE_UNAVAILABLE: "The GRAM (ex TON) exchange rate is unavailable right now. Try again in a moment."
 };
 
 function normalizeApiBase(apiBase: string) {
@@ -154,7 +160,7 @@ function terminalState(invoice: TonhubInvoice): {
         tone: "success",
         icon: CheckCircle2,
         title: "Payment successful",
-        message: "Your TON payment has been confirmed. The invoice is settled and ready to continue."
+        message: "Your GRAM (ex TON) payment has been confirmed. The invoice is settled and ready to continue."
       };
     case "EXPIRED":
       return {
@@ -409,7 +415,7 @@ export function TonhubPaymentWidget({
           disabled={busy}
           onClick={() => void createInvoice()}
         >
-          {busy ? "Creating..." : "Create TON invoice"}
+          {busy ? "Creating..." : "Create GRAM (ex TON) invoice"}
         </button>
       </div>
 
@@ -429,25 +435,25 @@ export function TonhubPaymentWidget({
               <strong>{invoice.fiatAmountFormatted}</strong>
             </div>
             <div>
-              <span>TON amount</span>
-              <strong>{invoice.amountTon}</strong>
+              <span>GRAM amount</span>
+              <strong>{invoice.amountGram}</strong>
             </div>
             {invoice.status === "PARTIAL" ? (
               <>
                 <div>
                   <span>Paid</span>
-                  <strong>{invoice.paidTon}</strong>
+                  <strong>{invoice.paidGram}</strong>
                 </div>
                 <div>
                   <span>Remaining</span>
-                  <strong>{invoice.remainingTon}</strong>
+                  <strong>{invoice.remainingGram}</strong>
                 </div>
               </>
             ) : null}
             {invoice.quote ? (
               <div>
                 <span>Rate</span>
-                <strong>1 TON = {formatRate(invoice.quote.fiatPerTon, invoice.fiatCurrency)}</strong>
+                <strong>1 GRAM (ex TON) = {formatRate(invoice.quote.fiatPerGram, invoice.fiatCurrency)}</strong>
               </div>
             ) : null}
             <div>
@@ -474,8 +480,8 @@ export function TonhubPaymentWidget({
               </div>
               <TonManualTransferFields
                 address={invoice.address}
-                amount={invoice.amountTon}
-                amountCopyValue={copyableTonAmount(invoice.amountTon)}
+                amount={invoice.amountGram}
+                amountCopyValue={copyableTonAmount(invoice.amountGram)}
                 addressLabel="Address"
                 amountLabel="Amount"
                 copyLabel="Copy"
@@ -508,8 +514,8 @@ export function TonhubPaymentWidget({
                   <strong>{invoice.fiatAmountFormatted}</strong>
                 </div>
                 <div>
-                  <span>TON total</span>
-                  <strong>{invoice.expectedAmountTon}</strong>
+                  <span>GRAM total</span>
+                  <strong>{invoice.expectedAmountGram}</strong>
                 </div>
                 <div>
                   <span>Network</span>

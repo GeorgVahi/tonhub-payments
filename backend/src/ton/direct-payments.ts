@@ -46,6 +46,11 @@ export type TonInvoiceMatch = {
   status: "observed" | "aborted" | "unknown";
 };
 
+export const gramAsset = {
+  symbol: "GRAM",
+  label: "GRAM (ex TON)"
+} as const;
+
 const nanoPerTon = BigInt("1000000000");
 
 export const tonNetworkConfig: Record<TonNetwork, {
@@ -163,7 +168,7 @@ export function parseTonAmountToNano(value: string) {
   const trimmed = value.trim();
 
   if (!/^\d+(\.\d{1,9})?$/.test(trimmed)) {
-    throw new Error("TON amount must be a positive decimal with up to 9 fractional digits.");
+    throw new Error(`${gramAsset.label} amount must be a positive decimal with up to 9 fractional digits.`);
   }
 
   const [wholeText, fractionalText = ""] = trimmed.split(".");
@@ -172,7 +177,7 @@ export function parseTonAmountToNano(value: string) {
   const nano = whole * nanoPerTon + fractional;
 
   if (nano <= 0) {
-    throw new Error("TON amount must be greater than zero.");
+    throw new Error(`${gramAsset.label} amount must be greater than zero.`);
   }
 
   return nano.toString();
@@ -180,7 +185,7 @@ export function parseTonAmountToNano(value: string) {
 
 export function formatNanoTon(value: string | undefined) {
   if (!value) {
-    return "0 TON";
+    return `0 ${gramAsset.label}`;
   }
 
   try {
@@ -189,7 +194,7 @@ export function formatNanoTon(value: string | undefined) {
     const fractional = nano % nanoPerTon;
     const fractionalText = fractional.toString().padStart(9, "0").replace(/0+$/, "");
 
-    return `${whole.toString()}${fractionalText ? `.${fractionalText}` : ""} TON`;
+    return `${whole.toString()}${fractionalText ? `.${fractionalText}` : ""} ${gramAsset.label}`;
   } catch {
     return `${value} nanotons`;
   }
