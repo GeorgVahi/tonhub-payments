@@ -1,5 +1,5 @@
 import type { FiatCurrency } from "./config";
-import { gramAsset } from "./ton/direct-payments";
+import { gramAsset, tonPaymentAmountNanoStep } from "./ton/direct-payments";
 
 export type TonFiatRate = {
   source: "coingecko";
@@ -81,12 +81,12 @@ export function ceilTonAmountNanoFromFiat(input: {
   amountCents: number;
   fiatPerTon: number;
 }) {
-  const amountNano = Math.ceil((input.amountCents * 10_000_000) / input.fiatPerTon);
+  const paymentUnits = Math.ceil(input.amountCents / input.fiatPerTon);
 
-  if (!Number.isFinite(amountNano) || amountNano <= 0) {
+  if (!Number.isSafeInteger(paymentUnits) || paymentUnits <= 0) {
     throw new Error(`Unable to calculate ${gramAsset.label} amount from fiat price.`);
   }
 
-  return BigInt(amountNano).toString();
+  return (BigInt(paymentUnits) * tonPaymentAmountNanoStep).toString();
 }
 

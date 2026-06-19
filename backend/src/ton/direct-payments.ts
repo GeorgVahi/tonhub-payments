@@ -52,6 +52,8 @@ export const gramAsset = {
 } as const;
 
 const nanoPerTon = BigInt("1000000000");
+export const tonPaymentFractionDigits = 2;
+export const tonPaymentAmountNanoStep = BigInt("10000000");
 
 export const tonNetworkConfig: Record<TonNetwork, {
   baseUrl: string;
@@ -183,21 +185,55 @@ export function parseTonAmountToNano(value: string) {
   return nano.toString();
 }
 
-export function formatNanoTon(value: string | undefined) {
+export function ceilNanoTonToPaymentUnit(value: string | bigint) {
+  const nano = typeof value === "bigint" ? value : BigInt(value);
+
+  if (nano <= BigInt(0)) {
+    return "0";
+  }
+
+  return (
+    ((nano + tonPaymentAmountNanoStep - BigInt(1)) / tonPaymentAmountNanoStep) *
+    tonPaymentAmountNanoStep
+  ).toString();
+}
+
+export function formatNanoTon(
+  value: string | undefined,
+  options: { fixedFractionDigits?: number } = {}
+) {
   if (!value) {
-    return `0 ${gramAsset.label}`;
+    const fixedZero = typeof options.fixedFractionDigits === "number"
+      ? (() => {
+          const digits = Math.max(0, Math.min(9, Math.trunc(options.fixedFractionDigits)));
+          return digits ? `0.${"0".repeat(digits)}` : "0";
+        })()
+      : "0";
+    return `${fixedZero} ${gramAsset.label}`;
   }
 
   try {
     const nano = BigInt(value);
     const whole = nano / nanoPerTon;
     const fractional = nano % nanoPerTon;
+    if (typeof options.fixedFractionDigits === "number") {
+      const digits = Math.max(0, Math.min(9, Math.trunc(options.fixedFractionDigits)));
+      const fractionalText = fractional.toString().padStart(9, "0").slice(0, digits);
+      return `${whole.toString()}${digits ? `.${fractionalText}` : ""} ${gramAsset.label}`;
+    }
+
     const fractionalText = fractional.toString().padStart(9, "0").replace(/0+$/, "");
 
     return `${whole.toString()}${fractionalText ? `.${fractionalText}` : ""} ${gramAsset.label}`;
   } catch {
     return `${value} nanotons`;
   }
+}
+
+export function formatPaymentNanoTon(value: string | undefined) {
+  return formatNanoTon(value ? ceilNanoTonToPaymentUnit(value) : "0", {
+    fixedFractionDigits: tonPaymentFractionDigits
+  });
 }
 
 function tonTransactionHashForExplorer(value: string) {

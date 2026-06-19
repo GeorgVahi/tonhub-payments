@@ -10,10 +10,12 @@ import {
 } from "./config";
 import {
   buildTonTransferLink,
+  ceilNanoTonToPaymentUnit,
   createTonInvoiceReference,
   fetchTonTransactions,
   findTonInvoicePayments,
   formatNanoTon,
+  formatPaymentNanoTon,
   gramAsset,
   maskValue,
   parseTonNetwork,
@@ -267,7 +269,9 @@ function extractQuote(invoice: TonhubPaymentInvoiceRecord): TonhubRateQuote | nu
     : typeof quote.fiatPerTon === "number"
       ? quote.fiatPerTon
       : null;
-  const amountNano = typeof quote.amountNano === "string" ? quote.amountNano : null;
+  const amountNano = typeof quote.amountNano === "string" && validNanoAmount(quote.amountNano)
+    ? ceilNanoTonToPaymentUnit(quote.amountNano)
+    : null;
   const updatedAt = typeof quote.updatedAt === "string" && quote.updatedAt ? new Date(quote.updatedAt) : null;
   const fetchedAt = typeof quote.fetchedAt === "string" ? new Date(quote.fetchedAt) : null;
 
@@ -284,7 +288,7 @@ function extractQuote(invoice: TonhubPaymentInvoiceRecord): TonhubRateQuote | nu
     return null;
   }
 
-  const amountFormatted = formatNanoTon(amountNano);
+  const amountFormatted = formatPaymentNanoTon(amountNano);
 
   return {
     source: "coingecko",
@@ -321,12 +325,14 @@ function serializeQuote(quote: TonhubRateQuote | null) {
 
 function serializeInvoice(invoice: TonhubPaymentInvoiceRecord, quote = extractQuote(invoice)) {
   const paidNano = invoice.paidNano || "0";
-  const remainingNano = subtractNano(invoice.amountNano, paidNano);
-  const payableNano = remainingNano === "0" ? invoice.amountNano : remainingNano;
-  const amountGram = formatNanoTon(payableNano);
-  const expectedAmountGram = formatNanoTon(invoice.amountNano);
+  const expectedAmountNano = ceilNanoTonToPaymentUnit(invoice.amountNano);
+  const remainingExactNano = subtractNano(expectedAmountNano, paidNano);
+  const remainingNano = remainingExactNano === "0" ? "0" : ceilNanoTonToPaymentUnit(remainingExactNano);
+  const payableNano = remainingNano === "0" ? expectedAmountNano : remainingNano;
+  const amountGram = formatPaymentNanoTon(payableNano);
+  const expectedAmountGram = formatPaymentNanoTon(expectedAmountNano);
   const paidGram = formatNanoTon(paidNano);
-  const remainingGram = formatNanoTon(remainingNano);
+  const remainingGram = formatPaymentNanoTon(remainingNano);
 
   return {
     id: invoice.id,
@@ -343,7 +349,7 @@ function serializeInvoice(invoice: TonhubPaymentInvoiceRecord, quote = extractQu
     amountNano: payableNano,
     amountGram,
     amountTon: amountGram,
-    expectedAmountNano: invoice.amountNano,
+    expectedAmountNano,
     expectedAmountGram,
     expectedAmountTon: expectedAmountGram,
     paidNano,
@@ -513,7 +519,9 @@ export async function settleTonhubInvoice(input: {
   const paidNano = sumObservedPayments(observedPayments);
   const lastEligibleMatch = eligibleMatches[eligibleMatches.length - 1] ?? partialStarter;
 
-  if (BigInt(paidNano) >= BigInt(invoice.amountNano)) {
+  const expectedAmountNano = ceilNanoTonToPaymentUnit(invoice.amountNano);
+
+  if (BigInt(paidNano) >= BigInt(expectedAmountNano)) {
     if (!lastEligibleMatch) {
       return {
         state: "pending",
@@ -649,8 +657,8 @@ export async function createTonhubPaymentInvoice(
       fiatPerGram: rate.fiatPerTon,
       fiatPerTon: rate.fiatPerTon,
       amountNano,
-      amountGram: formatNanoTon(amountNano),
-      amountTon: formatNanoTon(amountNano),
+      amountGram: formatPaymentNanoTon(amountNano),
+      amountTon: formatPaymentNanoTon(amountNano),
       updatedAt: rate.updatedAt,
       fetchedAt: rate.fetchedAt
     };
