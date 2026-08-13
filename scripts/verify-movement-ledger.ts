@@ -1,10 +1,12 @@
 import assert from "node:assert/strict";
 import { PrismaClient } from "@prisma/client";
+import { Address } from "@ton/core";
 import {
   createMovementLedger,
   MovementFingerprintConflictError,
 } from "../backend/src/movement-ledger";
 import { createPrismaRateSnapshotRepository } from "../backend/src/rate-snapshots";
+import { createInternalTestnetJettonAdapter } from "../backend/src/ton/internal-testnet-jetton";
 
 const prisma = new PrismaClient();
 const ledger = createMovementLedger(prisma as any);
@@ -432,6 +434,101 @@ try {
     }),
     (error: any) => error?.code === "P2002",
   );
+
+  const internalOwnerRaw = `0:${"51".repeat(32)}`;
+  const internalMasterRaw = `0:${"61".repeat(32)}`;
+  const internalWalletRaw = `0:${"71".repeat(32)}`;
+  const internalSenderRaw = `0:${"81".repeat(32)}`;
+  const internalSenderWalletRaw = `0:${"91".repeat(32)}`;
+  const friendly = (raw: string) => Address.parse(raw).toString({ bounceable: true, testOnly: true });
+  const internalDepositId = `ledger-internal-jetton-deposit-${suffix}`;
+  await prisma.tonhubDepositAddress.create({
+    data: {
+      id: internalDepositId,
+      network: "testnet",
+      address: friendly(internalOwnerRaw),
+      addressRaw: internalOwnerRaw,
+      walletVersion: "v5r1",
+      walletWorkchain: 0,
+      walletContext: suffix === "clean" ? 810_021 : 810_022,
+      walletNetworkGlobalId: -3,
+      walletPublicKeyHash: `ledger-internal-jetton-key-${suffix}`,
+      status: "ACTIVE",
+    },
+  });
+  const internalAdapter = createInternalTestnetJettonAdapter({
+    db: prisma,
+    ledger,
+    config: { enabled: true, network: "testnet", masterAddress: internalMasterRaw, decimals: 6 },
+    resolveReadConfig: () => ({
+      network: "testnet",
+      baseUrl: "https://testnet.toncenter.com/api/v3",
+      address: "",
+      addressEnvName: "",
+    }),
+    fetchImpl: async (request) => {
+      const url = new URL(String(request));
+      if (url.pathname.endsWith("/jetton/masters")) {
+        return new Response(JSON.stringify({
+          jetton_masters: [{
+            address: friendly(internalMasterRaw),
+            jetton_content: { decimals: "6", symbol: "TEST" },
+          }],
+        }), { status: 200 });
+      }
+      if (url.pathname.endsWith("/jetton/wallets")) {
+        return new Response(JSON.stringify({
+          jetton_wallets: [{
+            address: friendly(internalWalletRaw),
+            balance: "5000000",
+            owner: friendly(internalOwnerRaw),
+            jetton: friendly(internalMasterRaw),
+            last_transaction_lt: "910001",
+          }],
+        }), { status: 200 });
+      }
+      return new Response(JSON.stringify({
+        jetton_transfers: [{
+          amount: "5000000",
+          destination: friendly(internalOwnerRaw),
+          jetton_master: friendly(internalMasterRaw),
+          query_id: "84",
+          source: friendly(internalSenderRaw),
+          source_wallet: friendly(internalSenderWalletRaw),
+          transaction_aborted: false,
+          transaction_hash: "c3".repeat(32),
+          transaction_lt: "910001",
+          transaction_now: 1_786_616_400,
+        }],
+      }), { status: 200 });
+    },
+    now: () => new Date("2026-08-13T10:30:00.000Z"),
+  });
+  const internalObserved = await internalAdapter.observeDeposit({
+    depositAddressId: internalDepositId,
+    notBefore: new Date("2026-08-13T10:00:00.000Z"),
+    notAfter: new Date("2026-08-13T10:30:00.000Z"),
+  });
+  assert.equal(internalObserved.movementsObserved, 1);
+  const internalAccount = await prisma.tonhubDepositAssetAccount.findUniqueOrThrow({
+    where: {
+      depositAddressId_asset: {
+        depositAddressId: internalDepositId,
+        asset: "USDT",
+      },
+    },
+  });
+  assert.equal(internalAccount.status, "VERIFIED");
+  assert.equal(internalAccount.jettonMasterAddress, internalMasterRaw);
+  assert.equal(internalAccount.assetWalletAddress, internalWalletRaw);
+  const internalMovement = await prisma.tonhubPaymentMovement.findUniqueOrThrow({
+    where: {
+      fingerprint: `ton:testnet:jetton-in:${"c3".repeat(32)}:84:${internalMasterRaw}`,
+    },
+  });
+  assert.equal(internalMovement.asset, "USDT");
+  assert.equal(internalMovement.assetDecimals, 6);
+  assert.equal((internalMovement.rawPayload as any).internalTestAsset, true);
 } finally {
   await prisma.$disconnect();
 }

@@ -234,6 +234,27 @@ evidence, and advances its resumable cursor only after every selected movement
 has been persisted. Provider or persistence errors release the lease for retry
 without changing settlement state.
 
+An internal-only testnet jetton adapter exercises the provider and movement
+ledger boundary before official mainnet USDT is enabled. It is off by default,
+requires `TON_INTERNAL_TESTNET_JETTON_ENABLED=true` plus one explicit
+`TON_INTERNAL_TESTNET_JETTON_MASTER_ADDRESS` and
+`TON_INTERNAL_TESTNET_JETTON_DECIMALS=6`, and refuses non-testnet deposits or
+provider configs. The adapter verifies the test master's provider metadata is
+also exactly 6-decimal, then verifies the deposit owner and derived asset-wallet
+row reported by TON Center before journaling USDT-shaped evidence marked
+`internalTestAsset`. It is intentionally absent
+from public package exports and `/config`, so public testnet checkout remains
+GRAM-only. Internal QA can scan one provider page with:
+
+```bash
+npm run worker:scan:jetton-testnet -- --deposit-id=<id> --not-before=<ISO date>
+```
+
+Use `--not-after`, `--limit`, and `--offset` for a bounded historical page.
+The adapter follows TON Center's `/jetton/masters`, `/jetton/wallets`, and
+wallet-bound `/jetton/transfers` contracts; fake-master and malformed-transfer
+hardening remain a separate rollout gate before any public jetton support.
+
 The GRAM `/check` read path has been cut over to the same strict movement facts.
 It resolves the deposit relation as the scan owner, synchronously journals the
 current provider page, reads all usable GRAM movements inside the invoice

@@ -25,6 +25,7 @@
     "worker:sweep": "bun run worker/src/sweep-worker.ts",
     "worker:rates": "bun run worker/src/rate-worker.ts",
     "worker:scan:gram-shadow": "bun run worker/src/gram-shadow-worker.ts",
+    "worker:scan:jetton-testnet": "bun run worker/src/internal-testnet-jetton-worker.ts",
     "worker:settlement": "bun run worker/src/mixed-settlement-worker.ts",
     "db:generate": "prisma generate",
     "db:migrate": "prisma migrate dev",
@@ -32,7 +33,7 @@
     "db:migrate:rehearse": "node scripts/rehearse-prisma-migrations.mjs",
     "db:push": "prisma db push",
     "typecheck": "tsc --noEmit",
-    "test": "tsx --test tests/tonhub-payments.test.ts tests/gram-flow-characterization.test.ts tests/order-attempts.test.ts tests/payment-assets.test.ts tests/rate-snapshots.test.ts tests/movement-ledger.test.ts tests/mixed-settlement.test.ts tests/gram-shadow-scanner.test.ts tests/gram-ledger-cutover.test.ts",
+    "test": "tsx --test tests/tonhub-payments.test.ts tests/gram-flow-characterization.test.ts tests/order-attempts.test.ts tests/payment-assets.test.ts tests/rate-snapshots.test.ts tests/movement-ledger.test.ts tests/mixed-settlement.test.ts tests/gram-shadow-scanner.test.ts tests/gram-ledger-cutover.test.ts tests/internal-testnet-jetton.test.ts",
     "build": "vite build --config vite.config.ts",
     "preview": "vite preview --config vite.config.ts"
   },
