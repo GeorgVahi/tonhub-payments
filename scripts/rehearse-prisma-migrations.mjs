@@ -145,6 +145,9 @@ try {
   run(process.execPath, [tsxCli, "scripts/verify-order-attempt-repository.ts"], {
     env: { ...process.env, DATABASE_URL: databaseUrl("clean_migration") },
   });
+  run(process.execPath, [tsxCli, "scripts/verify-rate-snapshot-repository.ts"], {
+    env: { ...process.env, DATABASE_URL: databaseUrl("clean_migration") },
+  });
   prisma(
     databaseUrl("clean_migration"),
     "migrate",
@@ -224,6 +227,9 @@ try {
   );
   prisma(databaseUrl("legacy_migration"), "migrate", "deploy");
   prisma(databaseUrl("legacy_migration"), "migrate", "status");
+  run(process.execPath, [tsxCli, "scripts/verify-rate-snapshot-repository.ts"], {
+    env: { ...process.env, DATABASE_URL: databaseUrl("legacy_migration") },
+  });
 
   assertEqual(
     psql(

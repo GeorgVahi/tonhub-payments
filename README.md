@@ -35,11 +35,12 @@ npm run dev
 The API listens on `http://localhost:3008`; the Vite demo proxies `/api/**` to
 that API and runs on `http://localhost:5173`.
 
-For a full local payment flow, run three runtimes:
+For a full local payment flow, run four runtimes:
 
 ```bash
 npm run backend:dev
 npm run dev
+npm run worker:rates -- --watch --interval-seconds=60
 npm run worker:sweep -- --network=testnet --watch --interval-seconds=15
 ```
 
@@ -59,6 +60,15 @@ paid deposit-wallet balances to move to `TON_*_SWEEP_RECIPIENT_ADDRESS`.
 Keep `TON_*_DEPOSIT_SECRET_KEY` only in the worker environment. The backend
 derives unique deposit addresses from public keys and does not need signing
 credentials.
+
+The rate worker writes immutable GRAM/USD, GRAM/EUR, USDT/USD, and USDT/EUR
+snapshots. `TON_RATE_SNAPSHOT_INTERVAL_SECONDS` controls its polling interval;
+`TON_RATE_SNAPSHOT_MAX_AGE_SECONDS` rejects stale provider evidence. USDT/USD
+is fixed at the merchant policy `1 USDT = 1 USD`; USDT/EUR is derived exactly
+from contemporaneous GRAM/EUR and GRAM/USD observations and references both
+immutable component snapshot IDs. A provider outage does not invent a market
+rate: the worker stores the independent USDT/USD peg, reports the unavailable
+pairs, and retries on the next watch iteration.
 
 ## API
 
@@ -168,6 +178,13 @@ and `remaining` neutral fields. Existing GRAM-only fields such as `amountNano`,
 `amountGram`, and `amountTon` remain available for GRAM clients during the
 compatibility window. Atomic conversion uses decimal strings and `BigInt`; it
 does not route financial values through JavaScript floating-point numbers.
+
+Rate snapshots are append-only and selected historically: a lookup can use only
+an observation at or before the requested blockchain time and rejects evidence
+older than its configured maximum age. The first credited movement will lock
+the selected GRAM rate for the remaining partial-payment window when movement
+allocation is enabled in the following rollout stage. The current legacy GRAM
+settlement path remains unchanged while this snapshot writer runs in parallel.
 
 ## Frontend
 
