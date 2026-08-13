@@ -73,7 +73,7 @@ enum TonhubOutboxEventStatus {
 
 model TonhubPaymentOrder {
   id                    String                     @id @default(cuid())
-  externalId            String                     @unique
+  externalId            String?                    @unique
   fiatAmountMicros      String
   fiatCurrency          String
   creditedFiatMicros    String                     @default("0")

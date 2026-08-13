@@ -31,6 +31,8 @@ import {
 import { findTonDepositAddressPayments } from "./ton/matching";
 import { ceilTonAmountNanoFromFiat, fetchTonFiatRate } from "./rates";
 import {
+  TonhubOrderNotRetryableError,
+  TonhubOrderTermsMismatchError,
   prismaTonhubPaymentRepository,
   type TonhubPaymentRepository
 } from "./repository";
@@ -336,6 +338,7 @@ function serializeInvoice(invoice: TonhubPaymentInvoiceRecord, quote = extractQu
 
   return {
     id: invoice.id,
+    orderId: invoice.orderId ?? null,
     externalId: invoice.externalId,
     network: invoice.network,
     asset: invoice.asset === "TON" ? gramAsset.symbol : invoice.asset,
@@ -373,6 +376,19 @@ function serializeInvoice(invoice: TonhubPaymentInvoiceRecord, quote = extractQu
     partialPaymentExpiresAt: invoice.partialPaymentExpiresAt?.toISOString() ?? null,
     observedPayments: Array.isArray(invoice.observedPayments) ? invoice.observedPayments : [],
     quote: serializeQuote(quote),
+    order: invoice.order
+      ? {
+          id: invoice.order.id,
+          externalId: invoice.order.externalId,
+          fiatAmountMicros: invoice.order.fiatAmountMicros,
+          fiatCurrency: invoice.order.fiatCurrency,
+          creditedFiatMicros: invoice.order.creditedFiatMicros,
+          overpaymentFiatMicros: invoice.order.overpaymentFiatMicros,
+          status: invoice.order.status,
+          paidAt: invoice.order.paidAt?.toISOString() ?? null,
+          expiresAt: invoice.order.expiresAt?.toISOString() ?? null
+        }
+      : null,
     metadata: invoice.metadata ?? null
   };
 }
@@ -410,7 +426,7 @@ type SettleResult =
       state: "paid";
       invoice: TonhubPaymentInvoiceRecord;
       transactionsScanned: number;
-      match: TonInvoiceMatch;
+      match: TonInvoiceMatch | null;
     }
   | {
       state: "pending" | "expired" | "not-payable" | "invalid-network";
@@ -493,9 +509,45 @@ export async function settleTonhubInvoice(input: {
         expiredAt: now
       });
 
+      if (!expiredInvoice) {
+        return {
+          state: "not-payable",
+          invoice,
+          transactionsScanned: transactions.length,
+          match: null
+        };
+      }
+
+      if (expiredInvoice.status === "PAID") {
+        return {
+          state: "paid",
+          invoice: expiredInvoice,
+          transactionsScanned: transactions.length,
+          match: null
+        };
+      }
+
+      if (expiredInvoice.status === "PENDING" || expiredInvoice.status === "PARTIAL") {
+        return {
+          state: "pending",
+          invoice: expiredInvoice,
+          transactionsScanned: transactions.length,
+          match: null
+        };
+      }
+
+      if (expiredInvoice.status !== "EXPIRED") {
+        return {
+          state: "not-payable",
+          invoice: expiredInvoice,
+          transactionsScanned: transactions.length,
+          match: null
+        };
+      }
+
       return {
         state: "expired",
-        invoice: expiredInvoice ?? invoice,
+        invoice: expiredInvoice,
         transactionsScanned: transactions.length,
         match: null
       };
@@ -549,6 +601,17 @@ export async function settleTonhubInvoice(input: {
       };
     }
 
+    if (paidInvoice.status !== "PAID") {
+      return {
+        state: paidInvoice.status === "PENDING" || paidInvoice.status === "PARTIAL"
+          ? "pending"
+          : "not-payable",
+        invoice: paidInvoice,
+        transactionsScanned: transactions.length,
+        match: lastEligibleMatch
+      };
+    }
+
     return {
       state: "paid",
       invoice: paidInvoice,
@@ -564,9 +627,45 @@ export async function settleTonhubInvoice(input: {
         expiredAt: now
       });
 
+      if (!expiredInvoice) {
+        return {
+          state: "not-payable",
+          invoice,
+          transactionsScanned: transactions.length,
+          match: null
+        };
+      }
+
+      if (expiredInvoice.status === "PAID") {
+        return {
+          state: "paid",
+          invoice: expiredInvoice,
+          transactionsScanned: transactions.length,
+          match: lastEligibleMatch
+        };
+      }
+
+      if (expiredInvoice.status === "PENDING" || expiredInvoice.status === "PARTIAL") {
+        return {
+          state: "pending",
+          invoice: expiredInvoice,
+          transactionsScanned: transactions.length,
+          match: lastEligibleMatch
+        };
+      }
+
+      if (expiredInvoice.status !== "EXPIRED") {
+        return {
+          state: "not-payable",
+          invoice: expiredInvoice,
+          transactionsScanned: transactions.length,
+          match: null
+        };
+      }
+
       return {
         state: "expired",
-        invoice: expiredInvoice ?? invoice,
+        invoice: expiredInvoice,
         transactionsScanned: transactions.length,
         match: null
       };
@@ -581,9 +680,36 @@ export async function settleTonhubInvoice(input: {
       observedAt: starterDate
     });
 
+    if (!partialInvoice) {
+      return {
+        state: "not-payable",
+        invoice,
+        transactionsScanned: transactions.length,
+        match: null
+      };
+    }
+
+    if (partialInvoice.status === "PAID") {
+      return {
+        state: "paid",
+        invoice: partialInvoice,
+        transactionsScanned: transactions.length,
+        match: lastEligibleMatch
+      };
+    }
+
+    if (partialInvoice.status !== "PENDING" && partialInvoice.status !== "PARTIAL") {
+      return {
+        state: "not-payable",
+        invoice: partialInvoice,
+        transactionsScanned: transactions.length,
+        match: null
+      };
+    }
+
     return {
       state: "pending",
-      invoice: partialInvoice ?? invoice,
+      invoice: partialInvoice,
       transactionsScanned: transactions.length,
       match: lastEligibleMatch ?? matches[0] ?? null
     };
@@ -621,10 +747,26 @@ export async function createTonhubPaymentInvoice(
 
     const reusableInvoice = await deps.repository.findReusableInvoice({
       externalId: parsed.data.externalId,
-      network
+      network,
+      amountCents,
+      currency
     });
 
     if (reusableInvoice) {
+      if (reusableInvoice.status === "PAID") {
+        return {
+          status: 200,
+          body: {
+            ok: true,
+            reused: true,
+            finalized: true,
+            invoice: serializeInvoice(reusableInvoice),
+            transactionsScanned: 0,
+            match: null
+          }
+        };
+      }
+
       const settled = await settleTonhubInvoice({
         invoice: reusableInvoice,
         dependencies: deps
@@ -686,6 +828,16 @@ export async function createTonhubPaymentInvoice(
       }
     };
   } catch (error) {
+    if (error instanceof TonhubOrderTermsMismatchError || error instanceof TonhubOrderNotRetryableError) {
+      return {
+        status: 409,
+        body: {
+          errorCode: error.code,
+          error: error.message
+        }
+      };
+    }
+
     return {
       status: 503,
       body: {

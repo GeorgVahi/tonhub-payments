@@ -2,6 +2,23 @@ import type { FiatCurrency } from "./config";
 import type { TonNetwork, TonInvoiceMatch } from "./ton/direct-payments";
 
 export type TonhubPaymentStatus = "PENDING" | "PARTIAL" | "PAID" | "EXPIRED" | "CANCELLED" | "FAILED";
+export type TonhubPaymentOrderStatus = TonhubPaymentStatus | "RECOVERY";
+
+export type TonhubPaymentOrderRecord = {
+  id: string;
+  externalId: string | null;
+  fiatAmountMicros: string;
+  fiatCurrency: string;
+  creditedFiatMicros: string;
+  overpaymentFiatMicros: string;
+  status: TonhubPaymentOrderStatus;
+  paidAt: Date | null;
+  expiresAt: Date | null;
+  cancelledAt: Date | null;
+  createdAt: Date;
+  updatedAt: Date;
+  metadata: unknown;
+};
 
 export type TonhubObservedPayment = {
   transactionId: string;
@@ -30,9 +47,17 @@ export type TonhubRateQuote = {
 export type TonhubPaymentInvoiceRecord = {
   id: string;
   externalId: string | null;
+  orderId?: string | null;
+  order?: TonhubPaymentOrderRecord | null;
   network: string;
   asset: string;
+  checkoutAsset?: string;
+  assetKind?: string;
+  assetDecimals?: number;
   fiatAmountCents: number;
+  fiatAmountMicros?: string | null;
+  creditedFiatMicros?: string;
+  remainingFiatMicros?: string | null;
   fiatCurrency: string;
   address: string;
   addressRaw: string;
@@ -44,11 +69,15 @@ export type TonhubPaymentInvoiceRecord = {
   walletPublicKeyHash: string;
   amountNano: string;
   paidNano: string;
+  amountAtomic?: string | null;
+  paidAmountAtomic?: string | null;
+  version?: number;
   reference: string;
   status: TonhubPaymentStatus;
   providerName: string;
   observedTransactionHash: string | null;
   observedAt: Date | null;
+  firstMovementAt?: Date | null;
   partialPaymentStartedAt: Date | null;
   partialPaymentExpiresAt: Date | null;
   expiresAt: Date | null;

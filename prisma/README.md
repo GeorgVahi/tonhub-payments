@@ -1,9 +1,10 @@
 # Prisma migrations
 
 The migration history starts with `20260813100000_baseline`, which is an exact
-snapshot of the original GRAM-only schema. The following migration is additive:
-it keeps every legacy table and column available while introducing the
-multi-asset foundation.
+snapshot of the original GRAM-only schema. Later migrations are additive: the
+foundation keeps every legacy table and column, while the order-attempt
+migration links existing invoices to fiat-denominated orders and fills neutral
+amount fields.
 
 ## Empty database
 
@@ -49,9 +50,14 @@ npm run db:migrate:rehearse
 The script creates an isolated, process-named container and derives its legacy
 database from `tests/fixtures/gram-only-schema.prisma`, independently of the
 baseline SQL. It verifies baseline equivalence, clean and legacy deployments,
-sample-invoice survival, one-active-attempt and one-active-sweep constraints,
-append-only financial records, schema drift, and cleanup of only that temporary
-container.
+pending/partial/paid/recovery/anonymous backfill, real Prisma repository
+dual-writes, one-active-attempt and one-active-sweep constraints, append-only
+financial records, schema drift, and cleanup of only that temporary container.
+
+During rollout, apply migrations immediately before deploying the compatible
+application. The repository can still read an unlinked legacy row and will
+atomically attach it to an order when that invoice is reused or changes state,
+covering invoices created by an old process near the migration boundary.
 
 ## Database-enforced invariants
 

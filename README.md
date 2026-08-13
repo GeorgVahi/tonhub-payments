@@ -123,13 +123,16 @@ does not persist a transaction hash or advance `SENT` to on-chain
 
 ## Database Schema
 
-The current GRAM runtime still uses the three legacy models
-`TonhubPaymentInvoice`, `TonhubDepositAddress`, and
-`TonhubPaymentTransaction`. An additive migration now also provides the
-multi-asset persistence foundation without removing or renaming legacy fields:
+The GRAM runtime now treats `TonhubPaymentOrder` as the fiat obligation and
+`TonhubPaymentInvoice` as a concrete payment attempt. It dual-writes the legacy
+GRAM fields and the neutral amount fields, so existing clients and workers keep
+working while later multi-asset stages are introduced. The additive persistence
+foundation does not remove or rename legacy fields:
 
 - `TonhubPaymentOrder` owns the fiat obligation while invoice rows become
-  payment attempts; PostgreSQL permits only one active attempt per order.
+  payment attempts; PostgreSQL permits only one active attempt per order. A
+  merchant `externalId` cannot silently change amount or currency, paid orders
+  are idempotently returned, and an empty expired attempt may be replaced.
 - `TonhubDepositAssetAccount` records the native or jetton account associated
   with a unique deposit wallet.
 - `TonhubRateSnapshot`, `TonhubPaymentMovement`, and

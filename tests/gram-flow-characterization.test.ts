@@ -405,6 +405,43 @@ test("an invoice expires without funds and a transfer after the quote deadline d
   assert.equal(harness.calls.paid, 0);
 });
 
+test("an expiration CAS loser reports a concurrent partial winner as pending", async () => {
+  for (const scenario of ["empty", "funded"] as const) {
+    const harness = createRepositoryHarness(makeInvoice());
+    const winner = makeInvoice({
+      status: "PARTIAL",
+      paidNano: "500000000",
+      partialPaymentStartedAt: new Date("2026-05-11T10:30:00.000Z"),
+      partialPaymentExpiresAt: new Date("2026-05-12T10:30:00.000Z")
+    });
+    harness.repository.markInvoiceExpired = async () => {
+      harness.calls.expired += 1;
+      return winner;
+    };
+
+    const settled = await settleTonhubInvoice({
+      invoice: harness.current(),
+      transactions: scenario === "funded"
+        ? [incomingTransaction({
+            hash: "stale-partial-starter",
+            amountNano: "500000000",
+            at: "2026-05-11T10:30:00.000Z"
+          })]
+        : [],
+      dependencies: {
+        repository: harness.repository,
+        now: () => scenario === "funded"
+          ? new Date("2026-05-12T10:31:00.000Z")
+          : new Date("2026-05-11T11:05:00.000Z")
+      }
+    });
+
+    assert.equal(settled.state, "pending", scenario);
+    assert.equal(settled.invoice.status, "PARTIAL", scenario);
+    assert.equal(harness.calls.expired, 1, scenario);
+  }
+});
+
 test("checking a paid invoice is terminal and performs no blockchain fetch", async () => {
   const harness = createRepositoryHarness(makeInvoice({
     status: "PAID",

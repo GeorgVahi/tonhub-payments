@@ -23,7 +23,7 @@
     "db:migrate:rehearse": "node scripts/rehearse-prisma-migrations.mjs",
     "db:push": "prisma db push",
     "typecheck": "tsc --noEmit",
-    "test": "tsx --test tests/tonhub-payments.test.ts tests/gram-flow-characterization.test.ts",
+    "test": "tsx --test tests/tonhub-payments.test.ts tests/gram-flow-characterization.test.ts tests/order-attempts.test.ts",
     "build": "vite build --config vite.config.ts",
     "preview": "vite preview --config vite.config.ts"
   },

@@ -1,4 +1,4 @@
-import { readFileSync } from "node:fs";
+import { readFileSync, readdirSync } from "node:fs";
 import { resolve } from "node:path";
 import { spawnSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
@@ -7,11 +7,15 @@ const projectRoot = resolve(import.meta.dirname, "..");
 const containerName = `tonhub-payments-migration-${process.pid}-${randomUUID().slice(0, 8)}`;
 const postgresPassword = "tonhub-migration-rehearsal";
 const baselineMigration = "20260813100000_baseline";
+const expectedMigrationCount = readdirSync(resolve(projectRoot, "prisma", "migrations"), {
+  withFileTypes: true,
+}).filter((entry) => entry.isDirectory() && /^\d+_/.test(entry.name)).length.toString();
 const baselineMigrationSql = readFileSync(
   resolve(projectRoot, "prisma", "migrations", baselineMigration, "migration.sql"),
   "utf8",
 );
 const prismaCli = resolve(projectRoot, "node_modules", "prisma", "build", "index.js");
+const tsxCli = resolve(projectRoot, "node_modules", "tsx", "dist", "cli.mjs");
 
 function run(command, args, options = {}) {
   const result = spawnSync(command, args, {
@@ -137,6 +141,10 @@ try {
   prisma(databaseUrl("clean_migration"), "migrate", "deploy");
   prisma(databaseUrl("clean_migration"), "migrate", "deploy");
   prisma(databaseUrl("clean_migration"), "migrate", "status");
+  prisma(databaseUrl("clean_migration"), "generate", "--schema", "prisma/schema.prisma");
+  run(process.execPath, [tsxCli, "scripts/verify-order-attempt-repository.ts"], {
+    env: { ...process.env, DATABASE_URL: databaseUrl("clean_migration") },
+  });
   prisma(
     databaseUrl("clean_migration"),
     "migrate",
@@ -152,7 +160,7 @@ try {
       "clean_migration",
       `SELECT COUNT(*) FROM "_prisma_migrations" WHERE finished_at IS NOT NULL AND rolled_back_at IS NULL;`,
     ),
-    "2",
+    expectedMigrationCount,
     "clean migration count",
   );
 
@@ -173,12 +181,38 @@ try {
     `INSERT INTO "TonhubPaymentInvoice" (
       "id", "externalId", "network", "fiatAmountCents", "address", "addressRaw",
       "walletVersion", "walletWorkchain", "walletContext", "walletNetworkGlobalId",
-      "walletPublicKeyHash", "amountNano", "reference", "updatedAt"
-    ) VALUES (
-      'legacy-invoice-1', 'legacy-order-1', 'testnet', 1250, 'legacy-address',
-      '0:legacy-address', 'v5r1', 0, 1, -3, 'legacy-key-hash', '1000000000',
-      'legacy-reference-1', CURRENT_TIMESTAMP
-    );`,
+      "walletPublicKeyHash", "amountNano", "paidNano", "reference", "status",
+      "observedAt", "partialPaymentStartedAt", "partialPaymentExpiresAt", "expiresAt", "updatedAt"
+    ) VALUES
+      (
+        'legacy-invoice-1', 'legacy-order-1', 'testnet', 1250, 'legacy-address',
+        '0:legacy-address', 'v5r1', 0, 1, -3, 'legacy-key-hash', '1000000000', '0',
+        'legacy-reference-1', 'PENDING', NULL, NULL, NULL, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP
+      ),
+      (
+        'legacy-partial', 'legacy-order-partial', 'testnet', 500, 'legacy-partial-address',
+        '0:legacy-partial-address', 'v5r1', 0, 11, -3, 'legacy-partial-key', '2000000000', '500000000',
+        'legacy-reference-partial', 'PARTIAL', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP,
+        CURRENT_TIMESTAMP + INTERVAL '24 hours', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP
+      ),
+      (
+        'legacy-paid', 'legacy-order-paid', 'testnet', 700, 'legacy-paid-address',
+        '0:legacy-paid-address', 'v5r1', 0, 12, -3, 'legacy-paid-key', '1000000000', '1000000000',
+        'legacy-reference-paid', 'PAID', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP,
+        CURRENT_TIMESTAMP + INTERVAL '24 hours', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP
+      ),
+      (
+        'legacy-expired-funded', 'legacy-order-expired-funded', 'testnet', 900,
+        'legacy-expired-funded-address', '0:legacy-expired-funded-address', 'v5r1', 0, 13, -3,
+        'legacy-expired-funded-key', '3000000000', '1000000000', 'legacy-reference-expired-funded',
+        'EXPIRED', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP,
+        CURRENT_TIMESTAMP
+      ),
+      (
+        'legacy-anonymous', NULL, 'testnet', 100, 'legacy-anonymous-address',
+        '0:legacy-anonymous-address', 'v5r1', 0, 14, -3, 'legacy-anonymous-key', '400000000', '0',
+        'legacy-reference-anonymous', 'PENDING', NULL, NULL, NULL, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP
+      );`,
   );
 
   prisma(
@@ -210,7 +244,7 @@ try {
       "legacy_migration",
       `SELECT COUNT(*) FROM "_prisma_migrations" WHERE finished_at IS NOT NULL AND rolled_back_at IS NULL;`,
     ),
-    "2",
+    expectedMigrationCount,
     "legacy migration count",
   );
   assertEqual(
@@ -224,21 +258,64 @@ try {
     "1",
     "one-active-attempt partial unique index",
   );
+  assertEqual(
+    psql(
+      "legacy_migration",
+      `SELECT invoice."orderId" || ':' || payment_order."externalId" || ':' ||
+              payment_order."fiatAmountMicros" || ':' || payment_order."status"
+       FROM "TonhubPaymentInvoice" invoice
+       JOIN "TonhubPaymentOrder" payment_order ON payment_order."id" = invoice."orderId"
+       WHERE invoice."id" = 'legacy-invoice-1';`,
+    ),
+    "legacy-order:legacy-invoice-1:legacy-order-1:12500000:PENDING",
+    "legacy invoice order backfill",
+  );
+  assertEqual(
+    psql(
+      "legacy_migration",
+      `SELECT string_agg(
+         invoice."id" || ':' || payment_order."status" || ':' ||
+         payment_order."creditedFiatMicros" || ':' || invoice."remainingFiatMicros" || ':' ||
+         invoice."amountAtomic" || ':' || invoice."paidAmountAtomic" || ':' ||
+         (invoice."firstMovementAt" IS NOT NULL),
+         ',' ORDER BY invoice."id"
+       )
+       FROM "TonhubPaymentInvoice" invoice
+       JOIN "TonhubPaymentOrder" payment_order ON payment_order."id" = invoice."orderId"
+       WHERE invoice."id" IN (
+         'legacy-anonymous', 'legacy-expired-funded', 'legacy-paid', 'legacy-partial'
+       );`,
+    ),
+    [
+      "legacy-anonymous:PENDING:0:1000000:400000000:0:false",
+      "legacy-expired-funded:RECOVERY:3000000:6000000:3000000000:1000000000:true",
+      "legacy-paid:PAID:7000000:0:1000000000:1000000000:true",
+      "legacy-partial:PARTIAL:1250000:3750000:2000000000:500000000:true",
+    ].join(","),
+    "legacy status and neutral amount backfill",
+  );
+  assertEqual(
+    psql(
+      "legacy_migration",
+      `SELECT payment_order."externalId" IS NULL
+       FROM "TonhubPaymentInvoice" invoice
+       JOIN "TonhubPaymentOrder" payment_order ON payment_order."id" = invoice."orderId"
+       WHERE invoice."id" = 'legacy-anonymous';`,
+    ),
+    "t",
+    "anonymous legacy order",
+  );
 
   psql(
     "legacy_migration",
-    `INSERT INTO "TonhubPaymentOrder" (
-       "id", "externalId", "fiatAmountMicros", "fiatCurrency", "updatedAt"
-     ) VALUES ('order-1', 'order-1', '12500000', 'EUR', CURRENT_TIMESTAMP);
-     UPDATE "TonhubPaymentInvoice" SET "orderId" = 'order-1' WHERE "id" = 'legacy-invoice-1';
-     DO $$
+    `DO $$
      BEGIN
        INSERT INTO "TonhubPaymentInvoice" (
          "id", "orderId", "network", "fiatAmountCents", "address", "addressRaw",
          "walletVersion", "walletWorkchain", "walletContext", "walletNetworkGlobalId",
          "walletPublicKeyHash", "amountNano", "reference", "updatedAt"
        ) VALUES (
-         'blocked-active-attempt', 'order-1', 'testnet', 1250, 'blocked-address',
+         'blocked-active-attempt', 'legacy-order:legacy-invoice-1', 'testnet', 1250, 'blocked-address',
          '0:blocked-address', 'v5r1', 0, 2, -3, 'blocked-key-hash', '1000000000',
          'blocked-reference', CURRENT_TIMESTAMP
        );
@@ -252,7 +329,7 @@ try {
        "walletVersion", "walletWorkchain", "walletContext", "walletNetworkGlobalId",
        "walletPublicKeyHash", "amountNano", "reference", "updatedAt"
      ) VALUES (
-       'replacement-attempt', 'order-1', 'testnet', 1250, 'replacement-address',
+       'replacement-attempt', 'legacy-order:legacy-invoice-1', 'testnet', 1250, 'replacement-address',
        '0:replacement-address', 'v5r1', 0, 3, -3, 'replacement-key-hash', '1000000000',
        'replacement-reference', CURRENT_TIMESTAMP
      );`,
@@ -261,7 +338,7 @@ try {
     psql(
       "legacy_migration",
       `SELECT COUNT(*) FROM "TonhubPaymentInvoice"
-       WHERE "orderId" = 'order-1' AND "status" IN ('PENDING', 'PARTIAL');`,
+       WHERE "orderId" = 'legacy-order:legacy-invoice-1' AND "status" IN ('PENDING', 'PARTIAL');`,
     ),
     "1",
     "one active attempt behavior with terminal replacement",
@@ -427,13 +504,13 @@ try {
      ) VALUES ('order-2', 'order-2', '12500000', 'EUR', CURRENT_TIMESTAMP);
      INSERT INTO "TonhubMovementAllocation" (
        "id", "movementId", "orderId", "invoiceId", "kind", "fiatCreditMicros"
-     ) VALUES ('allocation-1', 'movement-1', 'order-1', 'replacement-attempt', 'CREDIT', '2500000');
+     ) VALUES ('allocation-1', 'movement-1', 'legacy-order:legacy-invoice-1', 'replacement-attempt', 'CREDIT', '2500000');
      DO $$
      BEGIN
        INSERT INTO "TonhubMovementAllocation" (
          "id", "movementId", "orderId", "invoiceId", "kind", "reversesAllocationId", "fiatCreditMicros"
        ) VALUES (
-         'allocation-self', 'movement-1', 'order-1', 'replacement-attempt', 'REVERSAL',
+         'allocation-self', 'movement-1', 'legacy-order:legacy-invoice-1', 'replacement-attempt', 'REVERSAL',
          'allocation-self', '2500000'
        );
        RAISE EXCEPTION 'self reversal was accepted';
@@ -445,7 +522,7 @@ try {
        INSERT INTO "TonhubMovementAllocation" (
          "id", "movementId", "orderId", "invoiceId", "kind", "reversesAllocationId", "fiatCreditMicros"
        ) VALUES (
-         'allocation-wrong-amount', 'movement-1', 'order-1', 'replacement-attempt', 'REVERSAL',
+         'allocation-wrong-amount', 'movement-1', 'legacy-order:legacy-invoice-1', 'replacement-attempt', 'REVERSAL',
          'allocation-1', '1'
        );
        RAISE EXCEPTION 'non-mirroring reversal amount was accepted';
@@ -467,7 +544,7 @@ try {
      INSERT INTO "TonhubMovementAllocation" (
        "id", "movementId", "orderId", "invoiceId", "kind", "reversesAllocationId", "fiatCreditMicros", "note"
      ) VALUES (
-       'allocation-reversal-1', 'movement-1', 'order-1', 'replacement-attempt', 'REVERSAL',
+       'allocation-reversal-1', 'movement-1', 'legacy-order:legacy-invoice-1', 'replacement-attempt', 'REVERSAL',
        'allocation-1', '2500000', 'rehearsal correction'
      );
      DO $$
@@ -475,7 +552,7 @@ try {
        INSERT INTO "TonhubMovementAllocation" (
          "id", "movementId", "orderId", "invoiceId", "kind", "reversesAllocationId", "fiatCreditMicros"
        ) VALUES (
-         'allocation-reversal-of-reversal', 'movement-1', 'order-1', 'replacement-attempt', 'REVERSAL',
+         'allocation-reversal-of-reversal', 'movement-1', 'legacy-order:legacy-invoice-1', 'replacement-attempt', 'REVERSAL',
          'allocation-reversal-1', '2500000'
        );
        RAISE EXCEPTION 'reversal of a reversal was accepted';
