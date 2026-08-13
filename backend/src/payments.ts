@@ -29,6 +29,7 @@ import {
   type TonUniqueDepositAddress
 } from "./ton/deposit-addresses";
 import { findTonDepositAddressPayments } from "./ton/matching";
+import { canonicalTonTransactionHash } from "./ton/gram-shadow-scanner";
 import { ceilTonAmountNanoFromFiat, fetchTonFiatRate } from "./rates";
 import {
   TonhubOrderNotRetryableError,
@@ -50,6 +51,14 @@ import {
   parsePaymentAsset,
   paymentAssets,
 } from "../../shared/payment-assets";
+import {
+  compareGramSettlementMatches,
+  parseGramSettlementMode,
+  prismaGramLedgerSettlementSource,
+  type GramLedgerSettlementSource,
+  type GramSettlementComparison,
+  type GramSettlementMode,
+} from "./gram-ledger-source";
 
 type TonhubPaymentDependencies = {
   repository: TonhubPaymentRepository;
@@ -68,6 +77,9 @@ type TonhubPaymentDependencies = {
   }>;
   createTonDepositAddress: (input: { network: TonNetwork }) => TonUniqueDepositAddress;
   createTonInvoiceReference: (prefix?: string) => string;
+  gramLedgerSource: GramLedgerSettlementSource;
+  gramSettlementMode: () => GramSettlementMode;
+  reportGramSettlementComparison: (comparison: GramSettlementComparison) => void;
 };
 
 type PaymentResponse =
@@ -141,7 +153,7 @@ function invoicePartialUntil(invoice: TonhubPaymentInvoiceRecord) {
 }
 
 function transactionIdentity(match: TonInvoiceMatch) {
-  return match.transaction.hash || match.transaction.lt || null;
+  return canonicalTonTransactionHash(match.transaction.hash) || match.transaction.hash || match.transaction.lt || null;
 }
 
 function matchCreatedAtDate(match: TonInvoiceMatch) {
@@ -199,9 +211,10 @@ function normalizeStoredObservedPayment(value: unknown): TonhubObservedPayment |
     return null;
   }
 
-  const transactionId = typeof value.transactionId === "string" && value.transactionId
+  const storedTransactionId = typeof value.transactionId === "string" && value.transactionId
     ? value.transactionId
     : null;
+  const transactionId = canonicalTonTransactionHash(storedTransactionId) ?? storedTransactionId;
   const amountNano = validNanoAmount(value.amountAtomic)
     ? value.amountAtomic
     : validNanoAmount(value.amountNano)
@@ -247,6 +260,99 @@ function storedObservedPayments(invoice: TonhubPaymentInvoiceRecord) {
   return invoice.observedPayments
     .map((payment) => normalizeStoredObservedPayment(payment))
     .filter((payment): payment is TonhubObservedPayment => Boolean(payment));
+}
+
+function canonicalStoredAtomic(value: unknown) {
+  return typeof value === "string" && /^\d+$/.test(value)
+    ? BigInt(value).toString()
+    : null;
+}
+
+function strictStoredObservedPaymentMatches(invoice: TonhubPaymentInvoiceRecord): TonInvoiceMatch[] {
+  const paidNano = canonicalStoredAtomic(invoice.paidNano);
+  const paidAmountAtomic = invoice.paidAmountAtomic === null || invoice.paidAmountAtomic === undefined
+    ? null
+    : canonicalStoredAtomic(invoice.paidAmountAtomic);
+  if (!paidNano || (invoice.paidAmountAtomic !== null && invoice.paidAmountAtomic !== undefined && !paidAmountAtomic)) {
+    throw new Error(`GRAM invoice ${invoice.id} has malformed persisted paid amount.`);
+  }
+  if (paidAmountAtomic !== null && paidAmountAtomic !== paidNano) {
+    throw new Error(`GRAM invoice ${invoice.id} has inconsistent persisted paid amounts.`);
+  }
+  const persistedPaidAtomic = paidAmountAtomic ?? paidNano;
+  if (invoice.observedPayments === null || invoice.observedPayments === undefined) {
+    if (persistedPaidAtomic === "0") {
+      return [];
+    }
+    throw new Error(`GRAM invoice ${invoice.id} has paid amount without stored payment evidence.`);
+  }
+  if (!Array.isArray(invoice.observedPayments)) {
+    throw new Error(`GRAM invoice ${invoice.id} has malformed stored payment evidence.`);
+  }
+
+  const matches = new Map<string, TonInvoiceMatch>();
+  const facts = new Map<string, string>();
+  for (const value of invoice.observedPayments) {
+    const payment = normalizeStoredObservedPayment(value);
+    if (!payment || !isRecord(value)) {
+      throw new Error(`GRAM invoice ${invoice.id} has malformed stored payment evidence.`);
+    }
+    const transactionId = canonicalTonTransactionHash(payment.transactionId);
+    const hasAmountAtomic = value.amountAtomic !== null && value.amountAtomic !== undefined;
+    const hasAmountNano = value.amountNano !== null && value.amountNano !== undefined;
+    const amountAtomic = canonicalStoredAtomic(value.amountAtomic);
+    const amountNano = canonicalStoredAtomic(value.amountNano);
+    const normalizedAmount = amountAtomic ?? amountNano;
+    if (
+      !transactionId ||
+      !normalizedAmount ||
+      normalizedAmount === "0" ||
+      (hasAmountAtomic && !amountAtomic) ||
+      (hasAmountNano && !amountNano) ||
+      (amountAtomic !== null && amountNano !== null && amountAtomic !== amountNano)
+    ) {
+      throw new Error(`GRAM invoice ${invoice.id} has malformed stored payment evidence.`);
+    }
+    const asset = parsePaymentAsset(typeof value.asset === "string" ? value.asset : "GRAM");
+    if (
+      asset.symbol !== "GRAM" ||
+      (value.assetDecimals !== undefined && value.assetDecimals !== null && value.assetDecimals !== 9) ||
+      value.status !== "observed"
+    ) {
+      throw new Error(`GRAM invoice ${invoice.id} has non-GRAM stored payment evidence.`);
+    }
+    if (typeof value.createdAt !== "string") {
+      throw new Error(`GRAM invoice ${invoice.id} has malformed stored payment evidence.`);
+    }
+    const createdAt = new Date(value.createdAt);
+    if (Number.isNaN(createdAt.getTime())) {
+      throw new Error(`GRAM invoice ${invoice.id} has malformed stored payment evidence.`);
+    }
+    const immutableFacts = `${normalizedAmount}:${createdAt.toISOString()}`;
+    const existingFacts = facts.get(transactionId);
+    if (existingFacts !== undefined && existingFacts !== immutableFacts) {
+      throw new Error(`GRAM invoice ${invoice.id} has conflicting stored payment evidence.`);
+    }
+    if (existingFacts === undefined) {
+      facts.set(transactionId, immutableFacts);
+      matches.set(transactionId, {
+        transaction: { hash: transactionId },
+        comment: payment.comment,
+        amountNano: normalizedAmount,
+        createdAt: createdAt.toISOString(),
+        status: "observed",
+      });
+    }
+  }
+
+  const storedTotal = [...matches.values()].reduce(
+    (sum, match) => sum + BigInt(match.amountNano),
+    BigInt(0),
+  ).toString();
+  if (storedTotal !== persistedPaidAtomic) {
+    throw new Error(`GRAM invoice ${invoice.id} stored payment evidence does not match its paid amount.`);
+  }
+  return [...matches.values()];
 }
 
 function observedPaymentsFromMatches(matches: TonInvoiceMatch[]) {
@@ -509,6 +615,11 @@ function resolveDependencies(
     fetchTonFiatRate,
     createTonDepositAddress: ({ network }) => createTonV5R1DepositAddressFromEnv({ network }),
     createTonInvoiceReference,
+    gramLedgerSource: prismaGramLedgerSettlementSource,
+    gramSettlementMode: () => parseGramSettlementMode(process.env.TON_GRAM_SETTLEMENT_MODE),
+    reportGramSettlementComparison: (comparison) => {
+      console.log(`[tonhub-settlement-compare] ${JSON.stringify(comparison)}`);
+    },
     ...overrides
   };
 }
@@ -527,13 +638,161 @@ type SettleResult =
       match: TonInvoiceMatch | null;
     };
 
+function gramSettlementWindow(invoice: TonhubPaymentInvoiceRecord, now: Date) {
+  const lockUntil = invoiceLockUntil(invoice);
+  const existingPartialUntil = invoicePartialUntil(invoice);
+  const searchLimit = existingPartialUntil ?? addHours(lockUntil, partialPaymentTtlHours());
+  return {
+    searchLimit,
+    searchEnd: minDate(now, searchLimit),
+  };
+}
+
+function legacyGramMatches(input: {
+  invoice: TonhubPaymentInvoiceRecord;
+  transactions: NonNullable<TonCenterTransactionsResponse["transactions"]>;
+  notAfter: Date;
+}) {
+  return (input.invoice.addressStrategy === "unique-address"
+    ? findTonDepositAddressPayments({
+        transactions: input.transactions,
+        notBefore: input.invoice.createdAt,
+        notAfter: input.notAfter,
+      })
+    : findTonInvoicePayments({
+        transactions: input.transactions,
+        expectedComment: input.invoice.reference,
+        notBefore: input.invoice.createdAt,
+        notAfter: input.notAfter,
+      })).sort(compareMatchesByCreatedAt);
+}
+
+function reportGramComparison(
+  deps: TonhubPaymentDependencies,
+  comparison: GramSettlementComparison,
+) {
+  try {
+    deps.reportGramSettlementComparison(comparison);
+  } catch (error) {
+    console.error(
+      `[tonhub-settlement-compare] reporter failed: ${error instanceof Error ? error.message : String(error)}`,
+    );
+  }
+}
+
+export async function settleTonhubInvoiceWithConfiguredSource(input: {
+  invoice: TonhubPaymentInvoiceRecord;
+  dependencies?: Partial<TonhubPaymentDependencies>;
+}): Promise<SettleResult> {
+  const deps = resolveDependencies(input.dependencies);
+  const mode = deps.gramSettlementMode();
+  if (mode === "legacy") {
+    return settleTonhubInvoice({ invoice: input.invoice, dependencies: deps });
+  }
+  const network = input.invoice.network === "testnet" || input.invoice.network === "mainnet"
+    ? input.invoice.network
+    : null;
+  if (!network || (input.invoice.status !== "PENDING" && input.invoice.status !== "PARTIAL")) {
+    return settleTonhubInvoice({ invoice: input.invoice, dependencies: deps });
+  }
+
+  const storedPaymentMatches = mode === "ledger"
+    ? strictStoredObservedPaymentMatches(input.invoice)
+    : [];
+
+  const now = deps.now();
+  const { searchLimit, searchEnd } = gramSettlementWindow(input.invoice, now);
+  let observationError: string | undefined;
+  let scanAddress = input.invoice.address;
+  try {
+    scanAddress = (await deps.gramLedgerSource.resolveTarget({
+      invoiceId: input.invoice.id,
+      network,
+    })).address;
+  } catch (error) {
+    observationError = error instanceof Error ? error.message : String(error);
+    if (mode === "ledger") {
+      throw error;
+    }
+  }
+  const transactions = (await deps.fetchTonTransactions({
+    config: {
+      ...deps.resolveTonApiConfig(network),
+      address: scanAddress,
+    },
+    limit: transactionLimit,
+    startUtime: toUnixSeconds(input.invoice.createdAt),
+    endUtime: toUnixSeconds(searchEnd) + 60,
+  })).transactions ?? [];
+  const legacy = legacyGramMatches({
+    invoice: input.invoice,
+    transactions,
+    notAfter: searchLimit,
+  });
+  let ledger: TonInvoiceMatch[] = [];
+  try {
+    if (observationError) {
+      throw new Error(observationError);
+    }
+    await deps.gramLedgerSource.observeTransactions({
+      invoiceId: input.invoice.id,
+      network,
+      notBefore: input.invoice.createdAt,
+      notAfter: searchEnd,
+      transactions,
+    });
+    ledger = await deps.gramLedgerSource.listMatches({
+      invoiceId: input.invoice.id,
+      network,
+      notBefore: input.invoice.createdAt,
+      notAfter: searchEnd,
+    });
+    if (mode === "ledger") {
+      const storedCompatibility = compareGramSettlementMatches({
+        invoiceId: input.invoice.id,
+        legacy: storedPaymentMatches,
+        ledger,
+      });
+      if (storedCompatibility.onlyLegacy.length || storedCompatibility.conflicting.length) {
+        throw new Error(
+          `GRAM ledger cannot verify ${storedCompatibility.onlyLegacy.length + storedCompatibility.conflicting.length} stored payment(s) for invoice ${input.invoice.id}.`,
+        );
+      }
+    }
+  } catch (error) {
+    observationError = error instanceof Error ? error.message : String(error);
+    if (mode === "ledger") {
+      throw error;
+    }
+  }
+
+  const comparison = compareGramSettlementMatches({
+    invoiceId: input.invoice.id,
+    legacy,
+    ledger,
+    observationError,
+  });
+  if (mode === "compare" || !comparison.equivalent) {
+    reportGramComparison(deps, comparison);
+  }
+  return settleTonhubInvoice({
+    invoice: input.invoice,
+    dependencies: deps,
+    transactions,
+    matches: mode === "ledger" ? ledger : legacy,
+    now,
+  });
+}
+
 export async function settleTonhubInvoice(input: {
   invoice: TonhubPaymentInvoiceRecord;
   dependencies?: Partial<TonhubPaymentDependencies>;
   transactions?: TonCenterTransactionsResponse["transactions"];
+  matches?: TonInvoiceMatch[];
+  now?: Date;
 }): Promise<SettleResult> {
   const deps = resolveDependencies(input.dependencies);
-  const now = deps.now();
+  const now = input.now ?? deps.now();
   const invoice = input.invoice;
 
   if (invoice.status !== "PENDING" && invoice.status !== "PARTIAL") {
@@ -571,7 +830,7 @@ export async function settleTonhubInvoice(input: {
     startUtime: toUnixSeconds(invoice.createdAt),
     endUtime: toUnixSeconds(searchEnd) + 60
   })).transactions ?? [];
-  const matches = (invoice.addressStrategy === "unique-address"
+  const matches = (input.matches ?? (invoice.addressStrategy === "unique-address"
     ? findTonDepositAddressPayments({
         transactions,
         notBefore: invoice.createdAt,
@@ -582,7 +841,7 @@ export async function settleTonhubInvoice(input: {
         expectedComment: invoice.reference,
         notBefore: invoice.createdAt,
         notAfter: searchLimit
-      })).sort(compareMatchesByCreatedAt);
+      }))).sort(compareMatchesByCreatedAt);
   const observedMatches = matches.filter((match) => match.status === "observed");
   const partialStarter = invoice.partialPaymentStartedAt
     ? observedMatches.find((match) => {
@@ -859,7 +1118,7 @@ export async function createTonhubPaymentInvoice(
         };
       }
 
-      const settled = await settleTonhubInvoice({
+      const settled = await settleTonhubInvoiceWithConfiguredSource({
         invoice: reusableInvoice,
         dependencies: deps
       });
@@ -1008,7 +1267,7 @@ export async function checkTonhubPaymentInvoice(
       };
     }
 
-    const settled = await settleTonhubInvoice({
+    const settled = await settleTonhubInvoiceWithConfiguredSource({
       invoice,
       dependencies: deps
     });

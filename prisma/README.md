@@ -56,6 +56,9 @@ financial records, schema drift, and cleanup of only that temporary container.
 The same clean and legacy paths exercise the GRAM shadow scanner with the real
 Prisma client: concurrent workers cannot lease the same address stream, cursor
 replay is idempotent, and observed movements do not mutate settlement state.
+It also drives `/check` through the strict GRAM ledger source on both database
+histories, proving that aborted transfers are excluded, replay remains unique,
+and valid movements preserve the compatible `PARTIAL` to `PAID` transition.
 
 During rollout, apply migrations immediately before deploying the compatible
 application. The repository can still read an unlinked legacy row and will

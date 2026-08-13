@@ -76,10 +76,19 @@ every 15 seconds and recent terminal attempts once per day for 30 days by
 default. Its per-address cursor and lease are stored in `TonhubScanCursor`.
 It accepts only successful, positive native transfers whose normalized TON
 destination exactly matches the invoice deposit address, then appends an
-idempotent `OBSERVED` movement. It does not allocate fiat, update invoice/order
-status, or replace the legacy `/check` settlement path yet. Tune its batch,
-pagination, retry, lease, active cadence, and terminal cadence with the
-`TON_GRAM_SHADOW_*` variables documented in `.env.example`.
+idempotent `OBSERVED` movement. The background worker itself does not allocate
+fiat or update invoice/order status. The `/check` path now uses these strict
+movements as its observation source before running the compatible GRAM state
+machine. Tune the worker's batch, pagination, retry, lease, active cadence, and
+terminal cadence with the `TON_GRAM_SHADOW_*` variables documented in
+`.env.example`.
+
+`TON_GRAM_SETTLEMENT_MODE` controls the reversible read cutover. `ledger` is the
+default and settles only strict persisted movements. `compare` records the same
+movements and emits a structured `[tonhub-settlement-compare]` diff while the
+legacy matcher still determines the response. `legacy` is the emergency
+rollback and bypasses movement observation. Comparison/reporting failures never
+change the legacy result; ledger-mode observation failures fail closed.
 
 ## API
 
@@ -123,7 +132,9 @@ This module uses unique-address direct GRAM (ex TON) payments on the TON network
    context metadata stored in PostgreSQL.
 2. The frontend shows that invoice-specific address as a QR/deeplink and polls
    the backend.
-3. The backend checks TON Center for incoming transfers to the invoice address.
+3. The backend checks TON Center for incoming transfers to the owned deposit
+   address, journals only explicitly successful native transfers as immutable
+   movements, and settles the compatible GRAM state machine from those rows.
    When the expected amount is observed, it marks the invoice `PAID` and marks
    the related deposit address `PAID`.
 4. The sweep worker queries PostgreSQL for `PAID` deposit addresses with
@@ -132,11 +143,11 @@ This module uses unique-address direct GRAM (ex TON) payments on the TON network
    `balance - TON_SWEEP_RESERVE_NANO` to `TON_*_SWEEP_RECIPIENT_ADDRESS`.
 
 The sweep worker does not independently discover payments. It only sweeps
-addresses that the legacy backend settlement path has already marked `PAID`, so
+addresses that the backend settlement path has already marked `PAID`, so
 invoice polling or an explicit `POST /api/tonhub-payments/invoices/:id/check`
-must still happen before the sweep candidate exists. The separate GRAM shadow
-scanner discovers and journals movements but deliberately does not settle them
-until the later comparison and cutover stage.
+must still happen before the sweep candidate exists. The separate GRAM scanner
+can discover and journal movements without polling, but the compatible state
+transition still runs on `/check` until the later autonomous settlement stage.
 
 Current sweep state is stored on `TonhubDepositAddress`. A successful broadcast
 sets `sweepStatus` to `SENT` and stores `sweepAmountNano`, `sweepReserveNano`,
@@ -215,13 +226,24 @@ credit always derives ownership through movement deposit address → invoice →
 order; invoice-less reassignment is reserved for a later authenticated and
 audited recovery workflow.
 
-The GRAM shadow worker now feeds this ledger independently of user polling. It
+The GRAM shadow worker feeds this ledger independently of user polling. It
 normalizes friendly/raw TON addresses and hex/base64 transaction hashes before
 fingerprinting, ignores comments for unique-address matching, rejects aborted,
 unknown, failed, malformed, foreign-address, non-positive, and out-of-window
 evidence, and advances its resumable cursor only after every selected movement
 has been persisted. Provider or persistence errors release the lease for retry
 without changing settlement state.
+
+The GRAM `/check` read path has been cut over to the same strict movement facts.
+It resolves the deposit relation as the scan owner, synchronously journals the
+current provider page, reads all usable GRAM movements inside the invoice
+window, and supplies those matches to the characterized partial/expiry/payment
+state machine. Existing stored partial hashes are canonicalized across hex and
+base64url encodings, preventing rollout replay from double-counting them. A
+legacy stored partial that cannot be reconciled to strict immutable movement
+evidence fails closed without reducing or advancing its invoice. This stage
+intentionally preserves the legacy locked-GRAM amount formula; immutable fiat
+allocations and mixed-asset settlement are introduced in the next stage.
 
 ## Frontend
 
@@ -278,4 +300,5 @@ npm run db:migrate:rehearse
 Unit tests use fake TON Center responses and never touch a real wallet or
 network. The migration rehearsal creates temporary clean and legacy-upgraded
 PostgreSQL databases in Docker and verifies scanner leasing, cursor replay,
-movement idempotency, and settlement isolation against the real Prisma client.
+movement idempotency, strict-vs-legacy divergence, partial-to-paid cutover, and
+settlement isolation against the real Prisma client.

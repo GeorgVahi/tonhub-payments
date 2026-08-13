@@ -178,6 +178,7 @@ const dependencies = {
     apiKeyEnvName: "TON_TESTNET_API_KEY"
   }),
   fetchTonTransactions: async () => ({ transactions: currentTransactions }),
+  gramSettlementMode: () => "legacy" as const,
   fetchTonFiatRate: async () => ({
     fiatPerTon: 2.47,
     updatedAt: new Date("2026-05-11T09:59:00.000Z"),

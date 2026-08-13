@@ -29,7 +29,7 @@ function text(value: unknown) {
   return typeof value === "string" && value.trim() ? value.trim() : null;
 }
 
-function canonicalHash(value: unknown) {
+export function canonicalTonTransactionHash(value: unknown) {
   const hash = text(value);
   if (!hash) {
     return null;
@@ -92,14 +92,14 @@ function rejection(
   code: GramShadowRejectionCode,
 ): GramShadowRejection {
   return {
-    transactionHash: canonicalHash(transaction.hash),
+    transactionHash: canonicalTonTransactionHash(transaction.hash),
     transactionLt: canonicalLt(transaction.lt),
     code,
   };
 }
 
 export function tonTransactionCursor(transaction: TonCenterTransaction) {
-  const hash = canonicalHash(transaction.hash);
+  const hash = canonicalTonTransactionHash(transaction.hash);
   const lt = canonicalLt(transaction.lt);
   const timestamp = transactionDate(transaction.now);
   return hash && lt && timestamp ? { hash, lt, timestamp } : null;
@@ -132,7 +132,7 @@ export function scanGramShadowTransactions(input: {
   const asset = paymentAssets.GRAM;
 
   for (const transaction of input.transactions) {
-    const hash = canonicalHash(transaction.hash);
+    const hash = canonicalTonTransactionHash(transaction.hash);
     const lt = canonicalLt(transaction.lt);
     if (!hash || !lt) {
       rejections.push(rejection(transaction, "TRANSACTION_ID_INVALID"));
