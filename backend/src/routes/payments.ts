@@ -8,6 +8,7 @@ import { parseFiatCurrency, resolveAllowedNetworks, resolveDefaultNetwork } from
 import { fetchTonFiatRate } from "../rates";
 import { gramAsset } from "../ton/direct-payments";
 import { listPaymentAssets, paymentAssets } from "../../../shared/payment-assets";
+import { resolveCheckoutAssetPolicy } from "../checkout-assets";
 
 export function createTonhubPaymentRoutes() {
   const app = new Hono();
@@ -18,15 +19,19 @@ export function createTonhubPaymentRoutes() {
     })
   );
 
-  app.get("/api/tonhub-payments/config", (context) =>
-    context.json({
+  app.get("/api/tonhub-payments/config", (context) => {
+    const checkout = resolveCheckoutAssetPolicy();
+    const defaultNetwork = resolveDefaultNetwork();
+    return context.json({
       ok: true,
       config: {
-        defaultNetwork: resolveDefaultNetwork(),
+        defaultNetwork,
         allowedNetworks: resolveAllowedNetworks(),
         currencies: ["EUR", "USD"],
-        defaultAsset: paymentAssets.GRAM.symbol,
-        checkoutAssets: [paymentAssets.GRAM.symbol],
+        defaultAsset: checkout.defaultAssetByNetwork[defaultNetwork],
+        checkoutAssets: checkout.checkoutAssetsByNetwork[defaultNetwork],
+        defaultAssetByNetwork: checkout.defaultAssetByNetwork,
+        checkoutAssetsByNetwork: checkout.checkoutAssetsByNetwork,
         assets: listPaymentAssets().map((asset) => ({
           symbol: asset.symbol,
           label: asset.label,
@@ -39,8 +44,8 @@ export function createTonhubPaymentRoutes() {
         invoiceTtlMinutes: Number.parseInt(process.env.TON_INVOICE_TTL_MINUTES || "60", 10),
         partialPaymentTtlHours: Number.parseInt(process.env.TON_PARTIAL_PAYMENT_TTL_HOURS || "24", 10)
       }
-    })
-  );
+    });
+  });
 
   app.get("/api/tonhub-payments/rates/:currency", async (context) => {
     try {

@@ -509,6 +509,10 @@ export function createPrismaTonhubPaymentRepository(db: PrismaLike): TonhubPayme
           ) {
             throw new Error("Invoice activation threshold must be between zero and the order obligation.");
           }
+          const checkoutAsset = assertPaymentAssetSnapshot(parsePaymentAsset(input.quote.asset), {
+            decimals: input.quote.assetDecimals,
+          });
+          const amountAtomic = input.quote.amountAtomic;
           const orderData = {
             externalId: input.externalId || null,
             fiatAmountMicros,
@@ -567,10 +571,10 @@ export function createPrismaTonhubPaymentRepository(db: PrismaLike): TonhubPayme
               externalId: null,
               orderId: order.id,
               network: input.network,
-              asset: gramAsset.symbol,
-              checkoutAsset: gramAsset.symbol,
-              assetKind: "NATIVE",
-              assetDecimals: gramAsset.decimals,
+              asset: checkoutAsset.symbol,
+              checkoutAsset: checkoutAsset.symbol,
+              assetKind: checkoutAsset.kind,
+              assetDecimals: checkoutAsset.decimals,
               fiatAmountCents: input.amountCents,
               fiatAmountMicros,
               creditedFiatMicros: "0",
@@ -585,13 +589,13 @@ export function createPrismaTonhubPaymentRepository(db: PrismaLike): TonhubPayme
               walletContext: input.depositAddress.walletContext,
               walletNetworkGlobalId: input.depositAddress.walletNetworkGlobalId,
               walletPublicKeyHash: input.depositAddress.walletPublicKeyHash,
-              amountNano: input.quote.amountNano,
+              amountNano: input.quote.amountNano ?? amountAtomic,
               paidNano: "0",
-              amountAtomic: input.quote.amountAtomic ?? input.quote.amountNano,
+              amountAtomic,
               paidAmountAtomic: "0",
               reference: input.reference,
               status: "PENDING",
-              providerName: "ton-direct",
+              providerName: checkoutAsset.kind === "JETTON" ? "ton-jetton-direct" : "ton-direct",
               expiresAt: input.expiresAt,
               priceLockedAt: input.priceLockedAt,
               priceLockedUntil: input.priceLockedUntil,

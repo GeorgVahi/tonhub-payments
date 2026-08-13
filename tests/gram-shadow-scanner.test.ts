@@ -8,6 +8,7 @@ import {
 } from "../backend/src/ton/gram-shadow-scanner";
 import type { TonCenterTransaction } from "../backend/src/ton/direct-payments";
 import {
+  createPrismaGramShadowScannerRepository,
   runGramShadowScanBatch,
   type GramShadowScanTarget,
   type GramShadowScannerRepository,
@@ -222,6 +223,61 @@ function repositoryHarness(scanTarget = target()) {
   };
   return { repository, calls };
 }
+
+test("GRAM shadow candidate selection includes a USDT checkout deposit", async () => {
+  let candidateWhere: Record<string, unknown> | null = null;
+  const cursor = {
+    id: "cursor-1",
+    lastHash: null,
+    lastLt: null,
+    lastTimestamp: null,
+  };
+  const db = {
+    $transaction: async (handler: (tx: unknown) => Promise<unknown>) => handler(db),
+    tonhubPaymentInvoice: {
+      findMany: async (input: { where: Record<string, unknown> }) => {
+        candidateWhere = input.where;
+        return [{
+          id: "invoice-usdt",
+          network: "mainnet",
+          checkoutAsset: "USDT",
+          address: destinationFriendly,
+          addressRaw: destinationRaw,
+          status: "PENDING",
+          createdAt: scanStart,
+          updatedAt: scanStart,
+          terminalMonitorUntil: null,
+          depositAddress: {
+            id: "deposit-usdt",
+            network: "mainnet",
+            address: destinationFriendly,
+            addressRaw: destinationRaw,
+          },
+        }];
+      },
+      updateMany: async () => ({ count: 1 }),
+      findUnique: async () => ({ id: "invoice-usdt" }),
+    },
+    tonhubScanCursor: {
+      createMany: async () => ({ count: 1 }),
+      findUnique: async () => cursor,
+      updateMany: async () => ({ count: 1 }),
+    },
+  };
+  const repository = createPrismaGramShadowScannerRepository(db as any);
+  const targets = await repository.claimDueTargets({
+    network: "mainnet",
+    workerId: "gram-worker",
+    now: scanNow,
+    limit: 1,
+    leaseMs: 60_000,
+    terminalMonitorMs: 30 * 24 * 60 * 60 * 1000,
+  });
+
+  assert.equal(Object.hasOwn(candidateWhere ?? {}, "checkoutAsset"), false);
+  assert.equal(targets.length, 1);
+  assert.equal(targets[0]?.invoiceId, "invoice-usdt");
+});
 
 test("GRAM shadow batch paginates until its cursor and records only newer successful movements", async () => {
   const harness = repositoryHarness();

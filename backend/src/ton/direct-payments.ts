@@ -280,11 +280,25 @@ export function createTonInvoiceReference(prefix = "AF-TEST") {
 export function buildTonTransferLink(input: {
   address: string;
   amountNano: string;
-  comment: string;
+  comment?: string;
 }) {
   const url = new URL(`ton://transfer/${input.address}`);
   url.searchParams.set("amount", input.amountNano);
-  url.searchParams.set("text", input.comment);
+  if (input.comment) {
+    url.searchParams.set("text", input.comment);
+  }
+
+  return url.toString();
+}
+
+export function buildTonJettonTransferLink(input: {
+  address: string;
+  amountAtomic: string;
+  jettonMasterAddress: string;
+}) {
+  const url = new URL(`ton://transfer/${input.address}`);
+  url.searchParams.set("jetton", input.jettonMasterAddress);
+  url.searchParams.set("amount", input.amountAtomic);
 
   return url.toString();
 }

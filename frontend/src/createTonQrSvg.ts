@@ -1,9 +1,9 @@
-const qrVersion = 6;
+const qrVersion = 7;
 const qrSize = 17 + qrVersion * 4;
-const qrDataCodewords = 136;
-const qrBlockDataCodewords = 68;
-const qrEccCodewords = 18;
-const qrMaxBytes = 134;
+const qrDataCodewords = 156;
+const qrBlockDataCodewords = 78;
+const qrEccCodewords = 20;
+const qrMaxBytes = 154;
 
 type QrMatrix = {
   modules: boolean[][];
@@ -72,15 +72,41 @@ function drawFunctionPatterns(matrix: QrMatrix) {
   drawFinder(matrix, 0, 0);
   drawFinder(matrix, 0, qrSize - 7);
   drawFinder(matrix, qrSize - 7, 0);
-  drawAlignment(matrix, 34, 34);
-
   for (let i = 8; i < qrSize - 8; i += 1) {
     const dark = i % 2 === 0;
     setFunction(matrix, 6, i, dark);
     setFunction(matrix, i, 6, dark);
   }
 
+  const alignmentPositions = [6, 22, 38];
+  for (const row of alignmentPositions) {
+    for (const col of alignmentPositions) {
+      const overlapsFinder =
+        (row === 6 && col === 6) ||
+        (row === 6 && col === 38) ||
+        (row === 38 && col === 6);
+      if (!overlapsFinder) {
+        drawAlignment(matrix, row, col);
+      }
+    }
+  }
+
   setFunction(matrix, qrSize - 8, 8, true);
+
+  let versionBits = qrVersion << 12;
+  for (let bit = 17; bit >= 12; bit -= 1) {
+    if (((versionBits >>> bit) & 1) !== 0) {
+      versionBits ^= 0x1f25 << (bit - 12);
+    }
+  }
+  versionBits |= qrVersion << 12;
+  for (let bit = 0; bit < 18; bit += 1) {
+    const dark = ((versionBits >>> bit) & 1) !== 0;
+    const offset = qrSize - 11 + bit % 3;
+    const position = Math.floor(bit / 3);
+    setFunction(matrix, position, offset, dark);
+    setFunction(matrix, offset, position, dark);
+  }
 }
 
 function appendBits(bits: number[], value: number, length: number) {
@@ -430,7 +456,11 @@ function isFinderModule(row: number, col: number) {
 
 type TonQrTone = "dark-on-light" | "light-on-dark";
 
-export function createTonQrSvg(payload: string, tone: TonQrTone = "dark-on-light") {
+export function createTonQrSvg(
+  payload: string,
+  tone: TonQrTone = "dark-on-light",
+  label = "TON payment QR",
+) {
   const bytes = new TextEncoder().encode(payload);
   const dataCodewords = bytesToCodewords(bytes);
 
@@ -483,7 +513,7 @@ export function createTonQrSvg(payload: string, tone: TonQrTone = "dark-on-light
     .join("");
 
   return [
-    `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ${viewSize} ${viewSize}" role="img" aria-label="GRAM (ex TON) payment QR" class="tonhub-qr-svg ${toneClass}">`,
+    `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 ${viewSize} ${viewSize}" role="img" aria-label="${label.replace(/[&<>\"']/g, "")}" class="tonhub-qr-svg ${toneClass}">`,
     `<rect width="${viewSize}" height="${viewSize}" rx="2.2" ry="2.2" class="tonhub-qr-bg-fill"/>`,
     `<g class="tonhub-qr-fg-fill">${finders}${dataDots}</g>`,
     "</svg>"

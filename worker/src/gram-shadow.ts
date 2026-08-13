@@ -147,7 +147,6 @@ export function createPrismaGramShadowScannerRepository(
       const candidates = await db.tonhubPaymentInvoice.findMany({
         where: {
           network: input.network,
-          checkoutAsset: "GRAM",
           addressStrategy: "unique-address",
           depositAddress: { isNot: null },
           OR: [

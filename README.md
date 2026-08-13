@@ -45,17 +45,23 @@ npm run worker:scan:gram-shadow -- --network=testnet --watch --interval-seconds=
 npm run worker:sweep -- --network=testnet --watch --interval-seconds=15
 ```
 
-The official mainnet USDT observer is a separate, disabled-by-default runtime:
+The official mainnet USDT observer and sweep service are separate, disabled-by-default runtimes:
 
 ```bash
 TON_USDT_MAINNET_ADAPTER_ENABLED=true npm run worker:scan:usdt-mainnet -- --watch
 TON_USDT_MAINNET_ADAPTER_ENABLED=true npm run worker:sweep:usdt-mainnet -- --watch
+npm run worker:scan:gram-shadow -- --network=mainnet --watch --interval-seconds=15
+npm run worker:sweep -- --network=mainnet --watch --interval-seconds=15
 ```
 
-It can only scan mainnet and does not expose USDT in public checkout. New
-invoices also need `TON_MOVEMENT_SETTLEMENT_ENABLED=true` to receive the sticky
-fiat-ledger policy that can allocate observed USDT. The second runtime consumes
-the durable asset-sweep queue; it does not expose USDT in public checkout.
+They can only process mainnet. Public USDT checkout is a third, independent
+rollout switch: it is exposed only when `TON_USDT_MAINNET_CHECKOUT_ENABLED`,
+`TON_USDT_MAINNET_ADAPTER_ENABLED`, and `TON_MOVEMENT_SETTLEMENT_ENABLED` are
+all `true`, and settlement mode is not `legacy`. Testnet checkout remains
+GRAM-only. A production USDT rollout therefore runs the rate, USDT observer,
+GRAM shadow observer, settlement, native-sweep, and asset-sweep workers before
+enabling the public switch. The GRAM observer must include mainnet so a native
+transfer sent to a USDT checkout is still discovered and valued in fiat.
 
 The frontend and backend are enough to create invoices and detect payments, but
 they do not sweep funds to the main wallet. The sweep worker must be running for
@@ -127,6 +133,7 @@ Content-Type: application/json
   "amount": "49.00",
   "currency": "EUR",
   "network": "testnet",
+  "asset": "GRAM",
   "externalId": "order-123",
   "metadata": { "customerId": "user-1" }
 }
@@ -217,9 +224,18 @@ of payment-asset identity and precision:
   `GRAM (ex TON)`. The legacy input alias `TON` resolves to `GRAM`; amounts use
   9 atomic decimals and checkout amounts are rounded up to 2 displayed digits.
 - `USDT` is a TON jetton with 6 atomic decimals and a USD-peg pricing strategy.
-  Listing it in the registry does not yet enable it in checkout: the config
-  endpoint continues to return `checkoutAssets: ["GRAM"]` until the verified
-  jetton scanner and canonical deployment are enabled in later rollout stages.
+  Public mainnet checkout presents it first when the independent public flag
+  and all required settlement services are enabled; GRAM remains the alternate
+  choice. Public testnet and the internal arbitrary test jetton remain GRAM-only.
+
+`POST /api/tonhub-payments/invoices` accepts optional `asset: "GRAM" | "USDT"`.
+Omitting it preserves the legacy GRAM API contract. The choice fixes the
+concrete attempt and payment instruction but not the fiat order obligation; a
+retry of the same merchant `externalId` reuses the existing attempt instead of
+silently switching assets. USDT issuance reads a fresh immutable USD-peg or EUR
+cross snapshot, calculates micro-USDT with integer arithmetic, and returns a
+standard `ton://transfer` jetton link plus the unique owner address and manual
+amount fallback. The link pins the compiled official mainnet USDT master.
 
 New API consumers should use `asset`, `assetKind`, `assetDecimals`,
 `amountAtomic`, `amountFormatted`, and the corresponding `expected`, `paid`,

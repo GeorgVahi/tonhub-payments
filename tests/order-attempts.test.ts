@@ -225,6 +225,37 @@ test("new invoices dual-write one order and one active attempt", async () => {
   assert.equal(memory.invoices[0]?.activationThresholdFiatMicros, "2500000");
 });
 
+test("a public USDT attempt persists the selected jetton identity without changing the fiat order", async () => {
+  const memory = createMemoryPrisma();
+  const repository = createPrismaTonhubPaymentRepository(memory.db);
+  const usdtQuote: TonhubRateQuote = {
+    source: "usd-peg",
+    rateSnapshotId: "usdt-usd-order-snapshot",
+    asset: "USDT",
+    assetDecimals: 6,
+    fiatPerAsset: 1,
+    amountAtomic: "5000000",
+    amountFormatted: "5.00 USDT",
+    fiatAmountCents: 500,
+    fiatAmount: 5,
+    fiatCurrency: "USD",
+    updatedAt: createdAt,
+    fetchedAt: createdAt,
+  };
+  const created = await repository.createPendingInvoice({
+    ...pendingInput("merchant-usdt-order"),
+    network: "mainnet",
+    depositAddress: { ...depositAddress, network: "mainnet", walletNetworkGlobalId: -239 },
+    quote: usdtQuote,
+  });
+  assert.equal(memory.orders[0]?.fiatAmountMicros, "5000000");
+  assert.equal(created.checkoutAsset, "USDT");
+  assert.equal(created.assetKind, "JETTON");
+  assert.equal(created.assetDecimals, 6);
+  assert.equal(created.amountAtomic, "5000000");
+  assert.equal(memory.invoices[0]?.providerName, "ton-jetton-direct");
+});
+
 test("an unlinked legacy invoice remains readable during rollout", async () => {
   const memory = createMemoryPrisma();
   const repository = createPrismaTonhubPaymentRepository(memory.db);

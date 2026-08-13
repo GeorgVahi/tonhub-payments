@@ -751,6 +751,40 @@ try {
   });
   assert.equal(directPaid?.firstMovementAt?.toISOString(), directPaidAt.toISOString());
 
+  const usdtAttempt = await repository.createPendingInvoice({
+    ...input,
+    externalId: "repository-public-usdt-order",
+    network: "mainnet",
+    reference: "REPOSITORY-PUBLIC-USDT",
+    depositAddress: {
+      ...input.depositAddress,
+      network: "mainnet",
+      address: "EQ_REPOSITORY_PUBLIC_USDT",
+      addressRaw: "0:repository-public-usdt",
+      walletContext: 950,
+      walletNetworkGlobalId: -239,
+    },
+    quote: {
+      source: "usd-peg",
+      rateSnapshotId: "repository-usdt-rate",
+      asset: "USDT",
+      assetDecimals: 6,
+      fiatPerAsset: 1,
+      amountAtomic: "5000000",
+      amountFormatted: "5.00 USDT",
+      fiatAmountCents: 500,
+      fiatAmount: 5,
+      fiatCurrency: "USD",
+      updatedAt: createdAt,
+      fetchedAt: createdAt,
+    },
+  });
+  assert.equal(usdtAttempt.checkoutAsset, "USDT");
+  assert.equal(usdtAttempt.assetKind, "JETTON");
+  assert.equal(usdtAttempt.assetDecimals, 6);
+  assert.equal(usdtAttempt.amountAtomic, "5000000");
+  assert.equal(usdtAttempt.order?.fiatAmountMicros, "5000000");
+
   process.stdout.write("Order/attempt repository rehearsal passed.\n");
 } finally {
   await prisma.$disconnect();

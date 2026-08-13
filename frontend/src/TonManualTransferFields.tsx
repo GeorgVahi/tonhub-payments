@@ -55,9 +55,11 @@ async function copyWithFallback(value: string) {
   return Promise.resolve();
 }
 
-export function copyableTonAmount(value: string) {
-  return value.replace(/\s*(?:GRAM\s*\(ex\s*TON\)|GRAM|TON)$/i, "").trim();
+export function copyableAssetAmount(value: string) {
+  return value.replace(/\s*(?:GRAM\s*\(ex\s*TON\)|GRAM|TON|USDT)$/i, "").trim();
 }
+
+export const copyableTonAmount = copyableAssetAmount;
 
 export function TonManualTransferFields({
   address,

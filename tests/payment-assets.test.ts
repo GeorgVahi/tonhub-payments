@@ -14,8 +14,20 @@ import {
   paymentAssets,
   paymentUnitAtomic,
 } from "../shared/payment-assets";
+import { resolveCheckoutAssetPolicy } from "../backend/src/checkout-assets";
+import { buildTonJettonTransferLink } from "../backend/src/ton/direct-payments";
+import { officialMainnetUsdtMasterFriendlyAddress } from "../backend/src/ton/mainnet-usdt";
+import { createTonQrSvg } from "../frontend/src/createTonQrSvg";
+import { createElement } from "react";
+import { renderToStaticMarkup } from "react-dom/server";
+import {
+  checkoutAssetForNetwork,
+  fiatPaymentProgress,
+  PaymentStatusAnnouncement,
+  TonhubPaymentWidget,
+} from "../frontend/src/TonhubPaymentWidget";
 
-test("the asset registry defines GRAM and USDT without enabling USDT checkout", async () => {
+test("the asset registry and default-off public policy keep testnet GRAM-only", async () => {
   assert.deepEqual(
     listPaymentAssets().map(({ symbol, kind, decimals, checkoutFractionDigits, pricingStrategy }) => ({
       symbol,
@@ -59,6 +71,110 @@ test("the asset registry defines GRAM and USDT without enabling USDT checkout", 
   assert.equal(body.config.defaultAsset, "GRAM");
   assert.deepEqual(body.config.checkoutAssets, ["GRAM"]);
   assert.deepEqual(body.config.assets.map((asset) => asset.symbol), ["GRAM", "USDT"]);
+});
+
+test("public USDT policy requires all independent mainnet settlement flags", () => {
+  const enabled = resolveCheckoutAssetPolicy({
+    TON_USDT_MAINNET_CHECKOUT_ENABLED: "true",
+    TON_USDT_MAINNET_ADAPTER_ENABLED: "true",
+    TON_MOVEMENT_SETTLEMENT_ENABLED: "true",
+    TON_GRAM_SETTLEMENT_MODE: "ledger",
+  });
+  assert.equal(enabled.defaultAsset, "USDT");
+  assert.deepEqual(enabled.checkoutAssetsByNetwork, {
+    testnet: ["GRAM"],
+    mainnet: ["USDT", "GRAM"],
+  });
+  for (const missing of [
+    "TON_USDT_MAINNET_CHECKOUT_ENABLED",
+    "TON_USDT_MAINNET_ADAPTER_ENABLED",
+    "TON_MOVEMENT_SETTLEMENT_ENABLED",
+  ]) {
+    const env: Record<string, string> = {
+      TON_USDT_MAINNET_CHECKOUT_ENABLED: "true",
+      TON_USDT_MAINNET_ADAPTER_ENABLED: "true",
+      TON_MOVEMENT_SETTLEMENT_ENABLED: "true",
+      TON_GRAM_SETTLEMENT_MODE: "ledger",
+    };
+    env[missing] = "false";
+    assert.equal(resolveCheckoutAssetPolicy(env).usdtMainnetEnabled, false, missing);
+  }
+  assert.equal(resolveCheckoutAssetPolicy({
+    TON_USDT_MAINNET_CHECKOUT_ENABLED: "true",
+    TON_USDT_MAINNET_ADAPTER_ENABLED: "true",
+    TON_MOVEMENT_SETTLEMENT_ENABLED: "true",
+    TON_GRAM_SETTLEMENT_MODE: "legacy",
+  }).usdtMainnetEnabled, false);
+});
+
+test("the widget waits for server policy and applies USDT as the mainnet default", () => {
+  const available = {
+    testnet: ["GRAM"],
+    mainnet: ["USDT", "GRAM"],
+  } as const;
+  const defaults = { testnet: "GRAM", mainnet: "USDT" } as const;
+  assert.equal(checkoutAssetForNetwork({
+    network: "mainnet",
+    defaults,
+    available: {
+      testnet: [...available.testnet],
+      mainnet: [...available.mainnet],
+    },
+  }), "USDT");
+  assert.equal(checkoutAssetForNetwork({
+    network: "mainnet",
+    requested: "GRAM",
+    defaults,
+    available: {
+      testnet: [...available.testnet],
+      mainnet: [...available.mainnet],
+    },
+  }), "GRAM");
+  assert.deepEqual(fiatPaymentProgress({
+    creditedFiatFormatted: "2.75 USD",
+    remainingFiatFormatted: "2.25 USD",
+    fiatCurrency: "USD",
+  }), {
+    paid: "2.75 USD",
+    remaining: "2.25 USD",
+  });
+
+  const initialMarkup = renderToStaticMarkup(createElement(TonhubPaymentWidget, {
+    initialNetwork: "mainnet",
+    initialAsset: "USDT",
+  }));
+  assert.match(initialMarkup, /Loading payment options\.\.\.<\/button>/);
+  assert.match(initialMarkup, /<button[^>]*disabled=""[^>]*>Loading payment options/);
+
+  const statusMarkup = renderToStaticMarkup(createElement(PaymentStatusAnnouncement, {
+    message: "Payment successful",
+  }));
+  assert.match(statusMarkup, /role="status"/);
+  assert.match(statusMarkup, /aria-live="polite"/);
+  assert.match(statusMarkup, /aria-atomic="true"/);
+});
+
+test("official USDT deeplink carries the unique deposit owner, master, and micro-USDT amount", () => {
+  const link = buildTonJettonTransferLink({
+    address: "UQ_DEPOSIT_OWNER",
+    amountAtomic: "12340000",
+    jettonMasterAddress: officialMainnetUsdtMasterFriendlyAddress,
+  });
+  const url = new URL(link);
+  assert.equal(url.protocol, "ton:");
+  assert.equal(url.pathname, "/UQ_DEPOSIT_OWNER");
+  assert.equal(url.searchParams.get("jetton"), officialMainnetUsdtMasterFriendlyAddress);
+  assert.equal(url.searchParams.get("amount"), "12340000");
+  assert.equal(url.searchParams.has("text"), false);
+  const realisticLink = buildTonJettonTransferLink({
+    address: "UQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAJKZ",
+    amountAtomic: "12340000",
+    jettonMasterAddress: officialMainnetUsdtMasterFriendlyAddress,
+  });
+  const qr = createTonQrSvg(realisticLink, "light-on-dark", "USDT payment QR");
+  assert.ok(qr);
+  assert.match(qr, /viewBox="0 0 53 53"/);
+  assert.match(qr, /aria-label="USDT payment QR"/);
 });
 
 test("atomic conversion is exact for native GRAM and six-decimal USDT", () => {
@@ -185,8 +301,10 @@ test("invoice responses use neutral atomic fields for a six-decimal jetton", asy
       expectedAmountFormatted: serialized.expectedAmountFormatted,
       paidAmountAtomic: serialized.paidAmountAtomic,
       paidAmountFormatted: serialized.paidAmountFormatted,
+      creditedFiatFormatted: serialized.creditedFiatFormatted,
       remainingAmountAtomic: serialized.remainingAmountAtomic,
       remainingAmountFormatted: serialized.remainingAmountFormatted,
+      remainingFiatFormatted: serialized.remainingFiatFormatted,
       deeplink: serialized.deeplink,
     },
     {
@@ -199,9 +317,11 @@ test("invoice responses use neutral atomic fields for a six-decimal jetton", asy
       expectedAmountFormatted: "5.00 USDT",
       paidAmountAtomic: "1000000",
       paidAmountFormatted: "1 USDT",
+      creditedFiatFormatted: "1.00 USD",
       remainingAmountAtomic: "4000000",
       remainingAmountFormatted: "4.00 USDT",
-      deeplink: null,
+      remainingFiatFormatted: "4.00 USD",
+      deeplink: `ton://transfer/EQ_USDT_CONTRACT?jetton=${officialMainnetUsdtMasterFriendlyAddress}&amount=4000000`,
     },
   );
   assert.equal(serialized.amountGram, null);
@@ -212,6 +332,7 @@ test("invoice responses use neutral atomic fields for a six-decimal jetton", asy
   assert.equal(serialized.remainingNano, null);
   assert.deepEqual(serialized.quote, {
     source: "usd-peg",
+    rateSnapshotId: null,
     asset: "USDT",
     assetDecimals: 6,
     fiatAmountCents: 500,
@@ -238,6 +359,29 @@ test("invoice responses use neutral atomic fields for a six-decimal jetton", asy
     status: "observed",
     comment: "",
   }]);
+
+  const internalTestnetRepository: TonhubPaymentRepository = {
+    ...repository,
+    findInvoiceById: async () => ({ ...invoice, network: "testnet" }),
+  };
+  const internalTestnetResponse = await getTonhubPaymentInvoice(invoice.id, {
+    repository: internalTestnetRepository,
+  });
+  assert.equal(
+    (internalTestnetResponse.body.invoice as { deeplink: string | null }).deeplink,
+    null,
+  );
+  const nonUniqueRepository: TonhubPaymentRepository = {
+    ...repository,
+    findInvoiceById: async () => ({ ...invoice, addressStrategy: "comment" }),
+  };
+  const nonUniqueResponse = await getTonhubPaymentInvoice(invoice.id, {
+    repository: nonUniqueRepository,
+  });
+  assert.equal(
+    (nonUniqueResponse.body.invoice as { deeplink: string | null }).deeplink,
+    null,
+  );
 
   for (const [patch, message] of [
     [{ assetDecimals: 9 }, /Stored USDT decimals 9 do not match registry decimals 6/],

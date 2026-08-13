@@ -259,6 +259,30 @@ test("GRAM ledger source resolves the deposit as scan owner and rejects invoice/
   );
 });
 
+test("GRAM observation remains available for a USDT checkout attempt on the same unique deposit owner", async () => {
+  const ledger = createLedgerSource(invoice({
+    asset: "USDT",
+    checkoutAsset: "USDT",
+    assetKind: "JETTON",
+    assetDecimals: 6,
+    amountAtomic: "5000000",
+    paidAmountAtomic: "0",
+  }));
+  const resolved = await ledger.source.resolveTarget({
+    invoiceId: invoice().id,
+    network: "testnet",
+  });
+  assert.equal(resolved.address, destination);
+  const observed = await ledger.source.observeTransactions({
+    invoiceId: invoice().id,
+    network: "testnet",
+    notBefore: createdAt,
+    notAfter: now,
+    transactions: [transaction({ hash: "59".repeat(32), lt: "1009", amount: "1000000000" })],
+  });
+  assert.equal(observed.observed, 1);
+});
+
 test("GRAM ledger source rejects a persisted movement whose destination does not belong to its deposit", async () => {
   const ledger = createLedgerSource();
   await ledger.source.observeTransactions({

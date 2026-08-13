@@ -37,6 +37,7 @@ export type TonhubObservedPayment = {
 
 export type TonhubRateQuote = {
   source: "coingecko" | "usd-peg";
+  rateSnapshotId?: string | null;
   asset: PaymentAssetSymbol;
   assetDecimals: number;
   fiatPerAsset: number;
@@ -105,6 +106,7 @@ export type TonhubCreateInvoiceInput = {
   amountCents: number;
   currency: FiatCurrency;
   network: TonNetwork;
+  asset?: PaymentAssetSymbol;
   externalId?: string | null;
   metadata?: unknown;
 };

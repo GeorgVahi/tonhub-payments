@@ -15,6 +15,7 @@ import type {
   TonInvoiceMatch,
   TonNetwork,
 } from "./ton/direct-payments";
+import { assertPaymentAssetSnapshot, parsePaymentAsset } from "../../shared/payment-assets";
 
 type PrismaLike = {
   tonhubPaymentInvoice: any;
@@ -153,12 +154,15 @@ async function requireOwnedDeposit(
   if (invoice.network !== input.network || deposit.network !== input.network) {
     throw new Error(`GRAM ledger invoice ${input.invoiceId} has inconsistent network ownership.`);
   }
-  if (
-    invoice.checkoutAsset !== "GRAM" ||
-    invoice.assetKind !== "NATIVE" ||
-    invoice.assetDecimals !== 9 ||
-    invoice.addressStrategy !== "unique-address"
-  ) {
+  try {
+    assertPaymentAssetSnapshot(parsePaymentAsset(invoice.checkoutAsset ?? invoice.asset), {
+      kind: invoice.assetKind,
+      decimals: invoice.assetDecimals,
+    });
+  } catch {
+    throw new Error(`GRAM ledger invoice ${input.invoiceId} has inconsistent settlement identity.`);
+  }
+  if (invoice.addressStrategy !== "unique-address") {
     throw new Error(`GRAM ledger invoice ${input.invoiceId} has inconsistent settlement identity.`);
   }
   return { invoice, deposit };
