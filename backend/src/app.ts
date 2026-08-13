@@ -1,6 +1,8 @@
 import { Hono } from "hono";
 import { cors } from "hono/cors";
 import { createTonhubPaymentRoutes } from "./routes/payments";
+import { createAdminRoutes } from "./admin/routes";
+import { resolveOptionalAdminSecurityConfig } from "./admin/security";
 
 export function createTonhubPaymentApp() {
   const app = new Hono();
@@ -18,6 +20,10 @@ export function createTonhubPaymentApp() {
   }
 
   app.route("/", createTonhubPaymentRoutes());
+  const adminConfig = resolveOptionalAdminSecurityConfig();
+  if (adminConfig) {
+    app.route("/", createAdminRoutes({ config: adminConfig }));
+  }
 
   return app;
 }

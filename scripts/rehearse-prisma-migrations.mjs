@@ -127,11 +127,12 @@ try {
   const databaseUrl = (database) =>
     `postgresql://postgres:${postgresPassword}@127.0.0.1:${publishedPort}/${database}?schema=public`;
 
-  const usdtSweepMigration = migrationDirectories.at(-1);
-  if (usdtSweepMigration !== "20260813105000_usdt_sweep_state") {
-    throw new Error(`unexpected latest migration for USDT sweep rollout: ${usdtSweepMigration}`);
+  const usdtSweepMigration = "20260813105000_usdt_sweep_state";
+  const usdtSweepMigrationIndex = migrationDirectories.indexOf(usdtSweepMigration);
+  if (usdtSweepMigrationIndex < 0) {
+    throw new Error(`missing required USDT sweep rollout migration: ${usdtSweepMigration}`);
   }
-  for (const migrationName of migrationDirectories.slice(0, -1)) {
+  for (const migrationName of migrationDirectories.slice(0, usdtSweepMigrationIndex)) {
     psql(
       "usdt_sweep_rollout",
       readFileSync(resolve(projectRoot, "prisma", "migrations", migrationName, "migration.sql"), "utf8"),
@@ -253,6 +254,13 @@ try {
       TONHUB_GRAM_CUTOVER_VERIFY_SUFFIX: "clean",
     },
   });
+  run(process.execPath, [tsxCli, "scripts/verify-admin-repository.ts"], {
+    env: {
+      ...process.env,
+      DATABASE_URL: databaseUrl("clean_migration"),
+      TONHUB_ADMIN_VERIFY_SUFFIX: "clean",
+    },
+  });
   prisma(
     databaseUrl("clean_migration"),
     "migrate",
@@ -361,6 +369,13 @@ try {
       ...process.env,
       DATABASE_URL: databaseUrl("legacy_migration"),
       TONHUB_GRAM_CUTOVER_VERIFY_SUFFIX: "legacy",
+    },
+  });
+  run(process.execPath, [tsxCli, "scripts/verify-admin-repository.ts"], {
+    env: {
+      ...process.env,
+      DATABASE_URL: databaseUrl("legacy_migration"),
+      TONHUB_ADMIN_VERIFY_SUFFIX: "legacy",
     },
   });
 

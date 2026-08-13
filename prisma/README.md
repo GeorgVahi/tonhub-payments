@@ -85,10 +85,14 @@ covering invoices created by an old process near the migration boundary.
   deleted or truncated. Evidence fields may be attached once. Status follows
   explicit forward transitions; `RECOVERY` may re-enter validation, while
   `CREDITED` and `REJECTED` are terminal and immutable.
-- Rate snapshots, movement allocations, and admin audit events are append-only.
+- Rate snapshots, movement allocations, registered refund evidence, and admin
+  audit events are append-only.
   They cannot be updated, deleted, or truncated. Allocation corrections use one
   full `REVERSAL` row that must exactly mirror and reference the original
   `CREDIT` allocation instead of editing it.
+- Login throttling is durable across API replicas but intentionally mutable and
+  contains only an HMAC-derived rate key. Registered refunds retain canonical
+  chain facts and order/attempt ownership separately from the operator audit.
 - Each on-chain movement can have at most one `CREDIT` allocation. PostgreSQL
   also requires that allocation to match the movement's terminal fiat evidence;
   automatic credit requires an invoice whose order and deposit address own the

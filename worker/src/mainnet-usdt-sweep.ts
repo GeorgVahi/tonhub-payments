@@ -22,6 +22,7 @@ import {
   resolveTonDepositSweepConfig,
   tonPublicKeyFromSecretKey,
 } from "./sweep";
+import { resumableFailedUsdtSweepStatus } from "../../shared/mainnet-usdt-sweep-state";
 
 export type MainnetUsdtSweepStatus =
   | "QUEUED"
@@ -89,6 +90,7 @@ export type MainnetUsdtSweepRecord = {
   seqno: number | null;
   queryId: string | null;
   gasTopupAmountNano: string | null;
+  gasServiceAddress?: string | null;
   gasTopupSeqno: number | null;
   reserveTopupAmountNano: string | null;
   reserveTopupSeqno: number | null;
@@ -423,6 +425,7 @@ function normalizeRecord(value: any): MainnetUsdtSweepRecord {
     seqno: value.seqno,
     queryId: value.queryId,
     gasTopupAmountNano: value.gasTopupAmountNano,
+    gasServiceAddress: value.gasServiceAddress ?? null,
     gasTopupSeqno: value.gasTopupSeqno,
     reserveTopupAmountNano: value.reserveTopupAmountNano,
     reserveTopupSeqno: value.reserveTopupSeqno,
@@ -750,32 +753,23 @@ export function createPrismaMainnetUsdtSweepRepository(db: PrismaLike): MainnetU
       });
     },
     retryFailed: async ({ sweepId, requestedAt }) => {
-      const retried = await db.tonhubAssetSweep.updateMany({
-        where: { id: sweepId, asset: "USDT", status: "FAILED" },
-        data: {
-          status: "QUEUED",
-          amountAtomic: null,
-          reserveAtomic: null,
-          recipientAddress: null,
-          transactionHash: null,
-          seqno: null,
-          queryId: null,
-          gasTopupAmountNano: null,
-          gasTopupSeqno: null,
-          reserveTopupAmountNano: null,
-          reserveTopupSeqno: null,
-          gasServicePlanKey: null,
-          gasTopupTransactionHash: null,
-          attempts: 0,
-          leaseOwner: null,
-          leaseExpiresAt: requestedAt,
-          startedAt: null,
-          sentAt: null,
-          confirmedAt: null,
-          lastError: null,
-        },
+      return db.$transaction(async (tx) => {
+        const stored = await tx.tonhubAssetSweep.findUnique({ where: { id: sweepId } });
+        if (!stored || stored.asset !== "USDT" || stored.status !== "FAILED") {
+          return false;
+        }
+        const retried = await tx.tonhubAssetSweep.updateMany({
+          where: { id: sweepId, asset: "USDT", status: "FAILED" },
+          data: {
+            status: resumableFailedUsdtSweepStatus(stored),
+            attempts: 0,
+            leaseOwner: null,
+            leaseExpiresAt: requestedAt,
+            lastError: null,
+          },
+        });
+        return retried.count === 1;
       });
-      return retried.count === 1;
     },
     queueForDeposit: async ({ depositAddressId, requestId, requestedAt }) => {
       const deposit = await db.tonhubDepositAddress.findUnique({
@@ -1089,6 +1083,7 @@ async function repairConfirmedReserve(input: {
       {
         reserveTopupAmountNano: (input.config.depositReserveNano - input.currentBalance).toString(),
         reserveTopupSeqno: plannedSeqno,
+        gasServiceAddress: input.config.gasServiceAddressRaw,
         gasServicePlanKey: gasServicePlanKey(input.config, plannedSeqno),
       },
     );
@@ -1286,6 +1281,7 @@ async function advanceSweep(input: {
         status: "GAS_TOPUP_REQUIRED",
         gasTopupAmountNano: topupNano.toString(),
         gasTopupSeqno: topupSeqno,
+        gasServiceAddress: input.config.gasServiceAddressRaw,
         gasServicePlanKey: gasServicePlanKey(input.config, topupSeqno),
       },
     );

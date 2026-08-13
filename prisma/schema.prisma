@@ -89,6 +89,7 @@ model TonhubPaymentOrder {
   allocations           TonhubMovementAllocation[]
   sweeps                TonhubAssetSweep[]
   recoveryCases         TonhubRecoveryCase[]
+  registeredRefunds     TonhubRegisteredRefund[]
 
   @@index([status, createdAt])
   @@index([status, expiresAt])
@@ -148,6 +149,7 @@ model TonhubPaymentInvoice {
   allocations                   TonhubMovementAllocation[]
   sweeps                        TonhubAssetSweep[]
   recoveryCases                 TonhubRecoveryCase[]
+  registeredRefunds             TonhubRegisteredRefund[]
 
   @@index([network, address, status])
   @@index([network, status, createdAt])
@@ -333,6 +335,7 @@ model TonhubAssetSweep {
   seqno                   Int?
   queryId                 String?
   gasTopupAmountNano      String?
+  gasServiceAddress       String?
   gasTopupSeqno           Int?
   reserveTopupAmountNano  String?
   reserveTopupSeqno       Int?
@@ -415,6 +418,42 @@ model TonhubAdminAuditEvent {
 
   @@index([targetType, targetId, createdAt])
   @@index([adminUsername, createdAt])
+}
+
+model TonhubAdminLoginThrottle {
+  id              String   @id
+  attempts        Int      @default(0)
+  windowStartedAt DateTime
+  blockedUntil    DateTime?
+  updatedAt       DateTime @updatedAt
+
+  @@index([blockedUntil])
+  @@index([updatedAt])
+}
+
+model TonhubRegisteredRefund {
+  id                  String   @id
+  orderId             String
+  invoiceId           String?
+  network             String
+  asset               String
+  assetKind           String
+  assetDecimals       Int
+  amountAtomic        String
+  fromAddress         String?
+  toAddress           String
+  jettonMasterAddress String?
+  transactionHash     String
+  transactionLt       String?
+  blockchainAt        DateTime
+  registeredBy        String
+  createdAt           DateTime @default(now())
+  order               TonhubPaymentOrder    @relation(fields: [orderId], references: [id], onDelete: Restrict)
+  invoice             TonhubPaymentInvoice? @relation(fields: [invoiceId], references: [id], onDelete: Restrict)
+
+  @@unique([network, transactionHash, asset])
+  @@index([orderId, blockchainAt])
+  @@index([invoiceId, blockchainAt])
 }
 
 model TonhubPaymentTransaction {

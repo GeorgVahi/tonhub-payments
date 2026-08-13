@@ -247,6 +247,38 @@ request never marks the invoice paid locally; the server ledger remains the
 authority. Wallet rejection or unsupported structured jetton support leaves the
 standard wallet deeplink, QR, address, and amount available as fallbacks.
 
+## Admin and recovery console
+
+Set `TONHUB_ADMIN_USERNAME`, `TONHUB_ADMIN_PASSWORD_HASH`, and
+`TONHUB_ADMIN_SESSION_SECRET` together to mount the server-rendered console at
+`/admin/**`. Generate the password hash by piping the password through stdin to
+`npm run admin:hash-password`; the API rejects plain-text or unsupported hash
+formats. The session secret must contain at least 32 UTF-8 bytes. Missing all
+three values keeps the console unmounted, while a partial or invalid setup makes
+the API fail at startup.
+
+Admin requests must reach Hono with an `https:` request URL. Forwarded headers
+are deliberately not trusted, so a TLS-terminating reverse proxy must construct
+the upstream request with the authoritative external HTTPS URL and keep the API
+port private. If client-IP login throttling must cross that proxy, set
+`TONHUB_ADMIN_TRUSTED_PROXY_IPS` to its exact peer IP address(es); only allowlisted
+peers may supply `X-Forwarded-For`, and the proxy must replace that header.
+Responses use HSTS, a restrictive CSP, no-store caching, and a
+`Secure`, `HttpOnly`, `SameSite=Strict`, `__Host-` session cookie. Mutations also
+require a same-origin request and a session-bound CSRF token. Login attempts are
+limited in PostgreSQL across API replicas; successful and failed authentication
+and every operator mutation enter the append-only admin audit log.
+
+The console shows orders and their attempts, incoming/outgoing movements with
+addresses, asset identity, hash/LT, fiat credit and rate, recovery/rate-pending/
+held states, gas top-ups, native and jetton sweeps, webhook outbox state, and
+audit history. Operators can validate and attach an owned movement through the
+normal ledger, mark recovery reviewed, create or retry a durable sweep job, and
+register immutable evidence for an already executed refund. These actions never
+sign or broadcast. `TON_DEPOSIT_SECRET_KEY`, network-specific deposit secret
+keys, and `TON_MAINNET_GAS_SERVICE_SECRET_KEY` are rejected from the API process
+environment; deploy signing workers with a separate environment.
+
 New API consumers should use `asset`, `assetKind`, `assetDecimals`,
 `amountAtomic`, `amountFormatted`, and the corresponding `expected`, `paid`,
 and `remaining` neutral fields. Existing GRAM-only fields such as `amountNano`,
