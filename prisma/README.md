@@ -53,6 +53,9 @@ baseline SQL. It verifies baseline equivalence, clean and legacy deployments,
 pending/partial/paid/recovery/anonymous backfill, real Prisma repository
 dual-writes, one-active-attempt and one-active-sweep constraints, append-only
 financial records, schema drift, and cleanup of only that temporary container.
+The same clean and legacy paths exercise the GRAM shadow scanner with the real
+Prisma client: concurrent workers cannot lease the same address stream, cursor
+replay is idempotent, and observed movements do not mutate settlement state.
 
 During rollout, apply migrations immediately before deploying the compatible
 application. The repository can still read an unlinked legacy row and will

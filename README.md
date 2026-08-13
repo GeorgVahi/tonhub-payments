@@ -35,12 +35,13 @@ npm run dev
 The API listens on `http://localhost:3008`; the Vite demo proxies `/api/**` to
 that API and runs on `http://localhost:5173`.
 
-For a full local payment flow, run four runtimes:
+For a full local payment flow with the additive shadow scanner, run five runtimes:
 
 ```bash
 npm run backend:dev
 npm run dev
 npm run worker:rates -- --watch --interval-seconds=60
+npm run worker:scan:gram-shadow -- --network=testnet --watch --interval-seconds=15
 npm run worker:sweep -- --network=testnet --watch --interval-seconds=15
 ```
 
@@ -69,6 +70,16 @@ from contemporaneous GRAM/EUR and GRAM/USD observations and references both
 immutable component snapshot IDs. A provider outage does not invent a market
 rate: the worker stores the independent USDT/USD peg, reports the unavailable
 pairs, and retries on the next watch iteration.
+
+The GRAM shadow scanner is an additive rollout runtime. It scans active attempts
+every 15 seconds and recent terminal attempts once per day for 30 days by
+default. Its per-address cursor and lease are stored in `TonhubScanCursor`.
+It accepts only successful, positive native transfers whose normalized TON
+destination exactly matches the invoice deposit address, then appends an
+idempotent `OBSERVED` movement. It does not allocate fiat, update invoice/order
+status, or replace the legacy `/check` settlement path yet. Tune its batch,
+pagination, retry, lease, active cadence, and terminal cadence with the
+`TON_GRAM_SHADOW_*` variables documented in `.env.example`.
 
 ## API
 
@@ -120,10 +131,12 @@ This module uses unique-address direct GRAM (ex TON) payments on the TON network
    V5R1 wallet from the stored metadata and worker secret key, and sends
    `balance - TON_SWEEP_RESERVE_NANO` to `TON_*_SWEEP_RECIPIENT_ADDRESS`.
 
-The worker does not independently scan every known address on-chain. It only
-sweeps addresses that the backend has already marked `PAID`, so invoice polling
-or an explicit `POST /api/tonhub-payments/invoices/:id/check` must happen before
-the sweep candidate exists.
+The sweep worker does not independently discover payments. It only sweeps
+addresses that the legacy backend settlement path has already marked `PAID`, so
+invoice polling or an explicit `POST /api/tonhub-payments/invoices/:id/check`
+must still happen before the sweep candidate exists. The separate GRAM shadow
+scanner discovers and journals movements but deliberately does not settle them
+until the later comparison and cutover stage.
 
 Current sweep state is stored on `TonhubDepositAddress`. A successful broadcast
 sets `sweepStatus` to `SENT` and stores `sweepAmountNano`, `sweepReserveNano`,
@@ -202,6 +215,14 @@ credit always derives ownership through movement deposit address → invoice →
 order; invoice-less reassignment is reserved for a later authenticated and
 audited recovery workflow.
 
+The GRAM shadow worker now feeds this ledger independently of user polling. It
+normalizes friendly/raw TON addresses and hex/base64 transaction hashes before
+fingerprinting, ignores comments for unique-address matching, rejects aborted,
+unknown, failed, malformed, foreign-address, non-positive, and out-of-window
+evidence, and advances its resumable cursor only after every selected movement
+has been persisted. Provider or persistence errors release the lease for retry
+without changing settlement state.
+
 ## Frontend
 
 ```tsx
@@ -251,7 +272,10 @@ invoice-specific deposit addresses until the worker is started.
 ```bash
 npm run test
 npm run typecheck
+npm run db:migrate:rehearse
 ```
 
-The tests use fake repositories and fake TON Center responses, so they do not
-touch a real wallet, network, or database.
+Unit tests use fake TON Center responses and never touch a real wallet or
+network. The migration rehearsal creates temporary clean and legacy-upgraded
+PostgreSQL databases in Docker and verifies scanner leasing, cursor replay,
+movement idempotency, and settlement isolation against the real Prisma client.

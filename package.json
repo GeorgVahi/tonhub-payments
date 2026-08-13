@@ -9,6 +9,7 @@
     "./backend": "./backend/src/app.ts",
     "./assets": "./shared/payment-assets.ts",
     "./movement-ledger": "./backend/src/movement-ledger.ts",
+    "./worker/gram-shadow": "./worker/src/gram-shadow.ts",
     "./worker/sweep": "./worker/src/sweep.ts"
   },
   "overrides": {
@@ -20,13 +21,14 @@
     "backend:start": "bun run backend/src/server.ts",
     "worker:sweep": "bun run worker/src/sweep-worker.ts",
     "worker:rates": "bun run worker/src/rate-worker.ts",
+    "worker:scan:gram-shadow": "bun run worker/src/gram-shadow-worker.ts",
     "db:generate": "prisma generate",
     "db:migrate": "prisma migrate dev",
     "db:migrate:deploy": "prisma migrate deploy",
     "db:migrate:rehearse": "node scripts/rehearse-prisma-migrations.mjs",
     "db:push": "prisma db push",
     "typecheck": "tsc --noEmit",
-    "test": "tsx --test tests/tonhub-payments.test.ts tests/gram-flow-characterization.test.ts tests/order-attempts.test.ts tests/payment-assets.test.ts tests/rate-snapshots.test.ts tests/movement-ledger.test.ts",
+    "test": "tsx --test tests/tonhub-payments.test.ts tests/gram-flow-characterization.test.ts tests/order-attempts.test.ts tests/payment-assets.test.ts tests/rate-snapshots.test.ts tests/movement-ledger.test.ts tests/gram-shadow-scanner.test.ts",
     "build": "vite build --config vite.config.ts",
     "preview": "vite preview --config vite.config.ts"
   },

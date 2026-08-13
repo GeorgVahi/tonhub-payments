@@ -1,0 +1,521 @@
+import assert from "node:assert/strict";
+import test from "node:test";
+import { Buffer } from "node:buffer";
+import { Address } from "@ton/core";
+import {
+  scanGramShadowTransactions,
+  type GramShadowRejectionCode,
+} from "../backend/src/ton/gram-shadow-scanner";
+import type { TonCenterTransaction } from "../backend/src/ton/direct-payments";
+import {
+  runGramShadowScanBatch,
+  type GramShadowScanTarget,
+  type GramShadowScannerRepository,
+} from "../worker/src/gram-shadow";
+
+const destinationRaw = `0:${"11".repeat(32)}`;
+const sourceRaw = `0:${"22".repeat(32)}`;
+const wrongDestinationRaw = `0:${"33".repeat(32)}`;
+const destinationFriendly = Address.parse(destinationRaw).toString({
+  bounceable: true,
+  testOnly: true,
+});
+const sourceFriendly = Address.parse(sourceRaw).toString({
+  bounceable: false,
+  testOnly: true,
+});
+const hashHex = "ab".repeat(32);
+const hashBase64Url = Buffer.from(hashHex, "hex").toString("base64url");
+const scanStart = new Date("2026-08-13T10:00:00.000Z");
+const scanNow = new Date("2026-08-13T10:30:00.000Z");
+
+function transaction(overrides: Partial<TonCenterTransaction> = {}): TonCenterTransaction {
+  return {
+    hash: hashHex,
+    lt: "900001",
+    now: Math.floor(new Date("2026-08-13T10:10:00.000Z").getTime() / 1000),
+    description: { aborted: false, action: { success: true } },
+    in_msg: {
+      source: sourceFriendly,
+      destination: destinationFriendly,
+      value: "1500000000",
+      message_content: { decoded: { text: "ignored comment" } },
+    },
+    ...overrides,
+  };
+}
+
+function scan(transactions: TonCenterTransaction[]) {
+  return scanGramShadowTransactions({
+    network: "testnet",
+    depositAddressId: "deposit-1",
+    address: destinationFriendly,
+    addressRaw: destinationRaw,
+    notBefore: scanStart,
+    notAfter: scanNow,
+    transactions,
+  });
+}
+
+test("GRAM shadow parser emits stable native movement evidence across TON address/hash encodings", () => {
+  const first = scan([transaction()]);
+  const encoded = scan([transaction({
+    hash: hashBase64Url,
+    in_msg: {
+      source: sourceRaw,
+      destination: destinationRaw,
+      value: "1500000000",
+      message_content: { decoded: { text: "another irrelevant comment" } },
+    },
+  })]);
+
+  assert.equal(first.rejections.length, 0);
+  assert.equal(first.movements.length, 1);
+  assert.deepEqual(encoded.movements, first.movements);
+  assert.deepEqual(first.movements[0], {
+    fingerprint: `ton:testnet:native-in:${hashHex}:0`,
+    depositAddressId: "deposit-1",
+    network: "testnet",
+    direction: "INCOMING",
+    asset: "GRAM",
+    assetKind: "NATIVE",
+    assetDecimals: 9,
+    amountAtomic: "1500000000",
+    fromAddress: sourceRaw,
+    toAddress: destinationRaw,
+    transactionHash: hashHex,
+    transactionLt: "900001",
+    blockchainAt: new Date("2026-08-13T10:10:00.000Z"),
+    rawPayload: {
+      evidenceVersion: 1,
+      provider: "toncenter-v3",
+      transaction: {
+        hash: hashHex,
+        lt: "900001",
+        now: 1786615800,
+        successful: true,
+        source: sourceRaw,
+        destination: destinationRaw,
+        value: "1500000000",
+      },
+    },
+  });
+});
+
+test("GRAM shadow parser rejects unsuccessful, malformed, foreign, non-positive, and out-of-window evidence", () => {
+  const cases: Array<{ expected: GramShadowRejectionCode; value: TonCenterTransaction }> = [
+    { expected: "TRANSACTION_ID_INVALID", value: transaction({ hash: "not-a-hash" }) },
+    { expected: "TRANSACTION_ID_INVALID", value: transaction({ lt: "bad-lt" }) },
+    { expected: "TRANSACTION_TIME_INVALID", value: transaction({ now: 0 }) },
+    {
+      expected: "TRANSACTION_OUTSIDE_WINDOW",
+      value: transaction({ now: Math.floor(scanStart.getTime() / 1000) - 1 }),
+    },
+    { expected: "TRANSACTION_NOT_SUCCESSFUL", value: transaction({ description: { aborted: true } }) },
+    { expected: "TRANSACTION_NOT_SUCCESSFUL", value: transaction({ description: { aborted: false } }) },
+    {
+      expected: "TRANSACTION_NOT_SUCCESSFUL",
+      value: transaction({ description: { aborted: false, action: { success: false } } }),
+    },
+    { expected: "TRANSACTION_NOT_SUCCESSFUL", value: transaction({ description: null }) },
+    { expected: "IN_MESSAGE_MISSING", value: transaction({ in_msg: null }) },
+    {
+      expected: "DESTINATION_MISMATCH",
+      value: transaction({ in_msg: { source: sourceRaw, destination: wrongDestinationRaw, value: "1" } }),
+    },
+    {
+      expected: "SOURCE_INVALID",
+      value: transaction({ in_msg: { source: "invalid", destination: destinationRaw, value: "1" } }),
+    },
+    {
+      expected: "AMOUNT_INVALID",
+      value: transaction({ in_msg: { source: sourceRaw, destination: destinationRaw, value: "0" } }),
+    },
+    {
+      expected: "AMOUNT_INVALID",
+      value: transaction({ in_msg: { source: sourceRaw, destination: destinationRaw, value: "1.5" } }),
+    },
+  ];
+
+  const result = scan(cases.map(({ value }) => value));
+  assert.equal(result.movements.length, 0);
+  assert.deepEqual(result.rejections.map(({ code }) => code), cases.map(({ expected }) => expected));
+});
+
+test("GRAM shadow parser rejects base64 transaction hashes with ignored junk or non-canonical padding", () => {
+  const result = scan([
+    transaction({ hash: `${hashBase64Url}!` }),
+    transaction({ hash: `${hashBase64Url}===` }),
+  ]);
+  assert.equal(result.movements.length, 0);
+  assert.deepEqual(result.rejections.map(({ code }) => code), [
+    "TRANSACTION_ID_INVALID",
+    "TRANSACTION_ID_INVALID",
+  ]);
+});
+
+test("GRAM shadow parser accepts exact inclusive blockchain-time boundaries", () => {
+  const start = transaction({ hash: "01".repeat(32), lt: "1", now: scanStart.getTime() / 1000 });
+  const end = transaction({ hash: "02".repeat(32), lt: "2", now: scanNow.getTime() / 1000 });
+  assert.equal(scan([start, end]).movements.length, 2);
+});
+
+test("GRAM shadow parser refuses inconsistent stored friendly and raw deposit addresses", () => {
+  assert.throws(
+    () => scanGramShadowTransactions({
+      network: "testnet",
+      depositAddressId: "deposit-1",
+      address: destinationFriendly,
+      addressRaw: wrongDestinationRaw,
+      notBefore: scanStart,
+      notAfter: scanNow,
+      transactions: [transaction()],
+    }),
+    /invalid or inconsistent/,
+  );
+});
+
+function target(overrides: Partial<GramShadowScanTarget> = {}): GramShadowScanTarget {
+  return {
+    invoiceId: "invoice-1",
+    depositAddressId: "deposit-1",
+    network: "testnet",
+    depositNetwork: "testnet",
+    address: destinationFriendly,
+    addressRaw: destinationRaw,
+    invoiceAddress: destinationFriendly,
+    invoiceAddressRaw: destinationRaw,
+    status: "PENDING",
+    createdAt: scanStart,
+    updatedAt: scanStart,
+    terminalMonitorUntil: null,
+    cursor: {
+      hash: "44".repeat(32),
+      lt: "800000",
+      timestamp: new Date("2026-08-13T10:05:00.000Z"),
+    },
+    leaseOwner: "worker-1",
+    ...overrides,
+  };
+}
+
+function repositoryHarness(scanTarget = target()) {
+  const calls = {
+    renew: 0,
+    complete: [] as any[],
+    fail: [] as any[],
+  };
+  const repository: GramShadowScannerRepository = {
+    claimDueTargets: async () => [scanTarget],
+    renewLease: async () => {
+      calls.renew += 1;
+      return true;
+    },
+    completeScan: async (input) => {
+      calls.complete.push(input);
+      return true;
+    },
+    failScan: async (input) => {
+      calls.fail.push(input);
+      return true;
+    },
+  };
+  return { repository, calls };
+}
+
+test("GRAM shadow batch paginates until its cursor and records only newer successful movements", async () => {
+  const harness = repositoryHarness();
+  const observed: any[] = [];
+  const newest = transaction({ hash: "55".repeat(32), lt: "900100" });
+  const aborted = transaction({
+    hash: "56".repeat(32),
+    lt: "900099",
+    description: { aborted: true },
+  });
+  const previousCursor = transaction({
+    hash: "44".repeat(32),
+    lt: "800000",
+    now: Math.floor(new Date("2026-08-13T10:05:00.000Z").getTime() / 1000),
+  });
+  const older = transaction({
+    hash: "43".repeat(32),
+    lt: "700000",
+    now: Math.floor(new Date("2026-08-13T10:04:00.000Z").getTime() / 1000),
+  });
+  const pages = [[newest, aborted], [previousCursor, older]];
+  const result = await runGramShadowScanBatch({
+    network: "testnet",
+    workerId: "worker-1",
+    now: scanNow,
+    repository: harness.repository,
+    ledger: { recordObserved: async (movement) => observed.push(movement) },
+    pageSize: 2,
+    fetchTransactions: async ({ offset }) => ({ transactions: pages[offset / 2] ?? [] }),
+    resolveConfig: () => ({
+      network: "testnet",
+      baseUrl: "https://example.invalid",
+      address: "",
+      addressEnvName: "",
+    }),
+  });
+
+  assert.equal(result.scanned, 1);
+  assert.equal(result.failed, 0);
+  assert.equal(result.outcomes[0]?.transactionsScanned, 2);
+  assert.equal(result.outcomes[0]?.movementsObserved, 1);
+  assert.deepEqual(result.outcomes[0]?.rejections.map(({ code }) => code), [
+    "TRANSACTION_NOT_SUCCESSFUL",
+  ]);
+  assert.equal(observed.length, 1);
+  assert.equal(observed[0].transactionHash, "55".repeat(32));
+  assert.equal(harness.calls.renew, 2);
+  assert.equal(harness.calls.fail.length, 0);
+  assert.equal(harness.calls.complete.length, 1);
+  assert.equal(harness.calls.complete[0].cursor.hash, "55".repeat(32));
+});
+
+test("GRAM shadow batch keeps settlement untouched and releases a failed scan for retry", async () => {
+  const harness = repositoryHarness();
+  const settlement = {
+    invoiceStatus: "PENDING",
+    invoicePaidAtomic: "0",
+    orderStatus: "PENDING",
+    orderCreditedFiatMicros: "0",
+  };
+  const result = await runGramShadowScanBatch({
+    network: "testnet",
+    workerId: "worker-1",
+    now: scanNow,
+    repository: harness.repository,
+    ledger: {
+      recordObserved: async () => {
+        throw new Error("shadow persistence unavailable");
+      },
+    },
+    fetchTransactions: async () => ({ transactions: [transaction()] }),
+    resolveConfig: () => ({
+      network: "testnet",
+      baseUrl: "https://example.invalid",
+      address: "",
+      addressEnvName: "",
+    }),
+  });
+
+  assert.equal(result.failed, 1);
+  assert.match(result.outcomes[0]?.error ?? "", /shadow persistence unavailable/);
+  assert.equal(harness.calls.complete.length, 0);
+  assert.equal(harness.calls.fail.length, 1);
+  assert.deepEqual(settlement, {
+    invoiceStatus: "PENDING",
+    invoicePaidAtomic: "0",
+    orderStatus: "PENDING",
+    orderCreditedFiatMicros: "0",
+  });
+});
+
+test("GRAM shadow batch refuses inconsistent invoice and deposit ownership addresses before fetching", async () => {
+  const harness = repositoryHarness(target({ invoiceAddressRaw: wrongDestinationRaw }));
+  let fetches = 0;
+  const result = await runGramShadowScanBatch({
+    network: "testnet",
+    workerId: "worker-1",
+    now: scanNow,
+    clock: () => scanNow,
+    repository: harness.repository,
+    ledger: { recordObserved: async () => undefined },
+    fetchTransactions: async () => {
+      fetches += 1;
+      return { transactions: [] };
+    },
+    resolveConfig: () => ({
+      network: "testnet",
+      baseUrl: "https://example.invalid",
+      address: "",
+      addressEnvName: "",
+    }),
+  });
+
+  assert.equal(result.failed, 1);
+  assert.match(result.outcomes[0]?.error ?? "", /invoice and deposit address evidence/);
+  assert.equal(fetches, 0);
+  assert.equal(harness.calls.fail.length, 1);
+});
+
+test("GRAM shadow batch refuses an invoice/deposit network mismatch before fetching", async () => {
+  const harness = repositoryHarness(target({ depositNetwork: "mainnet" }));
+  let fetches = 0;
+  const result = await runGramShadowScanBatch({
+    network: "testnet",
+    workerId: "worker-1",
+    now: scanNow,
+    clock: () => scanNow,
+    repository: harness.repository,
+    ledger: { recordObserved: async () => undefined },
+    fetchTransactions: async () => {
+      fetches += 1;
+      return { transactions: [] };
+    },
+    resolveConfig: () => ({
+      network: "testnet",
+      baseUrl: "https://example.invalid",
+      address: "",
+      addressEnvName: "",
+    }),
+  });
+
+  assert.equal(result.failed, 1);
+  assert.match(result.outcomes[0]?.error ?? "", /network evidence is inconsistent/);
+  assert.equal(fetches, 0);
+});
+
+test("GRAM shadow batch deduplicates identical provider page overlap before ledger persistence", async () => {
+  const harness = repositoryHarness(target({
+    cursor: { hash: null, lt: null, timestamp: null },
+  }));
+  const observed: any[] = [];
+  const duplicate = transaction();
+  const result = await runGramShadowScanBatch({
+    network: "testnet",
+    workerId: "worker-1",
+    now: scanNow,
+    clock: () => scanNow,
+    repository: harness.repository,
+    ledger: { recordObserved: async (movement) => observed.push(movement) },
+    fetchTransactions: async () => ({ transactions: [duplicate, structuredClone(duplicate)] }),
+    resolveConfig: () => ({
+      network: "testnet",
+      baseUrl: "https://example.invalid",
+      address: "",
+      addressEnvName: "",
+    }),
+  });
+
+  assert.equal(result.scanned, 1);
+  assert.equal(result.outcomes[0]?.movementsObserved, 1);
+  assert.equal(observed.length, 1);
+});
+
+test("GRAM shadow cursor never advances past provider evidence from the future", async () => {
+  const harness = repositoryHarness();
+  const future = transaction({
+    hash: "77".repeat(32),
+    lt: "999999",
+    now: Math.floor(scanNow.getTime() / 1000) + 30,
+  });
+  const previous = transaction({
+    hash: "44".repeat(32),
+    lt: "800000",
+    now: Math.floor(new Date("2026-08-13T10:05:00.000Z").getTime() / 1000),
+  });
+  const result = await runGramShadowScanBatch({
+    network: "testnet",
+    workerId: "worker-1",
+    now: scanNow,
+    clock: () => scanNow,
+    repository: harness.repository,
+    ledger: { recordObserved: async () => undefined },
+    fetchTransactions: async () => ({ transactions: [future, previous] }),
+    resolveConfig: () => ({
+      network: "testnet",
+      baseUrl: "https://example.invalid",
+      address: "",
+      addressEnvName: "",
+    }),
+  });
+
+  assert.equal(result.scanned, 1);
+  assert.deepEqual(result.outcomes[0]?.rejections.map(({ code }) => code), [
+    "TRANSACTION_OUTSIDE_WINDOW",
+  ]);
+  assert.equal(harness.calls.complete[0].cursor.hash, "44".repeat(32));
+});
+
+test("GRAM shadow batch does not fetch or advance after losing its lease", async () => {
+  const harness = repositoryHarness();
+  harness.repository.renewLease = async () => false;
+  let fetches = 0;
+  const result = await runGramShadowScanBatch({
+    network: "testnet",
+    workerId: "worker-1",
+    now: scanNow,
+    repository: harness.repository,
+    ledger: { recordObserved: async () => undefined },
+    fetchTransactions: async () => {
+      fetches += 1;
+      return { transactions: [] };
+    },
+    resolveConfig: () => ({
+      network: "testnet",
+      baseUrl: "https://example.invalid",
+      address: "",
+      addressEnvName: "",
+    }),
+  });
+
+  assert.equal(result.failed, 1);
+  assert.equal(fetches, 0);
+  assert.equal(harness.calls.complete.length, 0);
+  assert.equal(harness.calls.fail.length, 1);
+});
+
+test("GRAM shadow terminal cadence ends exactly 30 days after the terminal transition", async () => {
+  const terminalAt = new Date("2026-08-03T10:30:00.000Z");
+  const harness = repositoryHarness(target({
+    status: "EXPIRED",
+    updatedAt: terminalAt,
+    cursor: { hash: null, lt: null, timestamp: null },
+  }));
+  const result = await runGramShadowScanBatch({
+    network: "testnet",
+    workerId: "worker-1",
+    now: scanNow,
+    clock: () => scanNow,
+    repository: harness.repository,
+    ledger: { recordObserved: async () => undefined },
+    fetchTransactions: async () => ({ transactions: [] }),
+    resolveConfig: () => ({
+      network: "testnet",
+      baseUrl: "https://example.invalid",
+      address: "",
+      addressEnvName: "",
+    }),
+  });
+
+  assert.equal(result.scanned, 1);
+  assert.equal(
+    harness.calls.complete[0].terminalMonitorUntil.toISOString(),
+    "2026-09-02T10:30:00.000Z",
+  );
+  assert.equal(
+    harness.calls.complete[0].nextScanAt.toISOString(),
+    "2026-08-14T10:30:00.000Z",
+  );
+});
+
+test("GRAM shadow does not advance a cursor when the pagination safety cap is exhausted", async () => {
+  const harness = repositoryHarness();
+  const result = await runGramShadowScanBatch({
+    network: "testnet",
+    workerId: "worker-1",
+    now: scanNow,
+    clock: () => scanNow,
+    repository: harness.repository,
+    ledger: { recordObserved: async () => undefined },
+    pageSize: 1,
+    maxPages: 1,
+    fetchTransactions: async () => ({
+      transactions: [transaction({ hash: "66".repeat(32), lt: "990000" })],
+    }),
+    resolveConfig: () => ({
+      network: "testnet",
+      baseUrl: "https://example.invalid",
+      address: "",
+      addressEnvName: "",
+    }),
+  });
+
+  assert.equal(result.failed, 1);
+  assert.match(result.outcomes[0]?.error ?? "", /exceeded 1 pages/);
+  assert.equal(harness.calls.complete.length, 0);
+  assert.equal(harness.calls.fail.length, 1);
+});
