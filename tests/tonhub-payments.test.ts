@@ -104,6 +104,7 @@ const repository: TonhubPaymentRepository = {
       network: input.network,
       asset: "GRAM",
       fiatAmountCents: input.amountCents,
+      activationThresholdFiatMicros: input.activationThresholdFiatMicros,
       fiatCurrency: input.currency,
       address: input.depositAddress.address,
       addressRaw: input.depositAddress.addressRaw,
@@ -203,6 +204,10 @@ const created = await createTonhubPaymentInvoice(
 assert.equal(created.status, 200);
 assert.equal((created.body.invoice as { amountNano: string }).amountNano, "2030000000");
 assert.equal((created.body.invoice as { amountGram: string }).amountGram, "2.03 GRAM (ex TON)");
+assert.equal(
+  (created.body.invoice as { activationThresholdFiatMicros: string }).activationThresholdFiatMicros,
+  "0",
+);
 assert.deepEqual(
   {
     asset: (created.body.invoice as { asset: string }).asset,

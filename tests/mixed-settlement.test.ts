@@ -1,0 +1,358 @@
+import assert from "node:assert/strict";
+import test from "node:test";
+import { createMixedAssetSettlement } from "../backend/src/mixed-settlement";
+import type { TonhubPaymentInvoiceRecord } from "../backend/src/types";
+import { runMixedSettlementBatch } from "../worker/src/mixed-settlement";
+
+const createdAt = new Date("2026-08-13T10:00:00.000Z");
+const now = new Date("2026-08-13T10:30:00.000Z");
+
+function invoice(overrides: Partial<TonhubPaymentInvoiceRecord> = {}): TonhubPaymentInvoiceRecord {
+  return {
+    id: "mixed-invoice",
+    externalId: "mixed-order",
+    orderId: "order-1",
+    order: {
+      id: "order-1",
+      externalId: "mixed-order",
+      fiatAmountMicros: "5000000",
+      fiatCurrency: "USD",
+      creditedFiatMicros: "0",
+      overpaymentFiatMicros: "0",
+      status: "PENDING",
+      paidAt: null,
+      expiresAt: new Date("2026-08-13T11:00:00.000Z"),
+      cancelledAt: null,
+      createdAt,
+      updatedAt: createdAt,
+      metadata: null,
+    },
+    network: "testnet",
+    asset: "GRAM",
+    checkoutAsset: "GRAM",
+    assetKind: "NATIVE",
+    assetDecimals: 9,
+    fiatAmountCents: 500,
+    fiatAmountMicros: "5000000",
+    creditedFiatMicros: "0",
+    remainingFiatMicros: "5000000",
+    activationThresholdFiatMicros: "2500000",
+    fiatCurrency: "USD",
+    address: "EQ_MIXED",
+    addressRaw: "0:mixed",
+    addressStrategy: "unique-address",
+    walletVersion: "v5r1",
+    walletWorkchain: 0,
+    walletContext: 1,
+    walletNetworkGlobalId: -3,
+    walletPublicKeyHash: "mixed-key",
+    amountNano: "2000000000",
+    paidNano: "0",
+    amountAtomic: "2000000000",
+    paidAmountAtomic: "0",
+    reference: "MIXED",
+    status: "PENDING",
+    providerName: "ton-direct",
+    observedTransactionHash: null,
+    observedAt: null,
+    firstMovementAt: null,
+    partialPaymentStartedAt: null,
+    partialPaymentExpiresAt: null,
+    expiresAt: new Date("2026-08-13T11:00:00.000Z"),
+    priceLockedAt: createdAt,
+    priceLockedUntil: new Date("2026-08-13T11:00:00.000Z"),
+    observedPayments: null,
+    createdAt,
+    updatedAt: createdAt,
+    metadata: null,
+    payload: null,
+    ...overrides,
+  };
+}
+
+function harness(input: { movements?: any[]; current?: TonhubPaymentInvoiceRecord } = {}) {
+  let current = input.current ?? invoice();
+  let expired = 0;
+  let movementQuery: any = null;
+  const creditCalls: any[] = [];
+  const outcomes = new Map<
+    string,
+    "credited" | "rate-pending" | "held-under-minimum" | "recovery" | "blocked-earlier-movement"
+  >();
+  const depositAddress = { id: "deposit-1" };
+  const db = {
+    tonhubPaymentInvoice: {
+      findUnique: async () => ({ ...current, depositAddress }),
+    },
+    tonhubPaymentMovement: {
+      findMany: async ({ where }: any) => {
+        movementQuery = where;
+        const retryBefore = where.OR?.find((branch: any) => branch.status === "RATE_PENDING")
+          ?.updatedAt?.lte;
+        return (input.movements ?? []).filter((movement) =>
+          movement.status !== "RATE_PENDING" ||
+          !retryBefore ||
+          movement.updatedAt.getTime() <= retryBefore.getTime());
+      },
+    },
+  };
+  const creditor = {
+    creditMovement: async (value: any) => {
+      creditCalls.push(value);
+      return {
+        outcome: outcomes.get(value.movementId) ?? "credited",
+        movement: { id: value.movementId },
+      };
+    },
+  };
+  const repository = {
+    findInvoiceById: async () => current,
+    markInvoiceExpired: async ({ expiredAt }: any) => {
+      expired += 1;
+      current = { ...current, status: "EXPIRED", observedAt: expiredAt };
+      return current;
+    },
+  };
+  return {
+    service: createMixedAssetSettlement(db as any, creditor as any, repository as any),
+    outcomes,
+    creditCalls,
+    expired: () => expired,
+    movementQuery: () => movementQuery,
+  };
+}
+
+test("mixed settlement stops at the earliest rate-pending movement before later assets can lock state", async () => {
+  const first = {
+    id: "movement-gram",
+    depositAddressId: "deposit-1",
+    direction: "INCOMING",
+    asset: "GRAM",
+    assetKind: "NATIVE",
+    assetDecimals: 9,
+    blockchainAt: new Date("2026-08-13T10:01:00.000Z"),
+  };
+  const second = {
+    id: "movement-usdt",
+    depositAddressId: "deposit-1",
+    direction: "INCOMING",
+    asset: "USDT",
+    assetKind: "JETTON",
+    assetDecimals: 6,
+    blockchainAt: new Date("2026-08-13T10:02:00.000Z"),
+  };
+  const testHarness = harness({ movements: [first, second] });
+  testHarness.outcomes.set(first.id, "rate-pending");
+  const result = await testHarness.service.settleInvoice({ invoiceId: "mixed-invoice", now });
+
+  assert.equal(result.ratePending, true);
+  assert.deepEqual(testHarness.creditCalls.map(({ movementId }) => movementId), [first.id]);
+  assert.equal(testHarness.expired(), 0);
+});
+
+test("mixed settlement excludes RATE_PENDING evidence until the worker retry cutoff even when a later movement is observed", async () => {
+  const retryBefore = new Date("2026-08-13T10:29:00.000Z");
+  const pending = {
+    id: "movement-rate-pending",
+    depositAddressId: "deposit-1",
+    direction: "INCOMING",
+    status: "RATE_PENDING",
+    updatedAt: new Date("2026-08-13T10:29:30.000Z"),
+    asset: "GRAM",
+    assetKind: "NATIVE",
+    assetDecimals: 9,
+    blockchainAt: new Date("2026-08-13T10:01:00.000Z"),
+  };
+  const observed = {
+    id: "movement-observed-later",
+    depositAddressId: "deposit-1",
+    direction: "INCOMING",
+    status: "OBSERVED",
+    updatedAt: new Date("2026-08-13T10:29:45.000Z"),
+    asset: "USDT",
+    assetKind: "JETTON",
+    assetDecimals: 6,
+    blockchainAt: new Date("2026-08-13T10:02:00.000Z"),
+  };
+  const testHarness = harness({ movements: [pending, observed] });
+  await testHarness.service.settleInvoice({
+    invoiceId: "mixed-invoice",
+    now,
+    ratePendingBefore: retryBefore,
+  });
+
+  assert.deepEqual(testHarness.creditCalls.map(({ movementId }) => movementId), [observed.id]);
+  assert.equal(
+    testHarness.movementQuery().OR[1].updatedAt.lte.toISOString(),
+    retryBefore.toISOString(),
+  );
+});
+
+test("mixed settlement does not expire while an earlier movement is being settled concurrently", async () => {
+  const movement = {
+    id: "movement-blocked",
+    depositAddressId: "deposit-1",
+    direction: "INCOMING",
+    asset: "GRAM",
+    assetKind: "NATIVE",
+    assetDecimals: 9,
+    blockchainAt: new Date("2026-08-13T10:01:00.000Z"),
+  };
+  const testHarness = harness({
+    current: invoice({ expiresAt: new Date("2026-08-13T10:20:00.000Z") }),
+    movements: [movement],
+  });
+  testHarness.outcomes.set(movement.id, "blocked-earlier-movement");
+  const result = await testHarness.service.settleInvoice({ invoiceId: "mixed-invoice", now });
+
+  assert.equal(result.deferred, true);
+  assert.equal(result.invoice.status, "PENDING");
+  assert.equal(testHarness.expired(), 0);
+});
+
+test("mixed settlement expires an empty invoice only after exhausting on-chain candidates", async () => {
+  const testHarness = harness({
+    current: invoice({ expiresAt: new Date("2026-08-13T10:20:00.000Z") }),
+  });
+  const result = await testHarness.service.settleInvoice({ invoiceId: "mixed-invoice", now });
+
+  assert.equal(result.invoice.status, "EXPIRED");
+  assert.equal(testHarness.expired(), 1);
+  assert.deepEqual(testHarness.creditCalls, []);
+});
+
+test("mixed settlement leaves zero-threshold legacy attempts on the characterized rollback path", async () => {
+  const testHarness = harness({
+    current: invoice({ activationThresholdFiatMicros: "0" }),
+    movements: [{
+      id: "legacy-movement",
+      depositAddressId: "deposit-1",
+      direction: "INCOMING",
+      asset: "GRAM",
+      assetKind: "NATIVE",
+      assetDecimals: 9,
+      blockchainAt: new Date("2026-08-13T10:01:00.000Z"),
+    }],
+  });
+  const result = await testHarness.service.settleInvoice({ invoiceId: "mixed-invoice", now });
+
+  assert.equal(result.invoice.status, "PENDING");
+  assert.deepEqual(testHarness.creditCalls, []);
+  assert.equal(testHarness.expired(), 0);
+});
+
+test("mixed settlement refuses an unsupported movement identity before allocation", async () => {
+  const testHarness = harness({
+    movements: [{
+      id: "fake-usdt",
+      depositAddressId: "deposit-1",
+      direction: "INCOMING",
+      asset: "USDT",
+      assetKind: "NATIVE",
+      assetDecimals: 9,
+      blockchainAt: new Date("2026-08-13T10:01:00.000Z"),
+    }],
+  });
+
+  await assert.rejects(
+    testHarness.service.settleInvoice({ invoiceId: "mixed-invoice", now }),
+    /unsupported settlement identity/,
+  );
+  assert.deepEqual(testHarness.creditCalls, []);
+});
+
+test("mixed settlement worker rotates poison deposits so later invoices run on the next batch", async () => {
+  const calls: Array<{ invoiceId: string; ratePendingBefore?: Date }> = [];
+  const deposits = [
+    { id: "deposit-a", invoiceId: "invoice-a", movements: 5, settlementNextAttemptAt: null as Date | null },
+    { id: "deposit-b", invoiceId: "invoice-b", movements: 1, settlementNextAttemptAt: null as Date | null },
+    { id: "deposit-c", invoiceId: "invoice-c", movements: 1, settlementNextAttemptAt: null as Date | null },
+  ];
+  const db = {
+    tonhubDepositAddress: {
+      findMany: async ({ take, where }: any) => {
+        assert.equal(take, 2);
+        assert.ok(where.movements?.some);
+        const dueAt = where.AND.OR[1].settlementNextAttemptAt.lte as Date;
+        return deposits
+          .filter(({ settlementNextAttemptAt }) =>
+            settlementNextAttemptAt === null || settlementNextAttemptAt.getTime() <= dueAt.getTime())
+          .sort((left, right) => {
+            if (left.settlementNextAttemptAt === null || right.settlementNextAttemptAt === null) {
+              if (left.settlementNextAttemptAt === right.settlementNextAttemptAt) {
+                return left.id.localeCompare(right.id);
+              }
+              return left.settlementNextAttemptAt === null ? -1 : 1;
+            }
+            return left.settlementNextAttemptAt.getTime() - right.settlementNextAttemptAt.getTime() ||
+              left.id.localeCompare(right.id);
+          })
+          .slice(0, take)
+          .map((deposit) => ({
+            id: deposit.id,
+            invoice: { id: deposit.invoiceId },
+            _count: { movements: deposit.movements },
+          }));
+      },
+      updateMany: async ({ where, data }: any) => {
+        const deposit = deposits.find(({ id }) => id === where.id);
+        if (!deposit) {
+          return { count: 0 };
+        }
+        if (where.AND) {
+          const dueAt = where.AND.OR[1].settlementNextAttemptAt.lte as Date;
+          if (deposit.settlementNextAttemptAt && deposit.settlementNextAttemptAt.getTime() > dueAt.getTime()) {
+            return { count: 0 };
+          }
+        }
+        if (
+          where.settlementNextAttemptAt instanceof Date &&
+          deposit.settlementNextAttemptAt?.getTime() !== where.settlementNextAttemptAt.getTime()
+        ) {
+          return { count: 0 };
+        }
+        deposit.settlementNextAttemptAt = data.settlementNextAttemptAt;
+        return { count: 1 };
+      },
+    },
+  };
+  const settlement = {
+    settleInvoice: async ({ invoiceId, ratePendingBefore }: any) => {
+      calls.push({ invoiceId, ratePendingBefore });
+      if (invoiceId === "invoice-a" || invoiceId === "invoice-b") {
+        throw new Error("rate storage unavailable");
+      }
+      return { invoice: invoice(), outcomes: [], ratePending: false, deferred: false };
+    },
+  };
+  const first = await runMixedSettlementBatch({
+    now,
+    limit: 2,
+    db,
+    settlement,
+  });
+  const second = await runMixedSettlementBatch({
+    now: new Date("2026-08-13T10:30:15.000Z"),
+    limit: 2,
+    db,
+    settlement,
+  });
+
+  assert.deepEqual(calls.map(({ invoiceId }) => invoiceId), ["invoice-a", "invoice-b", "invoice-c"]);
+  assert.deepEqual(
+    calls.map(({ ratePendingBefore }) => ratePendingBefore?.toISOString()),
+    [
+      "2026-08-13T10:29:00.000Z",
+      "2026-08-13T10:29:00.000Z",
+      "2026-08-13T10:29:15.000Z",
+    ],
+  );
+  assert.equal(first.movementsSelected, 6);
+  assert.equal(first.invoicesSelected, 2);
+  assert.equal(first.invoicesSettled, 0);
+  assert.deepEqual(first.errors.map(({ invoiceId }) => invoiceId), ["invoice-a", "invoice-b"]);
+  assert.equal(second.movementsSelected, 1);
+  assert.equal(second.invoicesSelected, 1);
+  assert.equal(second.invoicesSettled, 1);
+  assert.deepEqual(second.errors, []);
+});

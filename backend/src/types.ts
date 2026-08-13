@@ -68,6 +68,7 @@ export type TonhubPaymentInvoiceRecord = {
   fiatAmountMicros?: string | null;
   creditedFiatMicros?: string;
   remainingFiatMicros?: string | null;
+  activationThresholdFiatMicros?: string | null;
   fiatCurrency: string;
   address: string;
   addressRaw: string;

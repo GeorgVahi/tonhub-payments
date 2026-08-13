@@ -176,6 +176,7 @@ model TonhubDepositAddress {
   updatedAt             DateTime                    @updatedAt
   assignedAt            DateTime?
   paidAt                DateTime?
+  settlementNextAttemptAt DateTime?
   sweepStatus           String                      @default("NOT_STARTED")
   sweepAmountNano       String?
   sweepReserveNano      String?
@@ -197,6 +198,7 @@ model TonhubDepositAddress {
   @@index([network, sweepStatus, paidAt])
   @@index([invoiceKind, status])
   @@index([sweepStatus, updatedAt])
+  @@index([settlementNextAttemptAt, id])
 }
 
 model TonhubDepositAssetAccount {

@@ -38,6 +38,7 @@ try {
       fiatAmountCents: 500,
       fiatAmountMicros: "5000000",
       remainingFiatMicros: "5000000",
+      activationThresholdFiatMicros: "2500000",
       fiatCurrency: "USD",
       address: ids.address,
       addressRaw: ids.rawAddress,
@@ -69,6 +70,12 @@ try {
       status: "ACTIVE",
     },
   });
+  await assert.rejects(
+    prisma.tonhubPaymentInvoice.update({
+      where: { id: ids.invoice },
+      data: { activationThresholdFiatMicros: "2500001" },
+    }),
+  );
 
   await rates.recordMany([
     {
@@ -171,7 +178,7 @@ try {
     rawPayload: { verifier: true, eventIndex: 0 },
   });
 
-  const [gramCredit, usdtCredit] = await Promise.all([
+  let [gramCredit, usdtCredit] = await Promise.all([
     ledger.creditMovement({
       movementId: gram.id,
       orderId: ids.order,
@@ -187,6 +194,24 @@ try {
       maxRateAgeMs: 300_000,
     }),
   ]);
+  if (gramCredit.outcome === "blocked-earlier-movement") {
+    gramCredit = await ledger.creditMovement({
+      movementId: gram.id,
+      orderId: ids.order,
+      invoiceId: ids.invoice,
+      validationCode: "NATIVE_INBOUND_V1",
+      maxRateAgeMs: 300_000,
+    });
+  }
+  if (usdtCredit.outcome === "blocked-earlier-movement") {
+    usdtCredit = await ledger.creditMovement({
+      movementId: usdt.id,
+      orderId: ids.order,
+      invoiceId: ids.invoice,
+      validationCode: "JETTON_INBOUND_V1",
+      maxRateAgeMs: 300_000,
+    });
+  }
   assert.equal(gramCredit.movement.fiatCreditMicros, "3750000");
   assert.equal(usdtCredit.movement.fiatCreditMicros, "2000000");
   const paid = await prisma.tonhubPaymentOrder.findUniqueOrThrow({ where: { id: ids.order } });
@@ -197,6 +222,82 @@ try {
   assert.equal(await prisma.tonhubMovementAllocation.count({
     where: { orderId: ids.order, kind: "CREDIT" },
   }), 2);
+  const synchronizedInvoice = await prisma.tonhubPaymentInvoice.findUniqueOrThrow({
+    where: { id: ids.invoice },
+  });
+  assert.equal(synchronizedInvoice.status, "PAID");
+  assert.equal(synchronizedInvoice.creditedFiatMicros, "5000000");
+  assert.equal(synchronizedInvoice.remainingFiatMicros, "0");
+
+  const [laterGramRate] = await rates.recordMany([{
+    asset: "GRAM",
+    baseCurrency: "GRAM",
+    quoteCurrency: "USD",
+    price: "5",
+    source: "coingecko",
+    observedAt: new Date("2026-08-13T10:01:00.000Z"),
+    fetchedAt: new Date("2026-08-13T10:01:10.000Z"),
+    payload: { verifier: "movement-ledger-later-rate" },
+  }]);
+  const laterGram = await ledger.recordObserved({
+    ...gramDraft,
+    fingerprint: `testnet:ledger-gram-later-${suffix}:incoming:0`,
+    amountAtomic: "100000000",
+    transactionHash: `ledger-gram-later-${suffix}`,
+    transactionLt: "900003",
+    blockchainAt: new Date("2026-08-13T10:02:00.000Z"),
+  });
+  const laterGramCredit = await ledger.creditMovement({
+    movementId: laterGram.id,
+    orderId: ids.order,
+    invoiceId: ids.invoice,
+    validationCode: "NATIVE_INBOUND_V1",
+    maxRateAgeMs: 300_000,
+  });
+  assert.equal(laterGramCredit.movement.rateSnapshotId, gramCredit.movement.rateSnapshotId);
+  assert.equal(laterGramCredit.movement.fiatCreditMicros, "250000");
+  assert.equal(laterGramCredit.order.status, "RECOVERY");
+  const postPaidInvoice = await prisma.tonhubPaymentInvoice.findUniqueOrThrow({
+    where: { id: ids.invoice },
+  });
+  assert.equal(postPaidInvoice.status, "PAID");
+  assert.equal(postPaidInvoice.settlementReason, "POST_PAID_MOVEMENT_RECOVERY");
+  assert.equal(await prisma.tonhubRecoveryCase.count({
+    where: { movementId: laterGram.id, reason: "POST_PAID_MOVEMENT" },
+  }), 1);
+
+  const conflictingRateMovement = await prisma.tonhubPaymentMovement.create({
+    data: {
+      fingerprint: `testnet:ledger-gram-conflicting-rate-${suffix}:incoming:0`,
+      depositAddressId: ids.deposit,
+      network: "testnet",
+      direction: "INCOMING",
+      asset: "GRAM",
+      assetKind: "NATIVE",
+      assetDecimals: 9,
+      amountAtomic: "100000000",
+      fromAddress: "EQ_LEDGER_SENDER",
+      toAddress: ids.address,
+      transactionHash: `ledger-gram-conflicting-rate-${suffix}`,
+      transactionLt: "900004",
+      blockchainAt: new Date("2026-08-13T10:02:30.000Z"),
+      status: "CREDITED",
+      validationCode: "DIRECT_DB_RATE_LOCK_NEGATIVE",
+      rateSnapshotId: laterGramRate.id,
+      fiatCreditMicros: "500000",
+    },
+  });
+  await assert.rejects(
+    prisma.tonhubMovementAllocation.create({
+      data: {
+        movementId: conflictingRateMovement.id,
+        orderId: ids.order,
+        invoiceId: ids.invoice,
+        kind: "CREDIT",
+        fiatCreditMicros: "500000",
+      },
+    }),
+  );
 
   const replay = await ledger.creditMovement({
     movementId: gram.id,
@@ -234,10 +335,16 @@ try {
   );
   const recovered = await prisma.tonhubPaymentOrder.findUniqueOrThrow({ where: { id: ids.order } });
   assert.equal(recovered.status, "RECOVERY");
-  assert.equal(recovered.creditedFiatMicros, "3750000");
+  assert.equal(recovered.creditedFiatMicros, "4000000");
   assert.equal(recovered.overpaymentFiatMicros, "0");
   assert.equal(await prisma.tonhubMovementAllocation.count({
     where: { reversesAllocationId: usdtAllocationId },
+  }), 1);
+  const recoveryInvoice = await prisma.tonhubPaymentInvoice.findUniqueOrThrow({ where: { id: ids.invoice } });
+  assert.equal(recoveryInvoice.status, "FAILED");
+  assert.equal(recoveryInvoice.creditedFiatMicros, "4000000");
+  assert.equal(await prisma.tonhubRecoveryCase.count({
+    where: { movementId: usdt.id, reason: "ALLOCATION_REVERSED" },
   }), 1);
 
   await assert.rejects(

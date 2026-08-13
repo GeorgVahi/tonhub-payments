@@ -59,6 +59,8 @@ import {
   type GramSettlementComparison,
   type GramSettlementMode,
 } from "./gram-ledger-source";
+import { calculateActivationThresholdFiatMicros } from "./movement-ledger";
+import { mixedAssetSettlement, type MixedSettlementResult } from "./mixed-settlement";
 
 type TonhubPaymentDependencies = {
   repository: TonhubPaymentRepository;
@@ -80,6 +82,15 @@ type TonhubPaymentDependencies = {
   gramLedgerSource: GramLedgerSettlementSource;
   gramSettlementMode: () => GramSettlementMode;
   reportGramSettlementComparison: (comparison: GramSettlementComparison) => void;
+  mixedAssetSettlement: {
+    settleInvoice: (input: {
+      invoiceId: string;
+      now: Date;
+      maxRateAgeMs?: number;
+      partialPaymentTtlHours?: number;
+    }) => Promise<MixedSettlementResult>;
+  };
+  movementSettlementEnabled: () => boolean;
 };
 
 type PaymentResponse =
@@ -134,6 +145,26 @@ function partialPaymentTtlHours() {
     min: 1,
     max: 7 * 24
   });
+}
+
+function partialMerchantNetworkFeeFiatMicros(currency: FiatCurrency) {
+  const envName = `TON_PARTIAL_MERCHANT_NETWORK_FEE_${currency}_MICROS`;
+  const value = process.env[envName]?.trim() || "0";
+  if (!/^\d+$/.test(value)) {
+    throw new Error(`${envName} must be a non-negative integer string.`);
+  }
+  return BigInt(value).toString();
+}
+
+function movementSettlementEnabled() {
+  const value = process.env.TON_MOVEMENT_SETTLEMENT_ENABLED?.trim().toLowerCase() || "false";
+  if (value === "true") {
+    return true;
+  }
+  if (value === "false") {
+    return false;
+  }
+  throw new Error("TON_MOVEMENT_SETTLEMENT_ENABLED must be true or false.");
 }
 
 function invoiceLockUntil(invoice: TonhubPaymentInvoiceRecord) {
@@ -504,7 +535,22 @@ function serializeInvoice(invoice: TonhubPaymentInvoiceRecord, quote = extractQu
   });
   const paidNano = invoice.paidAmountAtomic ?? (invoice.paidNano || "0");
   const expectedAmountNano = ceilAtomicToPaymentUnit(invoice.amountAtomic ?? invoice.amountNano, asset);
-  const remainingExactNano = subtractNano(expectedAmountNano, paidNano);
+  const fiatLedger = invoice.activationThresholdFiatMicros !== null &&
+    invoice.activationThresholdFiatMicros !== undefined &&
+    /^\d+$/.test(invoice.activationThresholdFiatMicros) &&
+    BigInt(invoice.activationThresholdFiatMicros) > BigInt(0);
+  const fiatAmountMicros = invoice.fiatAmountMicros && /^\d+$/.test(invoice.fiatAmountMicros)
+    ? BigInt(invoice.fiatAmountMicros)
+    : null;
+  const remainingFiatMicros = invoice.remainingFiatMicros && /^\d+$/.test(invoice.remainingFiatMicros)
+    ? BigInt(invoice.remainingFiatMicros)
+    : null;
+  const remainingExactNano = fiatLedger && fiatAmountMicros && remainingFiatMicros !== null
+    ? (
+        (BigInt(expectedAmountNano) * remainingFiatMicros + fiatAmountMicros - BigInt(1)) /
+        fiatAmountMicros
+      ).toString()
+    : subtractNano(expectedAmountNano, paidNano);
   const remainingNano = remainingExactNano === "0"
     ? "0"
     : ceilAtomicToPaymentUnit(remainingExactNano, asset);
@@ -530,6 +576,10 @@ function serializeInvoice(invoice: TonhubPaymentInvoiceRecord, quote = extractQu
     fiatAmount: invoice.fiatAmountCents / 100,
     fiatCurrency: invoice.fiatCurrency,
     fiatAmountFormatted: formatFiatCents(invoice.fiatAmountCents, parseFiatCurrency(invoice.fiatCurrency)),
+    creditedFiatMicros: invoice.creditedFiatMicros ?? "0",
+    remainingFiatMicros: invoice.remainingFiatMicros ?? null,
+    activationThresholdFiatMicros: invoice.activationThresholdFiatMicros ?? null,
+    settlementBasis: fiatLedger ? "fiat-ledger" : "asset-atomic",
     address: invoice.address,
     addressMasked: maskValue(invoice.address),
     addressStrategy: invoice.addressStrategy,
@@ -620,6 +670,8 @@ function resolveDependencies(
     reportGramSettlementComparison: (comparison) => {
       console.log(`[tonhub-settlement-compare] ${JSON.stringify(comparison)}`);
     },
+    mixedAssetSettlement,
+    movementSettlementEnabled,
     ...overrides
   };
 }
@@ -680,23 +732,48 @@ function reportGramComparison(
   }
 }
 
+function hasActiveAllocationPolicy(invoice: TonhubPaymentInvoiceRecord) {
+  const value = invoice.activationThresholdFiatMicros;
+  if (value === null || value === undefined) {
+    return false;
+  }
+  if (!/^\d+$/.test(value)) {
+    throw new Error(`Invoice ${invoice.id} has malformed activationThresholdFiatMicros.`);
+  }
+  return BigInt(value) > BigInt(0);
+}
+
 export async function settleTonhubInvoiceWithConfiguredSource(input: {
   invoice: TonhubPaymentInvoiceRecord;
   dependencies?: Partial<TonhubPaymentDependencies>;
 }): Promise<SettleResult> {
   const deps = resolveDependencies(input.dependencies);
   const mode = deps.gramSettlementMode();
+  const useAllocationSettlement = hasActiveAllocationPolicy(input.invoice);
   if (mode === "legacy") {
+    if (useAllocationSettlement) {
+      throw new Error(`Invoice ${input.invoice.id} uses fiat-ledger settlement and cannot fall back to legacy atomic mutation.`);
+    }
     return settleTonhubInvoice({ invoice: input.invoice, dependencies: deps });
   }
   const network = input.invoice.network === "testnet" || input.invoice.network === "mainnet"
     ? input.invoice.network
     : null;
-  if (!network || (input.invoice.status !== "PENDING" && input.invoice.status !== "PARTIAL")) {
+  if (!network) {
+    if (useAllocationSettlement) {
+      throw new Error(`Invoice ${input.invoice.id} uses fiat-ledger settlement with an invalid network.`);
+    }
     return settleTonhubInvoice({ invoice: input.invoice, dependencies: deps });
   }
-
-  const storedPaymentMatches = mode === "ledger"
+  if (input.invoice.status !== "PENDING" && input.invoice.status !== "PARTIAL") {
+    return {
+      state: "not-payable",
+      invoice: input.invoice,
+      transactionsScanned: 0,
+      match: null,
+    };
+  }
+  const storedPaymentMatches = mode === "ledger" && !useAllocationSettlement
     ? strictStoredObservedPaymentMatches(input.invoice)
     : [];
 
@@ -711,7 +788,7 @@ export async function settleTonhubInvoiceWithConfiguredSource(input: {
     })).address;
   } catch (error) {
     observationError = error instanceof Error ? error.message : String(error);
-    if (mode === "ledger") {
+    if (mode === "ledger" || useAllocationSettlement) {
       throw error;
     }
   }
@@ -730,6 +807,7 @@ export async function settleTonhubInvoiceWithConfiguredSource(input: {
     notAfter: searchLimit,
   });
   let ledger: TonInvoiceMatch[] = [];
+  let allocationSettlement: MixedSettlementResult | null = null;
   try {
     if (observationError) {
       throw new Error(observationError);
@@ -747,7 +825,7 @@ export async function settleTonhubInvoiceWithConfiguredSource(input: {
       notBefore: input.invoice.createdAt,
       notAfter: searchEnd,
     });
-    if (mode === "ledger") {
+    if (mode === "ledger" && !useAllocationSettlement) {
       const storedCompatibility = compareGramSettlementMatches({
         invoiceId: input.invoice.id,
         legacy: storedPaymentMatches,
@@ -759,9 +837,16 @@ export async function settleTonhubInvoiceWithConfiguredSource(input: {
         );
       }
     }
+    if (useAllocationSettlement) {
+      allocationSettlement = await deps.mixedAssetSettlement.settleInvoice({
+        invoiceId: input.invoice.id,
+        now,
+        partialPaymentTtlHours: partialPaymentTtlHours(),
+      });
+    }
   } catch (error) {
     observationError = error instanceof Error ? error.message : String(error);
-    if (mode === "ledger") {
+    if (mode === "ledger" || useAllocationSettlement) {
       throw error;
     }
   }
@@ -774,6 +859,40 @@ export async function settleTonhubInvoiceWithConfiguredSource(input: {
   });
   if (mode === "compare" || !comparison.equivalent) {
     reportGramComparison(deps, comparison);
+  }
+  if (allocationSettlement) {
+    const settledInvoice = allocationSettlement.invoice;
+    const lastMatch = ledger[ledger.length - 1] ?? null;
+    if (settledInvoice.order?.status === "PAID" || settledInvoice.status === "PAID") {
+      return {
+        state: "paid",
+        invoice: settledInvoice,
+        transactionsScanned: transactions.length,
+        match: lastMatch,
+      };
+    }
+    if (settledInvoice.status === "PENDING" || settledInvoice.status === "PARTIAL") {
+      return {
+        state: "pending",
+        invoice: settledInvoice,
+        transactionsScanned: transactions.length,
+        match: lastMatch,
+      };
+    }
+    if (settledInvoice.status === "EXPIRED") {
+      return {
+        state: "expired",
+        invoice: settledInvoice,
+        transactionsScanned: transactions.length,
+        match: lastMatch,
+      };
+    }
+    return {
+      state: "not-payable",
+      invoice: settledInvoice,
+      transactionsScanned: transactions.length,
+      match: lastMatch,
+    };
   }
   return settleTonhubInvoice({
     invoice: input.invoice,
@@ -1173,7 +1292,13 @@ export async function createTonhubPaymentInvoice(
       createdAt,
       expiresAt: addMinutes(createdAt, invoiceTtlMinutes()),
       priceLockedAt: createdAt,
-      priceLockedUntil: addMinutes(createdAt, invoiceTtlMinutes())
+      priceLockedUntil: addMinutes(createdAt, invoiceTtlMinutes()),
+      activationThresholdFiatMicros: deps.movementSettlementEnabled()
+        ? calculateActivationThresholdFiatMicros({
+            orderFiatMicros: (BigInt(amountCents) * BigInt(10_000)).toString(),
+            merchantNetworkFeeFiatMicros: partialMerchantNetworkFeeFiatMicros(currency),
+          })
+        : "0",
     });
 
     return {

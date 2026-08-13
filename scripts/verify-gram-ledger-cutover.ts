@@ -99,6 +99,7 @@ try {
     expiresAt: new Date("2026-08-13T11:00:00.000Z"),
     priceLockedAt: createdAt,
     priceLockedUntil: new Date("2026-08-13T11:00:00.000Z"),
+    activationThresholdFiatMicros: "0",
   });
 
   const dependencies = {

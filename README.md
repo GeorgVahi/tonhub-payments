@@ -242,8 +242,33 @@ state machine. Existing stored partial hashes are canonicalized across hex and
 base64url encodings, preventing rollout replay from double-counting them. A
 legacy stored partial that cannot be reconciled to strict immutable movement
 evidence fails closed without reducing or advancing its invoice. This stage
-intentionally preserves the legacy locked-GRAM amount formula; immutable fiat
-allocations and mixed-asset settlement are introduced in the next stage.
+intentionally preserves the legacy locked-GRAM amount formula for grandfathered
+attempts while the allocation path below is enabled only for new attempts.
+
+Mixed settlement issuance and its background worker are available behind
+`TON_MOVEMENT_SETTLEMENT_ENABLED`; only new attempts receive a non-zero
+`activationThresholdFiatMicros`. Once issued, that policy is sticky and `/check`
+continues the fiat-ledger path even if issuance is disabled, preventing a
+partially allocated order from falling back to incompatible atomic mutation. It allocates
+confirmed incoming GRAM and USDT movements to the same fiat order and closes
+the order from aggregate fiat micros, regardless of the asset originally shown
+in checkout. The first credited GRAM movement locks its immutable rate snapshot
+for later GRAM partials; USDT continues to use the exact peg/cross snapshot
+policy. The first partial must cover the whole order or at least the greater of
+50% of the obligation and twice the configured full merchant network cost.
+Later movements in the same 24-hour partial window have no activation minimum.
+Late, undersized-first, late-discovered out-of-order, post-`PAID`,
+terminal-attempt, and reversal cases remain journaled and enter the admin
+recovery queue instead of being discarded. Invoice chronology is rebuilt from
+the active CREDIT movements' blockchain time rather than discovery order.
+Legacy attempts are backfilled with a zero threshold and stay on the reversible
+characterized settlement path. The optional `worker:settlement -- --watch`
+process retries rate-pending movements without relying on user polling and
+passes the configured retry cutoff into settlement, so a later observed
+movement cannot make an earlier rate lookup bypass its backoff. Each selected
+deposit is claimed with `settlementNextAttemptAt` before processing; failures
+and chronology blocks therefore rotate behind untried deposits instead of
+starving the rest of the queue.
 
 ## Frontend
 

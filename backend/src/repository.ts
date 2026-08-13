@@ -422,6 +422,7 @@ export type TonhubPaymentRepository = {
     expiresAt: Date;
     priceLockedAt: Date;
     priceLockedUntil: Date;
+    activationThresholdFiatMicros?: string;
   }) => Promise<TonhubPaymentInvoiceRecord>;
   markInvoiceExpired: (input: {
     invoiceId: string;
@@ -501,6 +502,13 @@ export function createPrismaTonhubPaymentRepository(db: PrismaLike): TonhubPayme
       try {
         return await db.$transaction(async (tx) => {
           const fiatAmountMicros = fiatCentsToMicros(input.amountCents);
+          const activationThresholdFiatMicros = input.activationThresholdFiatMicros ?? "0";
+          if (
+            !/^\d+$/.test(activationThresholdFiatMicros) ||
+            BigInt(activationThresholdFiatMicros) > BigInt(fiatAmountMicros)
+          ) {
+            throw new Error("Invoice activation threshold must be between zero and the order obligation.");
+          }
           const orderData = {
             externalId: input.externalId || null,
             fiatAmountMicros,
@@ -567,6 +575,7 @@ export function createPrismaTonhubPaymentRepository(db: PrismaLike): TonhubPayme
               fiatAmountMicros,
               creditedFiatMicros: "0",
               remainingFiatMicros: fiatAmountMicros,
+              activationThresholdFiatMicros,
               fiatCurrency: input.currency,
               address: input.depositAddress.address,
               addressRaw: input.depositAddress.addressRaw,

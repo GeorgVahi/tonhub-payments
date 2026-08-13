@@ -196,6 +196,7 @@ function pendingInput(externalId = "merchant-order-1") {
     expiresAt: new Date("2026-08-13T11:00:00.000Z"),
     priceLockedAt: createdAt,
     priceLockedUntil: new Date("2026-08-13T11:00:00.000Z"),
+    activationThresholdFiatMicros: "2500000",
   };
 }
 
@@ -221,6 +222,7 @@ test("new invoices dual-write one order and one active attempt", async () => {
   assert.equal(memory.invoices[0]?.amountAtomic, quote.amountNano);
   assert.equal(memory.invoices[0]?.paidAmountAtomic, "0");
   assert.equal(memory.invoices[0]?.checkoutAsset, "GRAM");
+  assert.equal(memory.invoices[0]?.activationThresholdFiatMicros, "2500000");
 });
 
 test("an unlinked legacy invoice remains readable during rollout", async () => {

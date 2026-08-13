@@ -88,3 +88,9 @@ covering invoices created by an old process near the migration boundary.
   accepting either a snapshot or credit. Application transactions lock the
   order before replaying active allocations, preventing lost updates and
   deriving `paidAt` deterministically from blockchain time.
+- New attempts persist an immutable initial-partial activation threshold.
+  Existing attempts are grandfathered with zero so rollout cannot reinterpret
+  legacy payments. The first GRAM CREDIT allocation locks one rate snapshot per
+  order at the database boundary, and recovery cases are idempotent per
+  movement/reason. Deposit addresses carry a dedicated settlement retry time so
+  worker backoff and queue fairness do not reuse scanner or sweep timestamps.

@@ -171,6 +171,9 @@ function dependencies(input: {
   mode: "legacy" | "compare" | "ledger";
   transactions: TonCenterTransaction[];
   comparisons?: GramSettlementComparison[];
+  movementSettlementEnabled?: boolean;
+  mixedSettlementInvoice?: TonhubPaymentInvoiceRecord;
+  mixedSettlementError?: Error;
 }) {
   return {
     repository: input.repository,
@@ -184,6 +187,20 @@ function dependencies(input: {
     fetchTonTransactions: async () => ({ transactions: input.transactions }),
     gramLedgerSource: input.source,
     gramSettlementMode: () => input.mode,
+    movementSettlementEnabled: () => input.movementSettlementEnabled ?? false,
+    mixedAssetSettlement: {
+      settleInvoice: async () => {
+        if (input.mixedSettlementError) {
+          throw input.mixedSettlementError;
+        }
+        const settledInvoice = input.mixedSettlementInvoice ??
+          await input.repository.findInvoiceById("cutover-invoice");
+        if (!settledInvoice) {
+          throw new Error("mixed settlement fixture invoice is missing");
+        }
+        return { invoice: settledInvoice, outcomes: [], ratePending: false, deferred: false };
+      },
+    },
     reportGramSettlementComparison: (comparison: GramSettlementComparison) => {
       input.comparisons?.push(comparison);
     },
@@ -292,6 +309,157 @@ test("ledger cutover ignores an aborted transfer that the legacy matcher would c
   assert.equal(comparisons[0]?.legacyAmountAtomic, "2000000000");
   assert.equal(comparisons[0]?.ledgerAmountAtomic, "1000000000");
   assert.deepEqual(comparisons[0]?.onlyLegacy, ["62".repeat(32)]);
+});
+
+test("allocation settlement remains sticky after new-attempt issuance is disabled", async () => {
+  const pendingInvoice = invoice({ activationThresholdFiatMicros: "2500000" });
+  const harness = createRepositoryHarness(pendingInvoice);
+  const ledger = createLedgerSource(pendingInvoice);
+  const paidInvoice = invoice({
+    activationThresholdFiatMicros: "2500000",
+    status: "PAID",
+    creditedFiatMicros: "5000000",
+    remainingFiatMicros: "0",
+    paidNano: "0",
+    paidAmountAtomic: "0",
+    order: {
+      id: "cutover-order-id",
+      externalId: "cutover-order",
+      fiatAmountMicros: "5000000",
+      fiatCurrency: "USD",
+      creditedFiatMicros: "5000000",
+      overpaymentFiatMicros: "0",
+      status: "PAID",
+      paidAt: new Date("2026-08-13T10:10:00.000Z"),
+      expiresAt: new Date("2026-08-13T11:00:00.000Z"),
+      cancelledAt: null,
+      createdAt,
+      updatedAt: now,
+      metadata: null,
+    },
+  });
+  const checked = await checkTonhubPaymentInvoice(pendingInvoice.id, dependencies({
+    repository: harness.repository,
+    source: ledger.source,
+    mode: "ledger",
+    transactions: [],
+    movementSettlementEnabled: false,
+    mixedSettlementInvoice: paidInvoice,
+  }));
+
+  assert.equal(checked.status, 200);
+  assert.equal(checked.body.finalized, true);
+  assert.equal((checked.body.invoice as { status: string }).status, "PAID");
+  assert.equal((checked.body.invoice as { creditedFiatMicros: string }).creditedFiatMicros, "5000000");
+  assert.equal((checked.body.invoice as { remainingAmountAtomic: string }).remainingAmountAtomic, "0");
+  assert.equal((checked.body.invoice as { settlementBasis: string }).settlementBasis, "fiat-ledger");
+  assert.equal(harness.transitionCount(), 0);
+});
+
+test("a fiat-ledger attempt fails closed instead of falling back to legacy atomic settlement", async () => {
+  const pendingInvoice = invoice({ activationThresholdFiatMicros: "2500000" });
+  const harness = createRepositoryHarness(pendingInvoice);
+  const ledger = createLedgerSource(pendingInvoice);
+  const checked = await checkTonhubPaymentInvoice(pendingInvoice.id, dependencies({
+    repository: harness.repository,
+    source: ledger.source,
+    mode: "legacy",
+    transactions: [transaction({
+      hash: "79".repeat(32),
+      lt: "1950",
+      amount: "2000000000",
+    })],
+  }));
+
+  assert.equal(checked.status, 503);
+  assert.match(String(checked.body.error), /cannot fall back to legacy atomic mutation/);
+  assert.equal(harness.transitionCount(), 0);
+  assert.equal(harness.current().status, "PENDING");
+});
+
+test("a fiat-ledger attempt in compare mode fails closed when observation or allocation fails", async () => {
+  const pendingInvoice = invoice({ activationThresholdFiatMicros: "2500000" });
+  const harness = createRepositoryHarness(pendingInvoice);
+  const ledger = createLedgerSource(pendingInvoice);
+  const checked = await checkTonhubPaymentInvoice(pendingInvoice.id, dependencies({
+    repository: harness.repository,
+    source: ledger.source,
+    mode: "compare",
+    transactions: [transaction({
+      hash: "7a".repeat(32),
+      lt: "1951",
+      amount: "2000000000",
+    })],
+    mixedSettlementError: new Error("allocation storage unavailable"),
+  }));
+
+  assert.equal(checked.status, 503);
+  assert.match(String(checked.body.error), /allocation storage unavailable/);
+  assert.equal(harness.transitionCount(), 0);
+  assert.equal(harness.current().status, "PENDING");
+});
+
+test("a fiat-ledger attempt with an invalid stored network cannot enter legacy settlement", async () => {
+  const pendingInvoice = invoice({
+    activationThresholdFiatMicros: "2500000",
+    network: "invalid-network" as any,
+  });
+  const harness = createRepositoryHarness(pendingInvoice);
+  const ledger = createLedgerSource(pendingInvoice);
+
+  await assert.rejects(
+    settleTonhubInvoiceWithConfiguredSource({
+      invoice: pendingInvoice,
+      dependencies: dependencies({
+        repository: harness.repository,
+        source: ledger.source,
+        mode: "compare",
+        transactions: [],
+      }),
+    }),
+    /fiat-ledger settlement with an invalid network/,
+  );
+  assert.equal(harness.transitionCount(), 0);
+});
+
+test("fiat-ledger partial responses scale the locked checkout amount after wrong-asset credit", async () => {
+  const pendingInvoice = invoice({ activationThresholdFiatMicros: "2500000" });
+  const harness = createRepositoryHarness(pendingInvoice);
+  const ledger = createLedgerSource(pendingInvoice);
+  const partialInvoice = invoice({
+    activationThresholdFiatMicros: "2500000",
+    status: "PARTIAL",
+    creditedFiatMicros: "2000000",
+    remainingFiatMicros: "3000000",
+    paidNano: "0",
+    paidAmountAtomic: "0",
+    partialPaymentStartedAt: new Date("2026-08-13T10:10:00.000Z"),
+    partialPaymentExpiresAt: new Date("2026-08-14T10:10:00.000Z"),
+    observedPayments: [{
+      transactionId: "78".repeat(32),
+      asset: "USDT",
+      assetDecimals: 6,
+      amountAtomic: "2000000",
+      amountFormatted: "2 USDT",
+      createdAt: "2026-08-13T10:10:00.000Z",
+      status: "observed",
+      comment: "",
+    }],
+  });
+  const checked = await checkTonhubPaymentInvoice(pendingInvoice.id, dependencies({
+    repository: harness.repository,
+    source: ledger.source,
+    mode: "ledger",
+    transactions: [],
+    movementSettlementEnabled: true,
+    mixedSettlementInvoice: partialInvoice,
+  }));
+
+  assert.equal(checked.status, 200);
+  assert.equal(checked.body.finalized, false);
+  assert.equal((checked.body.invoice as { remainingAmountAtomic: string }).remainingAmountAtomic, "1200000000");
+  assert.equal((checked.body.invoice as { amountAtomic: string }).amountAtomic, "1200000000");
+  assert.equal((checked.body.invoice as { paidAmountAtomic: string }).paidAmountAtomic, "0");
 });
 
 test("compare mode reports divergence but preserves the legacy settlement response", async () => {
