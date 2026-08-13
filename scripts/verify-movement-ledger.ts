@@ -7,6 +7,12 @@ import {
 } from "../backend/src/movement-ledger";
 import { createPrismaRateSnapshotRepository } from "../backend/src/rate-snapshots";
 import { createInternalTestnetJettonAdapter } from "../backend/src/ton/internal-testnet-jetton";
+import {
+  createMainnetUsdtAdapter,
+  officialMainnetUsdtMasterAddress,
+  resolveMainnetUsdtAdapterConfig,
+} from "../backend/src/ton/mainnet-usdt";
+import { createPrismaMainnetUsdtScannerRepository } from "../worker/src/mainnet-usdt";
 
 const prisma = new PrismaClient();
 const ledger = createMovementLedger(prisma as any);
@@ -532,6 +538,170 @@ try {
   assert.equal(internalMovement.asset, "USDT");
   assert.equal(internalMovement.assetDecimals, 6);
   assert.equal((internalMovement.rawPayload as any).internalTestAsset, true);
+
+  const mainnetOrderId = `ledger-mainnet-usdt-order-${suffix}`;
+  const mainnetInvoiceId = `ledger-mainnet-usdt-invoice-${suffix}`;
+  const mainnetDepositId = `ledger-mainnet-usdt-deposit-${suffix}`;
+  const mainnetOwnerRaw = `0:${"52".repeat(32)}`;
+  const mainnetWalletRaw = `0:${"72".repeat(32)}`;
+  const mainnetSenderRaw = `0:${"82".repeat(32)}`;
+  const mainnetSenderWalletRaw = `0:${"92".repeat(32)}`;
+  const mainnetFriendly = (raw: string) => Address.parse(raw).toString({ bounceable: true });
+  await prisma.tonhubPaymentOrder.create({
+    data: {
+      id: mainnetOrderId,
+      externalId: `ledger-mainnet-usdt-external-${suffix}`,
+      fiatAmountMicros: "5000000",
+      fiatCurrency: "USD",
+      expiresAt: new Date("2026-08-13T11:00:00.000Z"),
+    },
+  });
+  await prisma.tonhubPaymentInvoice.create({
+    data: {
+      id: mainnetInvoiceId,
+      orderId: mainnetOrderId,
+      network: "mainnet",
+      fiatAmountCents: 500,
+      fiatAmountMicros: "5000000",
+      remainingFiatMicros: "5000000",
+      activationThresholdFiatMicros: "2500000",
+      fiatCurrency: "USD",
+      address: mainnetFriendly(mainnetOwnerRaw),
+      addressRaw: mainnetOwnerRaw,
+      walletVersion: "v5r1",
+      walletWorkchain: 0,
+      walletContext: suffix === "clean" ? 810_031 : 810_032,
+      walletNetworkGlobalId: -239,
+      walletPublicKeyHash: `ledger-mainnet-usdt-key-${suffix}`,
+      amountNano: "2000000000",
+      amountAtomic: "2000000000",
+      reference: `ledger-mainnet-usdt-reference-${suffix}`,
+      expiresAt: new Date("2026-08-13T11:00:00.000Z"),
+      priceLockedAt: new Date("2026-08-13T10:00:00.000Z"),
+      priceLockedUntil: new Date("2026-08-13T11:00:00.000Z"),
+      createdAt: new Date("2026-08-13T10:00:00.000Z"),
+      updatedAt: new Date("2026-08-13T10:00:00.000Z"),
+    },
+  });
+  await prisma.tonhubDepositAddress.create({
+    data: {
+      id: mainnetDepositId,
+      invoiceId: mainnetInvoiceId,
+      network: "mainnet",
+      address: mainnetFriendly(mainnetOwnerRaw),
+      addressRaw: mainnetOwnerRaw,
+      walletVersion: "v5r1",
+      walletWorkchain: 0,
+      walletContext: suffix === "clean" ? 810_031 : 810_032,
+      walletNetworkGlobalId: -239,
+      walletPublicKeyHash: `ledger-mainnet-usdt-key-${suffix}`,
+      status: "ACTIVE",
+    },
+  });
+  const mainnetAdapter = createMainnetUsdtAdapter({
+    db: prisma,
+    ledger,
+    config: resolveMainnetUsdtAdapterConfig({
+      TON_USDT_MAINNET_ADAPTER_ENABLED: "true",
+    })!,
+    resolveReadConfig: () => ({
+      network: "mainnet",
+      baseUrl: "https://toncenter.com/api/v3",
+      address: "",
+      addressEnvName: "",
+    }),
+    fetchImpl: async (request) => {
+      const url = new URL(String(request));
+      if (url.pathname.endsWith("/jetton/masters")) {
+        return new Response(JSON.stringify({
+          jetton_masters: [{
+            address: officialMainnetUsdtMasterAddress,
+            jetton_content: { decimals: "6", symbol: "metadata-is-not-identity" },
+          }],
+        }), { status: 200 });
+      }
+      if (url.pathname.endsWith("/jetton/wallets")) {
+        return new Response(JSON.stringify({
+          jetton_wallets: [{
+            address: mainnetFriendly(mainnetWalletRaw),
+            owner: mainnetFriendly(mainnetOwnerRaw),
+            jetton: officialMainnetUsdtMasterAddress,
+          }],
+        }), { status: 200 });
+      }
+      if (url.pathname.endsWith("/transactions")) {
+        return new Response(JSON.stringify({ transactions: [] }), { status: 200 });
+      }
+      if (!url.searchParams.has("jetton_wallet")) {
+        return new Response(JSON.stringify({ jetton_transfers: [] }), { status: 200 });
+      }
+      return new Response(JSON.stringify({
+        jetton_transfers: [{
+          amount: "5000000",
+          destination: mainnetFriendly(mainnetOwnerRaw),
+          jetton_master: officialMainnetUsdtMasterAddress,
+          query_id: "86",
+          source: mainnetFriendly(mainnetSenderRaw),
+          source_wallet: mainnetFriendly(mainnetSenderWalletRaw),
+          transaction_aborted: false,
+          transaction_hash: "e5".repeat(32),
+          transaction_lt: "920001",
+          transaction_now: 1_786_616_400,
+        }],
+      }), { status: 200 });
+    },
+    now: () => new Date("2026-08-13T10:30:00.000Z"),
+  });
+  const mainnetObserved = await mainnetAdapter.observeDeposit({
+    depositAddressId: mainnetDepositId,
+    notBefore: new Date("2026-08-13T10:00:00.000Z"),
+    notAfter: new Date("2026-08-13T10:30:00.000Z"),
+  });
+  assert.equal(mainnetObserved.movementsObserved, 1);
+  const mainnetMovement = await prisma.tonhubPaymentMovement.findUniqueOrThrow({
+    where: {
+      fingerprint: `ton:mainnet:jetton-in:${"e5".repeat(32)}:86:${officialMainnetUsdtMasterAddress}`,
+    },
+  });
+  assert.equal(mainnetMovement.network, "mainnet");
+  assert.equal(mainnetMovement.jettonMasterAddress, officialMainnetUsdtMasterAddress);
+  assert.equal(mainnetMovement.jettonWalletAddress, mainnetWalletRaw);
+  assert.equal((mainnetMovement.rawPayload as any).officialUsdt, true);
+  assert.equal((mainnetMovement.rawPayload as any).internalTestAsset, undefined);
+
+  const scannerRepository = createPrismaMainnetUsdtScannerRepository(prisma);
+  const claimedMainnetTargets = await scannerRepository.claimDueTargets({
+    workerId: `mainnet-usdt-verifier-${suffix}`,
+    now: new Date("2026-08-13T10:30:00.000Z"),
+    limit: 100,
+    leaseMs: 60_000,
+    activeIntervalMs: 15_000,
+    terminalIntervalMs: 86_400_000,
+    terminalMonitorMs: 30 * 86_400_000,
+    candidatePoolSize: 10_000,
+  });
+  const claimedMainnetTarget = claimedMainnetTargets.find(
+    ({ depositAddressId }) => depositAddressId === mainnetDepositId,
+  );
+  assert.ok(claimedMainnetTarget);
+  assert.equal(await scannerRepository.completeScan({
+    target: claimedMainnetTarget,
+    scannedThroughAt: new Date("2026-08-13T10:30:00.000Z"),
+    nextScanAt: new Date("2026-08-13T10:30:15.000Z"),
+  }), true);
+  const storedMainnetCursor = await prisma.tonhubScanCursor.findUniqueOrThrow({
+    where: {
+      network_streamType_scopeKey: {
+        network: "mainnet",
+        streamType: "USDT_MAINNET_IN",
+        scopeKey: mainnetDepositId,
+      },
+    },
+  });
+  assert.equal(storedMainnetCursor.lastTimestamp?.toISOString(), "2026-08-13T10:30:00.000Z");
+  assert.equal(storedMainnetCursor.leaseOwner, null);
+  assert.equal(storedMainnetCursor.leaseExpiresAt?.toISOString(), "2026-08-13T10:30:15.000Z");
+
   const rejectedJettonDraft = {
     fingerprint: `ton:testnet:jetton-rejected:${"d4".repeat(32)}:85:${internalMasterRaw}:${internalWalletRaw}`,
     depositAddressId: internalDepositId,

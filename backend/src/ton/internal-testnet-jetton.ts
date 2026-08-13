@@ -4,18 +4,32 @@ import { paymentAssets } from "../../../shared/payment-assets";
 import type { PaymentMovementDraft } from "../movement-ledger";
 import {
   resolveTonApiConfig,
+  type TonNetwork,
   type TonReadConfig,
 } from "./direct-payments";
 import {
   canonicalTonAddress,
   canonicalTonTransactionHash,
 } from "./gram-shadow-scanner";
+import { officialMainnetUsdtMasterAddress } from "./jetton-identities";
 
 export type InternalTestnetJettonConfig = {
   enabled: true;
   network: "testnet";
   masterAddress: string;
   decimals: 6;
+};
+
+export type VerifiedJettonConfig = {
+  enabled: true;
+  network: TonNetwork;
+  masterAddress: string;
+  decimals: 6;
+};
+
+export type VerifiedJettonAdapterProfile = {
+  name: string;
+  evidence: "internal-test-asset" | "official-usdt";
 };
 
 export type TonCenterJettonWallet = {
@@ -73,12 +87,12 @@ export type InternalTestnetJettonRejection = {
   code: InternalTestnetJettonRejectionCode;
 };
 
-type PrismaLike = {
+export type VerifiedJettonPrismaLike = {
   tonhubDepositAddress: any;
   tonhubDepositAssetAccount: any;
 };
 
-type MovementLedgerLike = {
+export type VerifiedJettonMovementLedgerLike = {
   recordObserved: (movement: PaymentMovementDraft) => Promise<unknown>;
   recordRejected: (input: {
     movement: PaymentMovementDraft;
@@ -91,13 +105,17 @@ type MovementLedgerLike = {
 
 export const jettonTransferNotificationOpcode = 0x7362d09c;
 
-type AdapterDependencies = {
-  db: PrismaLike;
-  ledger: MovementLedgerLike;
-  config: InternalTestnetJettonConfig;
-  resolveReadConfig?: (network: "testnet") => TonReadConfig;
+export type VerifiedJettonAdapterDependencies = {
+  db: VerifiedJettonPrismaLike;
+  ledger: VerifiedJettonMovementLedgerLike;
+  config: VerifiedJettonConfig;
+  resolveReadConfig?: (network: TonNetwork) => TonReadConfig;
   fetchImpl?: typeof fetch;
   now?: () => Date;
+};
+
+type AdapterDependencies = Omit<VerifiedJettonAdapterDependencies, "config"> & {
+  config: InternalTestnetJettonConfig;
 };
 
 function text(value: unknown) {
@@ -242,7 +260,7 @@ async function fetchJson(input: {
   if (!response.ok) {
     const detail = (await response.text().catch(() => "")).trim().slice(0, 180);
     throw new Error(
-      `TON Center testnet ${input.path} request failed: ${response.status}${detail ? ` ${detail}` : ""}.`,
+      `TON Center ${input.config.network} ${input.path} request failed: ${response.status}${detail ? ` ${detail}` : ""}.`,
     );
   }
   return await response.json() as unknown;
@@ -263,7 +281,9 @@ function rejection(
   };
 }
 
-export function scanInternalTestnetJettonTransfers(input: {
+function scanVerifiedJettonTransfers(input: {
+  network: TonNetwork;
+  evidence: VerifiedJettonAdapterProfile["evidence"];
   depositAddressId: string;
   ownerAddress: string;
   masterAddress: string;
@@ -277,14 +297,14 @@ export function scanInternalTestnetJettonTransfers(input: {
   const masterAddress = canonicalTonAddress(input.masterAddress);
   const assetWalletAddress = canonicalTonAddress(input.assetWalletAddress);
   if (!ownerAddress || !masterAddress || !assetWalletAddress) {
-    throw new Error("Internal testnet jetton target evidence is invalid.");
+    throw new Error("Verified jetton target evidence is invalid.");
   }
   if (
     !validDate(input.notBefore) ||
     !validDate(input.notAfter) ||
     input.notAfter.getTime() < input.notBefore.getTime()
   ) {
-    throw new Error("Internal testnet jetton scan window is invalid.");
+    throw new Error("Verified jetton scan window is invalid.");
   }
 
   const movements: PaymentMovementDraft[] = [];
@@ -418,9 +438,9 @@ export function scanInternalTestnetJettonTransfers(input: {
     }
     const asset = paymentAssets.USDT;
     movements.push({
-      fingerprint: `ton:testnet:jetton-in:${transactionHash}:${queryId}:${masterAddress}`,
+      fingerprint: `ton:${input.network}:jetton-in:${transactionHash}:${queryId}:${masterAddress}`,
       depositAddressId: input.depositAddressId,
-      network: "testnet",
+      network: input.network,
       direction: "INCOMING",
       asset: asset.symbol,
       assetKind: asset.kind,
@@ -439,7 +459,9 @@ export function scanInternalTestnetJettonTransfers(input: {
       rawPayload: {
         evidenceVersion: 1,
         provider: "toncenter-v3-jetton-transfers",
-        internalTestAsset: true,
+        ...(input.evidence === "internal-test-asset"
+          ? { internalTestAsset: true }
+          : { officialUsdt: true }),
         transfer: {
           amount: amountAtomic,
           destination: ownerAddress,
@@ -469,7 +491,20 @@ export function scanInternalTestnetJettonTransfers(input: {
   return { movements, rejections };
 }
 
+export function scanInternalTestnetJettonTransfers(input: Omit<
+  Parameters<typeof scanVerifiedJettonTransfers>[0],
+  "network" | "evidence"
+>) {
+  return scanVerifiedJettonTransfers({
+    ...input,
+    network: "testnet",
+    evidence: "internal-test-asset",
+  });
+}
+
 function rejectedJettonCandidate(input: {
+  network: TonNetwork;
+  evidence: VerifiedJettonAdapterProfile["evidence"];
   depositAddressId: string;
   ownerAddress: string;
   configuredMaster: string;
@@ -515,9 +550,9 @@ function rejectedJettonCandidate(input: {
   }
   const asset = paymentAssets.USDT;
   return {
-    fingerprint: `ton:testnet:jetton-rejected:${transactionHash}:${queryId}:${actualMaster}:${actualWallet}`,
+    fingerprint: `ton:${input.network}:jetton-rejected:${transactionHash}:${queryId}:${actualMaster}:${actualWallet}`,
     depositAddressId: input.depositAddressId,
-    network: "testnet" as const,
+    network: input.network,
     direction: "INCOMING" as const,
     asset: asset.symbol,
     assetKind: asset.kind,
@@ -536,7 +571,9 @@ function rejectedJettonCandidate(input: {
     rawPayload: {
       evidenceVersion: 1,
       provider: "toncenter-v3-jetton-transfers",
-      internalTestAsset: true,
+      ...(input.evidence === "internal-test-asset"
+        ? { internalTestAsset: true }
+        : { officialUsdt: true }),
       untrustedJettonCandidate: true,
       rejectionCode: input.code,
       configuredMasterAddress: input.configuredMaster,
@@ -616,10 +653,12 @@ function assertAccountIdentity(account: any, input: {
   depositAddressId: string;
   assetWalletAddress: string;
   masterAddress: string;
+  network: TonNetwork;
+  profileName: string;
 }) {
   if (
     account.depositAddressId !== input.depositAddressId ||
-    account.network !== "testnet" ||
+    account.network !== input.network ||
     account.asset !== "USDT" ||
     account.assetKind !== "JETTON" ||
     account.assetDecimals !== paymentAssets.USDT.decimals ||
@@ -627,22 +666,37 @@ function assertAccountIdentity(account: any, input: {
     canonicalTonAddress(account.assetWalletAddress) !== input.assetWalletAddress ||
     account.status !== "VERIFIED"
   ) {
-    throw new Error("Stored internal testnet jetton account conflicts with verified provider evidence.");
+    throw new Error(`Stored ${input.profileName} account conflicts with verified provider evidence.`);
   }
   return account;
 }
 
-export function createInternalTestnetJettonAdapter(dependencies: AdapterDependencies) {
+export function createVerifiedJettonAdapter(
+  dependencies: VerifiedJettonAdapterDependencies,
+  profile: VerifiedJettonAdapterProfile,
+) {
   if (
-    dependencies.config.network !== "testnet" ||
+    !["testnet", "mainnet"].includes(dependencies.config.network) ||
     dependencies.config.enabled !== true ||
     dependencies.config.decimals !== paymentAssets.USDT.decimals
   ) {
-    throw new Error("The internal jetton adapter requires explicit testnet-only configuration.");
+    throw new Error(`${profile.name} requires explicit verified 6-decimal configuration.`);
   }
   const configuredMaster = canonicalTonAddress(dependencies.config.masterAddress);
   if (!configuredMaster) {
-    throw new Error("The internal testnet jetton master address is invalid.");
+    throw new Error(`${profile.name} master address is invalid.`);
+  }
+  if (
+    (profile.evidence === "internal-test-asset" && dependencies.config.network !== "testnet") ||
+    (
+      profile.evidence === "official-usdt" &&
+      (
+        dependencies.config.network !== "mainnet" ||
+        configuredMaster !== officialMainnetUsdtMasterAddress
+      )
+    )
+  ) {
+    throw new Error(`${profile.name} evidence identity is not allowed on this network.`);
   }
   const fetchImpl = dependencies.fetchImpl ?? fetch;
   const resolveReadConfig = dependencies.resolveReadConfig ?? resolveTonApiConfig;
@@ -661,15 +715,15 @@ export function createInternalTestnetJettonAdapter(dependencies: AdapterDependen
         !validDate(input.notAfter) ||
         input.notAfter.getTime() < input.notBefore.getTime()
       ) {
-        throw new Error("Internal testnet jetton scan window is invalid.");
+        throw new Error(`${profile.name} scan window is invalid.`);
       }
       const limit = input.limit ?? 100;
       const offset = input.offset ?? 0;
       if (!Number.isInteger(limit) || limit < 1 || limit > 1000) {
-        throw new Error("Internal testnet jetton limit must be between 1 and 1000.");
+        throw new Error(`${profile.name} limit must be between 1 and 1000.`);
       }
       if (!Number.isInteger(offset) || offset < 0) {
-        throw new Error("Internal testnet jetton offset must be a non-negative integer.");
+        throw new Error(`${profile.name} offset must be a non-negative integer.`);
       }
       const deposit = await dependencies.db.tonhubDepositAddress.findUnique({
         where: { id: input.depositAddressId },
@@ -678,16 +732,16 @@ export function createInternalTestnetJettonAdapter(dependencies: AdapterDependen
       const ownerAddressRaw = canonicalTonAddress(deposit?.addressRaw);
       if (
         !deposit ||
-        deposit.network !== "testnet" ||
+        deposit.network !== dependencies.config.network ||
         !ownerAddress ||
         !ownerAddressRaw ||
         ownerAddress !== ownerAddressRaw
       ) {
-        throw new Error("The internal jetton adapter requires a consistent testnet deposit.");
+        throw new Error(`${profile.name} requires a consistent ${dependencies.config.network} deposit.`);
       }
-      const readConfig = resolveReadConfig("testnet");
-      if (readConfig.network !== "testnet") {
-        throw new Error("The internal jetton adapter cannot use a non-testnet provider.");
+      const readConfig = resolveReadConfig(dependencies.config.network);
+      if (readConfig.network !== dependencies.config.network) {
+        throw new Error(`${profile.name} cannot use a provider for another network.`);
       }
       const mastersPayload = requireRecord(await fetchJson({
         config: readConfig,
@@ -702,11 +756,11 @@ export function createInternalTestnetJettonAdapter(dependencies: AdapterDependen
         .map((value) => requireRecord(value, "Jetton master"))
         .filter((master) => canonicalTonAddress(master.address) === configuredMaster);
       if (exactMasters.length !== 1) {
-        throw new Error("TON Center must return exactly one configured internal testnet jetton master.");
+        throw new Error(`TON Center must return exactly one configured ${profile.name} master.`);
       }
       const masterContent = requireRecord(exactMasters[0].jetton_content, "Jetton master content");
       if (canonicalInteger(masterContent.decimals) !== String(paymentAssets.USDT.decimals)) {
-        throw new Error("The internal testnet jetton master must have exactly 6 decimals.");
+        throw new Error(`${profile.name} master must have exactly 6 decimals.`);
       }
       const walletsPayload = requireRecord(await fetchJson({
         config: readConfig,
@@ -727,12 +781,12 @@ export function createInternalTestnetJettonAdapter(dependencies: AdapterDependen
         .map((wallet) => canonicalTonAddress(wallet.address))
         .filter((value): value is string => Boolean(value)))];
       if (uniqueWalletAddresses.length !== 1) {
-        throw new Error("TON Center must return exactly one verified internal testnet jetton wallet.");
+        throw new Error(`TON Center must return exactly one verified ${profile.name} wallet.`);
       }
       const assetWalletAddress = uniqueWalletAddresses[0];
       const verifiedAt = clock();
       if (!validDate(verifiedAt)) {
-        throw new Error("Internal testnet jetton verification time is invalid.");
+        throw new Error(`${profile.name} verification time is invalid.`);
       }
       let account = await dependencies.db.tonhubDepositAssetAccount.upsert({
         where: {
@@ -743,7 +797,7 @@ export function createInternalTestnetJettonAdapter(dependencies: AdapterDependen
         },
         create: {
           depositAddressId: deposit.id,
-          network: "testnet",
+          network: dependencies.config.network,
           asset: paymentAssets.USDT.symbol,
           assetKind: paymentAssets.USDT.kind,
           assetDecimals: paymentAssets.USDT.decimals,
@@ -759,6 +813,8 @@ export function createInternalTestnetJettonAdapter(dependencies: AdapterDependen
         depositAddressId: deposit.id,
         assetWalletAddress,
         masterAddress: configuredMaster,
+        network: dependencies.config.network,
+        profileName: profile.name,
       });
 
       const startUtime = Math.max(0, Math.floor(input.notBefore.getTime() / 1000) - 1);
@@ -819,7 +875,9 @@ export function createInternalTestnetJettonAdapter(dependencies: AdapterDependen
         "Notification transactions",
       );
       const notifications = notificationEvidenceFromTransactions(notificationTransactions);
-      const parsed = scanInternalTestnetJettonTransfers({
+      const parsed = scanVerifiedJettonTransfers({
+        network: dependencies.config.network,
+        evidence: profile.evidence,
         depositAddressId: deposit.id,
         ownerAddress: ownerAddressRaw,
         masterAddress: configuredMaster,
@@ -829,7 +887,9 @@ export function createInternalTestnetJettonAdapter(dependencies: AdapterDependen
         transfers,
         notifications,
       });
-      const discovered = scanInternalTestnetJettonTransfers({
+      const discovered = scanVerifiedJettonTransfers({
+        network: dependencies.config.network,
+        evidence: profile.evidence,
         depositAddressId: deposit.id,
         ownerAddress: ownerAddressRaw,
         masterAddress: configuredMaster,
@@ -893,6 +953,8 @@ export function createInternalTestnetJettonAdapter(dependencies: AdapterDependen
             continue;
           }
           const candidate = rejectedJettonCandidate({
+            network: dependencies.config.network,
+            evidence: profile.evidence,
             depositAddressId: deposit.id,
             ownerAddress: ownerAddressRaw,
             configuredMaster,
@@ -944,4 +1006,14 @@ export function createInternalTestnetJettonAdapter(dependencies: AdapterDependen
       };
     },
   };
+}
+
+export function createInternalTestnetJettonAdapter(dependencies: AdapterDependencies) {
+  if (dependencies.config.network !== "testnet") {
+    throw new Error("The internal jetton adapter requires explicit testnet-only configuration.");
+  }
+  return createVerifiedJettonAdapter(dependencies, {
+    name: "internal testnet jetton adapter",
+    evidence: "internal-test-asset",
+  });
 }

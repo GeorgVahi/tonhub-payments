@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { createMixedAssetSettlement } from "../backend/src/mixed-settlement";
+import { officialMainnetUsdtMasterAddress } from "../backend/src/ton/mainnet-usdt";
 import type { TonhubPaymentInvoiceRecord } from "../backend/src/types";
 import { runMixedSettlementBatch } from "../worker/src/mixed-settlement";
 
@@ -70,7 +71,11 @@ function invoice(overrides: Partial<TonhubPaymentInvoiceRecord> = {}): TonhubPay
   };
 }
 
-function harness(input: { movements?: any[]; current?: TonhubPaymentInvoiceRecord } = {}) {
+function harness(input: {
+  movements?: any[];
+  current?: TonhubPaymentInvoiceRecord;
+  depositAddress?: any;
+} = {}) {
   let current = input.current ?? invoice();
   let expired = 0;
   let movementQuery: any = null;
@@ -79,7 +84,7 @@ function harness(input: { movements?: any[]; current?: TonhubPaymentInvoiceRecor
     string,
     "credited" | "rate-pending" | "held-under-minimum" | "recovery" | "blocked-earlier-movement"
   >();
-  const depositAddress = { id: "deposit-1" };
+  const depositAddress = input.depositAddress ?? { id: "deposit-1", network: current.network };
   const db = {
     tonhubPaymentInvoice: {
       findUnique: async () => ({ ...current, depositAddress }),
@@ -89,7 +94,10 @@ function harness(input: { movements?: any[]; current?: TonhubPaymentInvoiceRecor
         movementQuery = where;
         const retryBefore = where.OR?.find((branch: any) => branch.status === "RATE_PENDING")
           ?.updatedAt?.lte;
-        return (input.movements ?? []).filter((movement) =>
+        return (input.movements ?? []).map((movement) => ({
+          network: current.network,
+          ...movement,
+        })).filter((movement) =>
           movement.status !== "RATE_PENDING" ||
           !retryBefore ||
           movement.updatedAt.getTime() <= retryBefore.getTime());
@@ -259,6 +267,70 @@ test("mixed settlement refuses an unsupported movement identity before allocatio
     /unsupported settlement identity/,
   );
   assert.deepEqual(testHarness.creditCalls, []);
+});
+
+test("mainnet settlement accepts only official USDT bound to the verified deposit jetton wallet", async () => {
+  const verifiedWallet = `0:${"71".repeat(32)}`;
+  const mainnetOwner = `0:${"51".repeat(32)}`;
+  const baseMovement = {
+    id: "official-usdt",
+    depositAddressId: "deposit-1",
+    network: "mainnet",
+    direction: "INCOMING",
+    asset: "USDT",
+    assetKind: "JETTON",
+    assetDecimals: 6,
+    toAddress: mainnetOwner,
+    ownerAddress: mainnetOwner,
+    jettonMasterAddress: officialMainnetUsdtMasterAddress,
+    jettonWalletAddress: verifiedWallet,
+    rawPayload: { officialUsdt: true },
+    blockchainAt: new Date("2026-08-13T10:01:00.000Z"),
+  };
+  const current = invoice({
+    network: "mainnet",
+    address: mainnetOwner,
+    addressRaw: mainnetOwner,
+    walletNetworkGlobalId: -239,
+  });
+  const depositAddress = {
+    id: "deposit-1",
+    network: "mainnet",
+    address: mainnetOwner,
+    addressRaw: mainnetOwner,
+    assetAccounts: [{
+      network: "mainnet",
+      asset: "USDT",
+      assetKind: "JETTON",
+      assetDecimals: 6,
+      jettonMasterAddress: officialMainnetUsdtMasterAddress,
+      assetWalletAddress: verifiedWallet,
+      status: "VERIFIED",
+    }],
+  };
+  const accepted = harness({ current, depositAddress, movements: [baseMovement] });
+  await accepted.service.settleInvoice({ invoiceId: current.id, now });
+  assert.deepEqual(accepted.creditCalls.map(({ movementId }) => movementId), [baseMovement.id]);
+
+  for (const [label, override] of [
+    ["fake master", { jettonMasterAddress: `0:${"62".repeat(32)}` }],
+    ["wrong wallet", { jettonWalletAddress: `0:${"72".repeat(32)}` }],
+    ["wrong owner", { toAddress: `0:${"53".repeat(32)}` }],
+    ["wrong network", { network: "testnet" }],
+    ["missing official provenance", { rawPayload: null }],
+  ] as const) {
+    const rejected = harness({
+      current,
+      depositAddress,
+      movements: [{ ...baseMovement, id: `rejected-${label}`, ...override }],
+    });
+    await assert.rejects(
+      rejected.service.settleInvoice({ invoiceId: current.id, now }),
+      /inconsistent settlement ownership|verified official USDT identity/,
+      label,
+    );
+    assert.deepEqual(rejected.creditCalls, [], label);
+  }
 });
 
 test("mixed settlement worker rotates poison deposits so later invoices run on the next batch", async () => {

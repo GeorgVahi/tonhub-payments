@@ -35,7 +35,7 @@ npm run dev
 The API listens on `http://localhost:3008`; the Vite demo proxies `/api/**` to
 that API and runs on `http://localhost:5173`.
 
-For a full local payment flow with the additive shadow scanner, run five runtimes:
+For a full local GRAM payment flow with the additive shadow scanner, run five runtimes:
 
 ```bash
 npm run backend:dev
@@ -44,6 +44,17 @@ npm run worker:rates -- --watch --interval-seconds=60
 npm run worker:scan:gram-shadow -- --network=testnet --watch --interval-seconds=15
 npm run worker:sweep -- --network=testnet --watch --interval-seconds=15
 ```
+
+The official mainnet USDT observer is a separate, disabled-by-default runtime:
+
+```bash
+TON_USDT_MAINNET_ADAPTER_ENABLED=true npm run worker:scan:usdt-mainnet -- --watch
+```
+
+It can only scan mainnet and does not expose USDT in public checkout. New
+invoices also need `TON_MOVEMENT_SETTLEMENT_ENABLED=true` to receive the sticky
+fiat-ledger policy that can allocate observed USDT. Jetton gas top-up and sweep
+remain disabled until the following rollout stage.
 
 The frontend and backend are enough to create invoices and detect payments, but
 they do not sweep funds to the main wallet. The sweep worker must be running for
@@ -263,6 +274,30 @@ only produce rejection evidence; it can never credit a payment.
 Structurally valid unsupported jetton candidates are journaled as `REJECTED`
 with an open recovery case; they cannot be allocated as payment and do not
 create an automatic asset sweep.
+
+The production USDT observer reuses that strict verified-jetton boundary behind
+the independent `TON_USDT_MAINNET_ADAPTER_ENABLED` flag. It pins the official
+TON mainnet USDT master at
+`EQCxE6mUtQJKFnGfaROTKOt1lZbDiiX1kCixRv7Nw2Id_sDs` (6 decimals); there is no
+environment override for token identity. TON Center metadata such as symbol,
+name, or image is ignored. Before accepting a transfer, the adapter verifies
+the compiled master and the unique owner/master-derived jetton wallet, then
+journals `officialUsdt` evidence into the same immutable movement ledger.
+Testnet deposits are rejected before provider or ledger writes, and enabling
+the internal QA flag cannot enable this mainnet adapter.
+
+`worker:scan:usdt-mainnet` scans all eligible mainnet unique deposit addresses,
+including attempts initially shown as GRAM, because the order settles the fiat
+equivalent of whichever supported asset actually arrived. It uses its own
+`USDT_MAINNET_IN` cursor and lease, paginates both the trusted and discovery
+streams to completion, and overlaps the previous hour so delayed provider
+indexing is replayed safely through immutable fingerprints. Active attempts are
+checked every 15 seconds by default; terminal attempts are checked daily for 30
+days. The `TON_USDT_MAINNET_SCAN_*` variables in `.env.example` tune those
+cadences, pagination, retry, and lease limits. The worker only observes and
+journals; the mixed-settlement worker performs fiat allocation, and no USDT
+sweep is created in this stage. The scan batch size has a minimum of two so a
+busy active queue always leaves capacity for terminal-address monitoring.
 
 The GRAM `/check` read path has been cut over to the same strict movement facts.
 It resolves the deposit relation as the scan owner, synchronously journals the

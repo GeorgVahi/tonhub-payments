@@ -5,6 +5,8 @@ import {
   type TonhubPaymentRepository,
 } from "./repository";
 import type { TonhubPaymentInvoiceRecord } from "./types";
+import { canonicalTonAddress } from "./ton/gram-shadow-scanner";
+import { officialMainnetUsdtMasterAddress } from "./ton/mainnet-usdt";
 
 type PrismaLike = {
   tonhubPaymentInvoice: any;
@@ -32,11 +34,50 @@ function validDate(value: unknown): value is Date {
   return value instanceof Date && !Number.isNaN(value.getTime());
 }
 
-function validationCodeForMovement(movement: any) {
+function validationCodeForMovement(movement: any, invoice: any) {
   if (movement.asset === "GRAM" && movement.assetKind === "NATIVE" && movement.assetDecimals === 9) {
     return "NATIVE_INBOUND_V1";
   }
   if (movement.asset === "USDT" && movement.assetKind === "JETTON" && movement.assetDecimals === 6) {
+    if (invoice.network === "mainnet") {
+      const officialEvidence = movement.rawPayload &&
+        typeof movement.rawPayload === "object" &&
+        !Array.isArray(movement.rawPayload) &&
+        movement.rawPayload.officialUsdt === true &&
+        movement.rawPayload.internalTestAsset !== true;
+      const accounts = Array.isArray(invoice.depositAddress?.assetAccounts)
+        ? invoice.depositAddress.assetAccounts
+        : [];
+      const verifiedAccount = accounts.find((account: any) =>
+        account.network === "mainnet" &&
+        account.asset === "USDT" &&
+        account.assetKind === "JETTON" &&
+        account.assetDecimals === 6 &&
+        account.status === "VERIFIED" &&
+        canonicalTonAddress(account.jettonMasterAddress) === officialMainnetUsdtMasterAddress &&
+        canonicalTonAddress(account.assetWalletAddress) ===
+          canonicalTonAddress(movement.jettonWalletAddress));
+      const depositOwner = canonicalTonAddress(invoice.depositAddress?.address);
+      const storedOwners = [
+        depositOwner,
+        canonicalTonAddress(invoice.depositAddress?.addressRaw),
+        canonicalTonAddress(invoice.address),
+        canonicalTonAddress(invoice.addressRaw),
+      ];
+      if (
+        movement.network !== "mainnet" ||
+        canonicalTonAddress(movement.jettonMasterAddress) !== officialMainnetUsdtMasterAddress ||
+        !canonicalTonAddress(movement.jettonWalletAddress) ||
+        !depositOwner ||
+        storedOwners.some((owner) => owner !== depositOwner) ||
+        canonicalTonAddress(movement.toAddress) !== depositOwner ||
+        canonicalTonAddress(movement.ownerAddress) !== depositOwner ||
+        !officialEvidence ||
+        !verifiedAccount
+      ) {
+        throw new Error(`Movement ${movement.id} lacks verified official USDT identity.`);
+      }
+    }
     return "JETTON_INBOUND_V1";
   }
   throw new Error(`Movement ${movement.id} has unsupported settlement identity.`);
@@ -99,7 +140,10 @@ export function createMixedAssetSettlement(
       }
       const invoice = await db.tonhubPaymentInvoice.findUnique({
         where: { id: input.invoiceId },
-        include: { order: true, depositAddress: true },
+        include: {
+          order: true,
+          depositAddress: { include: { assetAccounts: true } },
+        },
       });
       if (!invoice) {
         throw new Error(`Payment invoice not found: ${input.invoiceId}.`);
@@ -140,14 +184,19 @@ export function createMixedAssetSettlement(
       let ratePending = false;
       let deferred = false;
       for (const movement of movements) {
-        if (movement.depositAddressId !== invoice.depositAddress.id || !validDate(movement.blockchainAt)) {
+        if (
+          movement.depositAddressId !== invoice.depositAddress.id ||
+          movement.network !== invoice.network ||
+          invoice.depositAddress.network !== invoice.network ||
+          !validDate(movement.blockchainAt)
+        ) {
           throw new Error(`Movement ${movement.id} has inconsistent settlement ownership or time.`);
         }
         const outcome = await creditor.creditMovement({
           movementId: movement.id,
           orderId: invoice.orderId,
           invoiceId: invoice.id,
-          validationCode: validationCodeForMovement(movement),
+          validationCode: validationCodeForMovement(movement, invoice),
           maxRateAgeMs: input.maxRateAgeMs,
           partialPaymentTtlHours: input.partialPaymentTtlHours,
         });
