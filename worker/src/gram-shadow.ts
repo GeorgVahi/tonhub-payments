@@ -205,7 +205,15 @@ export function createPrismaGramShadowScannerRepository(
           });
           scanInvoice = { ...invoice, terminalMonitorUntil };
         }
-        const cursor = await db.tonhubScanCursor.upsert({
+        await db.tonhubScanCursor.createMany({
+          data: {
+            network: input.network,
+            streamType,
+            scopeKey: depositAddressId,
+          },
+          skipDuplicates: true,
+        });
+        const cursor = await db.tonhubScanCursor.findUnique({
           where: {
             network_streamType_scopeKey: {
               network: input.network,
@@ -213,13 +221,10 @@ export function createPrismaGramShadowScannerRepository(
               scopeKey: depositAddressId,
             },
           },
-          create: {
-            network: input.network,
-            streamType,
-            scopeKey: depositAddressId,
-          },
-          update: {},
         });
+        if (!cursor) {
+          throw new Error("GRAM scan cursor was not created.");
+        }
         const lease = await db.tonhubScanCursor.updateMany({
           where: {
             id: cursor.id,

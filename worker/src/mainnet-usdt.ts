@@ -211,7 +211,13 @@ export function createPrismaMainnetUsdtScannerRepository(
           continue;
         }
         const existing = cursorsByScope.get(deposit.id);
-        const cursor = existing ?? await db.tonhubScanCursor.upsert({
+        if (!existing) {
+          await db.tonhubScanCursor.createMany({
+            data: { network: "mainnet", streamType, scopeKey: deposit.id },
+            skipDuplicates: true,
+          });
+        }
+        const cursor = existing ?? await db.tonhubScanCursor.findUnique({
           where: {
             network_streamType_scopeKey: {
               network: "mainnet",
@@ -219,9 +225,10 @@ export function createPrismaMainnetUsdtScannerRepository(
               scopeKey: deposit.id,
             },
           },
-          create: { network: "mainnet", streamType, scopeKey: deposit.id },
-          update: {},
         });
+        if (!cursor) {
+          throw new Error("Mainnet USDT scan cursor was not created.");
+        }
         const lease = await db.tonhubScanCursor.updateMany({
           where: {
             id: cursor.id,

@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { Address } from "@ton/core";
 import {
   calculateActivationThresholdFiatMicros,
   calculateMovementFiatMicros,
@@ -7,6 +8,7 @@ import {
   MovementFingerprintConflictError,
   type PaymentMovementDraft,
 } from "../backend/src/movement-ledger";
+import { officialMainnetUsdtMasterAddress } from "../backend/src/ton/mainnet-usdt";
 
 function matches(row: any, where: any): boolean {
   return Object.entries(where ?? {}).every(([key, expected]: [string, any]) => {
@@ -61,6 +63,8 @@ function createMemoryLedgerDb() {
   }];
   const deposits: any[] = [{ id: "deposit-1", status: "ACTIVE" }];
   const recoveryCases: any[] = [];
+  const assetAccounts: any[] = [];
+  const sweeps: any[] = [];
   const rates: any[] = [
     {
       id: "rate-gram-usd",
@@ -92,7 +96,7 @@ function createMemoryLedgerDb() {
   const now = () => new Date(1_786_617_600_000 + clock++ * 1_000);
   const db: any = {
     $transaction: async (handler: (tx: any) => Promise<unknown>) => {
-      const snapshot = structuredClone({ movements, allocations, orders, invoices, deposits, recoveryCases });
+      const snapshot = structuredClone({ movements, allocations, orders, invoices, deposits, recoveryCases, assetAccounts, sweeps });
       try {
         return await handler(db);
       } catch (error) {
@@ -102,6 +106,8 @@ function createMemoryLedgerDb() {
         invoices.splice(0, invoices.length, ...snapshot.invoices);
         deposits.splice(0, deposits.length, ...snapshot.deposits);
         recoveryCases.splice(0, recoveryCases.length, ...snapshot.recoveryCases);
+        assetAccounts.splice(0, assetAccounts.length, ...snapshot.assetAccounts);
+        sweeps.splice(0, sweeps.length, ...snapshot.sweeps);
         throw error;
       }
     },
@@ -214,13 +220,36 @@ function createMemoryLedgerDb() {
           return null;
         }
         const invoice = invoices.find((row) => row.depositAddress?.id === deposit.id) ?? null;
-        return { ...deposit, invoice };
+        return {
+          ...deposit,
+          invoice,
+          assetAccounts: assetAccounts.filter((row) => row.depositAddressId === deposit.id),
+        };
       },
       updateMany: async ({ where, data }: any) => {
         const rows = deposits.filter((row) => matches(row, where));
         rows.forEach((row) => Object.assign(row, data));
         return { count: rows.length };
       },
+    },
+    tonhubDepositAssetAccount: {},
+    tonhubAssetSweep: {
+      createMany: async ({ data, skipDuplicates }: any) => {
+        const duplicate = sweeps.some((row) =>
+          row.idempotencyKey === data.idempotencyKey ||
+          (
+            row.depositAddressId === data.depositAddressId &&
+            row.asset === data.asset &&
+            row.status !== "CONFIRMED"
+          ));
+        if (duplicate && skipDuplicates) {
+          return { count: 0 };
+        }
+        sweeps.push({ id: `sweep-${sweeps.length + 1}`, createdAt: now(), ...data });
+        return { count: 1 };
+      },
+      findFirst: async ({ where }: any) => sweeps.find((row) =>
+        row.depositAddressId === where.depositAddressId && row.asset === where.asset) ?? null,
     },
     tonhubRecoveryCase: {
       findUnique: async ({ where }: any) => recoveryCases.find((row) => matches(row, where)) ?? null,
@@ -245,7 +274,7 @@ function createMemoryLedgerDb() {
           right.createdAt.getTime() - left.createdAt.getTime())[0] ?? null,
     },
   };
-  return { db, movements, allocations, orders, invoices, deposits, recoveryCases, rates };
+  return { db, movements, allocations, orders, invoices, deposits, recoveryCases, assetAccounts, sweeps, rates };
 }
 
 function movement(overrides: Partial<PaymentMovementDraft> = {}): PaymentMovementDraft {
@@ -383,6 +412,138 @@ test("observed movement replay is idempotent and conflicting facts are rejected"
     MovementFingerprintConflictError,
   );
   assert.equal(memory.movements.length, 1);
+});
+
+test("a new official mainnet USDT movement atomically queues one asset sweep, while replay does not", async () => {
+  const memory = createMemoryLedgerDb();
+  const owner = Address.parseRaw(`0:${"11".repeat(32)}`).toRawString();
+  const assetWallet = Address.parseRaw(`0:${"22".repeat(32)}`).toRawString();
+  Object.assign(memory.deposits[0], {
+    network: "mainnet",
+    address: owner,
+    addressRaw: owner,
+  });
+  Object.assign(memory.invoices[0], {
+    network: "mainnet",
+    address: owner,
+    addressRaw: owner,
+  });
+  memory.assetAccounts.push({
+    depositAddressId: "deposit-1",
+    network: "mainnet",
+    asset: "USDT",
+    assetKind: "JETTON",
+    assetDecimals: 6,
+    jettonMasterAddress: officialMainnetUsdtMasterAddress,
+    assetWalletAddress: assetWallet,
+    status: "VERIFIED",
+  });
+  const ledger = createMovementLedger(memory.db);
+  const draft = movement({
+    fingerprint: `ton:mainnet:jetton-in:${"ab".repeat(32)}:9:${officialMainnetUsdtMasterAddress}`,
+    network: "mainnet",
+    asset: "USDT",
+    assetKind: "JETTON",
+    assetDecimals: 6,
+    amountAtomic: "5000000",
+    toAddress: owner,
+    ownerAddress: owner,
+    jettonMasterAddress: officialMainnetUsdtMasterAddress,
+    jettonWalletAddress: assetWallet,
+    transactionHash: "ab".repeat(32),
+    queryId: "9",
+    rawPayload: { officialUsdt: true },
+  });
+  const first = await ledger.recordObserved(draft);
+  await ledger.recordObserved(draft);
+  assert.equal(memory.sweeps.length, 1);
+  assert.equal(memory.sweeps[0]?.idempotencyKey, `official-usdt-movement:${first.id}`);
+  assert.equal(memory.sweeps[0]?.asset, "USDT");
+  assert.equal(memory.sweeps[0]?.status, "QUEUED");
+  memory.sweeps.splice(0, memory.sweeps.length);
+  await ledger.recordObserved(draft);
+  assert.equal(memory.sweeps.length, 1);
+  assert.equal(memory.sweeps[0]?.idempotencyKey, `official-usdt-movement:${first.id}`);
+});
+
+test("a late-observed inbound already covered by a confirmed full-balance sweep does not queue a false retry", async () => {
+  const memory = createMemoryLedgerDb();
+  const owner = Address.parseRaw(`0:${"21".repeat(32)}`).toRawString();
+  const assetWallet = Address.parseRaw(`0:${"22".repeat(32)}`).toRawString();
+  Object.assign(memory.deposits[0], { network: "mainnet", address: owner, addressRaw: owner });
+  Object.assign(memory.invoices[0], { network: "mainnet", address: owner, addressRaw: owner });
+  memory.assetAccounts.push({
+    depositAddressId: "deposit-1",
+    network: "mainnet",
+    asset: "USDT",
+    assetKind: "JETTON",
+    assetDecimals: 6,
+    jettonMasterAddress: officialMainnetUsdtMasterAddress,
+    assetWalletAddress: assetWallet,
+    status: "VERIFIED",
+  });
+  const ledger = createMovementLedger(memory.db);
+  const official = (suffix: string, amountAtomic: string, direction: "INCOMING" | "OUTGOING") => movement({
+    fingerprint: `ton:mainnet:jetton-${direction.toLowerCase()}:${suffix}`,
+    network: "mainnet",
+    direction,
+    asset: "USDT",
+    assetKind: "JETTON",
+    assetDecimals: 6,
+    amountAtomic,
+    toAddress: direction === "INCOMING" ? owner : Address.parseRaw(`0:${"23".repeat(32)}`).toRawString(),
+    ownerAddress: owner,
+    jettonMasterAddress: officialMainnetUsdtMasterAddress,
+    jettonWalletAddress: assetWallet,
+    transactionHash: suffix.repeat(64).slice(0, 64),
+    queryId: suffix,
+    rawPayload: { officialUsdt: true },
+  });
+  await ledger.recordObserved(official("1", "5000000", "INCOMING"));
+  assert.equal(memory.sweeps.length, 1);
+  memory.sweeps[0].status = "CONFIRMED";
+  await ledger.recordObserved(official("2", "10000000", "OUTGOING"));
+  await ledger.recordObserved(official("3", "5000000", "INCOMING"));
+  assert.equal(memory.sweeps.length, 1);
+  assert.equal(memory.sweeps[0]?.status, "CONFIRMED");
+});
+
+test("official USDT sweep enqueue fails closed with the movement when asset-wallet ownership drifts", async () => {
+  const memory = createMemoryLedgerDb();
+  const owner = Address.parseRaw(`0:${"31".repeat(32)}`).toRawString();
+  const observedWallet = Address.parseRaw(`0:${"32".repeat(32)}`).toRawString();
+  const storedWallet = Address.parseRaw(`0:${"33".repeat(32)}`).toRawString();
+  Object.assign(memory.deposits[0], { network: "mainnet", address: owner, addressRaw: owner });
+  Object.assign(memory.invoices[0], { network: "mainnet", address: owner, addressRaw: owner });
+  memory.assetAccounts.push({
+    depositAddressId: "deposit-1",
+    network: "mainnet",
+    asset: "USDT",
+    assetKind: "JETTON",
+    assetDecimals: 6,
+    jettonMasterAddress: officialMainnetUsdtMasterAddress,
+    assetWalletAddress: storedWallet,
+    status: "VERIFIED",
+  });
+  const ledger = createMovementLedger(memory.db);
+  await assert.rejects(
+    ledger.recordObserved(movement({
+      fingerprint: "ton:mainnet:jetton-in:ownership-drift",
+      network: "mainnet",
+      asset: "USDT",
+      assetKind: "JETTON",
+      assetDecimals: 6,
+      amountAtomic: "5000000",
+      toAddress: owner,
+      ownerAddress: owner,
+      jettonMasterAddress: officialMainnetUsdtMasterAddress,
+      jettonWalletAddress: observedWallet,
+      rawPayload: { officialUsdt: true },
+    })),
+    /ownership evidence is inconsistent/,
+  );
+  assert.equal(memory.movements.length, 0);
+  assert.equal(memory.sweeps.length, 0);
 });
 
 test("credits aggregate exactly, retain overpayment, and remain idempotent", async () => {

@@ -668,6 +668,17 @@ try {
   assert.equal(mainnetMovement.jettonWalletAddress, mainnetWalletRaw);
   assert.equal((mainnetMovement.rawPayload as any).officialUsdt, true);
   assert.equal((mainnetMovement.rawPayload as any).internalTestAsset, undefined);
+  const queuedMainnetSweeps = await prisma.tonhubAssetSweep.findMany({
+    where: { depositAddressId: mainnetDepositId, asset: "USDT" },
+  });
+  assert.equal(queuedMainnetSweeps.length, 1);
+  assert.equal(queuedMainnetSweeps[0]?.status, "QUEUED");
+  assert.equal(queuedMainnetSweeps[0]?.invoiceId, mainnetInvoiceId);
+  assert.equal(queuedMainnetSweeps[0]?.orderId, mainnetOrderId);
+  assert.equal(
+    queuedMainnetSweeps[0]?.idempotencyKey,
+    `official-usdt-movement:${mainnetMovement.id}`,
+  );
 
   const scannerRepository = createPrismaMainnetUsdtScannerRepository(prisma);
   const claimedMainnetTargets = await scannerRepository.claimDueTargets({

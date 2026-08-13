@@ -7,9 +7,12 @@ const projectRoot = resolve(import.meta.dirname, "..");
 const containerName = `tonhub-payments-migration-${process.pid}-${randomUUID().slice(0, 8)}`;
 const postgresPassword = "tonhub-migration-rehearsal";
 const baselineMigration = "20260813100000_baseline";
-const expectedMigrationCount = readdirSync(resolve(projectRoot, "prisma", "migrations"), {
+const migrationDirectories = readdirSync(resolve(projectRoot, "prisma", "migrations"), {
   withFileTypes: true,
-}).filter((entry) => entry.isDirectory() && /^\d+_/.test(entry.name)).length.toString();
+}).filter((entry) => entry.isDirectory() && /^\d+_/.test(entry.name))
+  .map((entry) => entry.name)
+  .sort();
+const expectedMigrationCount = migrationDirectories.length.toString();
 const baselineMigrationSql = readFileSync(
   resolve(projectRoot, "prisma", "migrations", baselineMigration, "migration.sql"),
   "utf8",
@@ -119,9 +122,83 @@ try {
 
   psql("postgres", 'CREATE DATABASE "clean_migration";');
   psql("postgres", 'CREATE DATABASE "legacy_migration";');
+  psql("postgres", 'CREATE DATABASE "usdt_sweep_rollout";');
 
   const databaseUrl = (database) =>
     `postgresql://postgres:${postgresPassword}@127.0.0.1:${publishedPort}/${database}?schema=public`;
+
+  const usdtSweepMigration = migrationDirectories.at(-1);
+  if (usdtSweepMigration !== "20260813105000_usdt_sweep_state") {
+    throw new Error(`unexpected latest migration for USDT sweep rollout: ${usdtSweepMigration}`);
+  }
+  for (const migrationName of migrationDirectories.slice(0, -1)) {
+    psql(
+      "usdt_sweep_rollout",
+      readFileSync(resolve(projectRoot, "prisma", "migrations", migrationName, "migration.sql"), "utf8"),
+    );
+  }
+  const rolloutMaster = "0:b113a994b5024a16719f69139328eb759596c38a25f59028b146fecdc3621dfe";
+  const rolloutOwner = `0:${"a1".repeat(32)}`;
+  const rolloutWallet = `0:${"a2".repeat(32)}`;
+  psql(
+    "usdt_sweep_rollout",
+    `INSERT INTO "TonhubPaymentOrder" (
+       "id", "fiatAmountMicros", "fiatCurrency", "updatedAt"
+     ) VALUES ('rollout-order', '5000000', 'USD', CURRENT_TIMESTAMP);
+     INSERT INTO "TonhubPaymentInvoice" (
+       "id", "orderId", "network", "fiatAmountCents", "fiatAmountMicros", "fiatCurrency",
+       "address", "addressRaw", "walletVersion", "walletWorkchain", "walletContext",
+       "walletNetworkGlobalId", "walletPublicKeyHash", "amountNano", "amountAtomic",
+       "reference", "updatedAt"
+     ) VALUES (
+       'rollout-invoice', 'rollout-order', 'mainnet', 500, '5000000', 'USD',
+       '${rolloutOwner}', '${rolloutOwner}', 'v5r1', 0, 950001, -239, 'rollout-key',
+       '5000000000', '5000000000', 'rollout-reference', CURRENT_TIMESTAMP
+     );
+     INSERT INTO "TonhubDepositAddress" (
+       "id", "invoiceId", "network", "address", "addressRaw", "walletVersion",
+       "walletWorkchain", "walletContext", "walletNetworkGlobalId", "walletPublicKeyHash",
+       "updatedAt"
+     ) VALUES (
+       'rollout-deposit', 'rollout-invoice', 'mainnet', '${rolloutOwner}', '${rolloutOwner}',
+       'v5r1', 0, 950001, -239, 'rollout-key', CURRENT_TIMESTAMP
+     );
+     INSERT INTO "TonhubDepositAssetAccount" (
+       "id", "depositAddressId", "network", "asset", "assetKind", "assetDecimals",
+       "jettonMasterAddress", "assetWalletAddress", "status", "updatedAt"
+     ) VALUES (
+       'rollout-account', 'rollout-deposit', 'mainnet', 'USDT', 'JETTON', 6,
+       '${rolloutMaster}', '${rolloutWallet}', 'VERIFIED', CURRENT_TIMESTAMP
+     );
+     INSERT INTO "TonhubPaymentMovement" (
+       "id", "fingerprint", "depositAddressId", "network", "direction", "asset",
+       "assetKind", "assetDecimals", "amountAtomic", "toAddress", "ownerAddress",
+       "jettonMasterAddress", "jettonWalletAddress", "transactionHash", "transactionLt",
+       "blockchainAt", "rawPayload", "updatedAt"
+     ) VALUES (
+       'rollout-movement', 'rollout-usdt-movement', 'rollout-deposit', 'mainnet',
+       'INCOMING', 'USDT', 'JETTON', 6, '5000000', '${rolloutOwner}', '${rolloutOwner}',
+       '${rolloutMaster}', '${rolloutWallet}', '${"b1".repeat(64)}', '950001',
+       CURRENT_TIMESTAMP, '{"officialUsdt":true,"evidenceVersion":1}', CURRENT_TIMESTAMP
+     );`,
+  );
+  psql(
+    "usdt_sweep_rollout",
+    readFileSync(
+      resolve(projectRoot, "prisma", "migrations", usdtSweepMigration, "migration.sql"),
+      "utf8",
+    ),
+  );
+  assertEqual(
+    psql(
+      "usdt_sweep_rollout",
+      `SELECT COUNT(*) FROM "TonhubAssetSweep"
+       WHERE "depositAddressId" = 'rollout-deposit' AND "status" = 'QUEUED'
+         AND "idempotencyKey" = 'official-usdt-movement:rollout-movement';`,
+    ),
+    "1",
+    "pre-step-13 official USDT movement sweep backfill",
+  );
 
   const legacyFixtureSql = prisma(
     databaseUrl("legacy_migration"),
@@ -153,6 +230,13 @@ try {
       ...process.env,
       DATABASE_URL: databaseUrl("clean_migration"),
       TONHUB_LEDGER_VERIFY_SUFFIX: "clean",
+    },
+  });
+  run(process.execPath, [tsxCli, "scripts/verify-mainnet-usdt-sweep.ts"], {
+    env: {
+      ...process.env,
+      DATABASE_URL: databaseUrl("clean_migration"),
+      TONHUB_USDT_SWEEP_VERIFY_SUFFIX: "clean",
     },
   });
   run(process.execPath, [tsxCli, "scripts/verify-gram-shadow-scanner.ts"], {
@@ -256,6 +340,13 @@ try {
       ...process.env,
       DATABASE_URL: databaseUrl("legacy_migration"),
       TONHUB_LEDGER_VERIFY_SUFFIX: "legacy",
+    },
+  });
+  run(process.execPath, [tsxCli, "scripts/verify-mainnet-usdt-sweep.ts"], {
+    env: {
+      ...process.env,
+      DATABASE_URL: databaseUrl("legacy_migration"),
+      TONHUB_USDT_SWEEP_VERIFY_SUFFIX: "legacy",
     },
   });
   run(process.execPath, [tsxCli, "scripts/verify-gram-shadow-scanner.ts"], {
@@ -415,7 +506,10 @@ try {
      END $$;
      UPDATE "TonhubAssetSweep"
        SET "status" = 'CONFIRMED', "transactionHash" = 'sweep-tx-1',
-           "gasTopupTransactionHash" = 'gas-topup-tx-1'
+           "gasTopupTransactionHash" = 'gas-topup-tx-1',
+           "amountAtomic" = '1', "reserveAtomic" = '0',
+           "recipientAddress" = '0:fixture-recipient', "seqno" = 1, "queryId" = '1',
+           "sentAt" = CURRENT_TIMESTAMP, "confirmedAt" = CURRENT_TIMESTAMP
        WHERE "id" = 'sweep-1';
      INSERT INTO "TonhubAssetSweep" (
        "id", "idempotencyKey", "depositAddressId", "asset", "assetKind", "updatedAt"

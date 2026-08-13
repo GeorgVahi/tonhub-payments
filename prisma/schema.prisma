@@ -331,7 +331,12 @@ model TonhubAssetSweep {
   recipientAddress        String?
   transactionHash         String?
   seqno                   Int?
+  queryId                 String?
   gasTopupAmountNano      String?
+  gasTopupSeqno           Int?
+  reserveTopupAmountNano  String?
+  reserveTopupSeqno       Int?
+  gasServicePlanKey       String?                @unique
   gasTopupTransactionHash String?
   attempts                Int                    @default(0)
   leaseOwner              String?

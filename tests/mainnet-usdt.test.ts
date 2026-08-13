@@ -451,18 +451,23 @@ test("mainnet USDT repository filters due rows before bounded pools and reserves
     },
     tonhubScanCursor: {
       findMany: async () => [],
-      upsert: async ({ create }: any) => {
+      createMany: async ({ data }: any) => {
         const cursor = {
           id: `cursor-${cursorIndex += 1}`,
-          ...create,
+          ...data,
           lastTimestamp: null,
           leaseOwner: null,
           leaseExpiresAt: null,
           updatedAt: notBefore,
         };
         cursors.set(cursor.id, cursor);
-        return cursor;
+        return { count: 1 };
       },
+      findUnique: async ({ where }: any) => Array.from(cursors.values()).find((cursor) =>
+        cursor.network === where.network_streamType_scopeKey.network &&
+        cursor.streamType === where.network_streamType_scopeKey.streamType &&
+        cursor.scopeKey === where.network_streamType_scopeKey.scopeKey
+      ) ?? null,
       updateMany: async ({ where, data }: any) => {
         const cursor = cursors.get(where.id);
         if (!cursor) {

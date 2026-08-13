@@ -1,4 +1,5 @@
 import { Buffer } from "node:buffer";
+import { randomUUID } from "node:crypto";
 import { Address, SendMode, internal } from "@ton/core";
 import { TonClient, WalletContractV5R1 } from "@ton/ton";
 import { prisma } from "../../backend/src/db";
@@ -127,6 +128,74 @@ export type TonDepositSweepBlockchain = {
   }) => Promise<{
     seqno: number | null;
   }>;
+  waitForWalletSeqno: (wallet: WalletContractV5R1, previousSeqno: number) => Promise<boolean>;
+};
+
+export type TonWalletSigningLease = {
+  acquire: (input: {
+    network: TonNetwork;
+    addressRaw: string;
+    owner: string;
+    now: Date;
+    leaseMs: number;
+  }) => Promise<boolean>;
+  release: (input: {
+    network: TonNetwork;
+    addressRaw: string;
+    owner: string;
+  }) => Promise<void>;
+};
+
+const walletSigningStreamType = "TON_WALLET_OUT";
+const activeAssetSweepStatuses = [
+  "QUEUED",
+  "GAS_CHECK",
+  "GAS_TOPUP_REQUIRED",
+  "GAS_TOPUP_SENT",
+  "READY",
+  "SENT",
+  "FAILED"
+];
+
+export const prismaTonWalletSigningLease: TonWalletSigningLease = {
+  acquire: async (input) => {
+    await (prisma as any).tonhubScanCursor.createMany({
+      data: {
+        network: input.network,
+        streamType: walletSigningStreamType,
+        scopeKey: input.addressRaw
+      },
+      skipDuplicates: true
+    });
+    const result = await (prisma as any).tonhubScanCursor.updateMany({
+      where: {
+        network: input.network,
+        streamType: walletSigningStreamType,
+        scopeKey: input.addressRaw,
+        OR: [
+          { leaseOwner: input.owner },
+          { leaseExpiresAt: null },
+          { leaseExpiresAt: { lte: input.now } }
+        ]
+      },
+      data: {
+        leaseOwner: input.owner,
+        leaseExpiresAt: new Date(input.now.getTime() + input.leaseMs)
+      }
+    });
+    return result.count === 1;
+  },
+  release: async (input) => {
+    await (prisma as any).tonhubScanCursor.updateMany({
+      where: {
+        network: input.network,
+        streamType: walletSigningStreamType,
+        scopeKey: input.addressRaw,
+        leaseOwner: input.owner
+      },
+      data: { leaseOwner: null, leaseExpiresAt: null }
+    });
+  }
 };
 
 export type TonDepositSweepOutcome =
@@ -328,6 +397,15 @@ export function createTonSweepBlockchainClient(
       return {
         seqno
       };
+    },
+    waitForWalletSeqno: async (wallet, previousSeqno) => {
+      for (let attempt = 0; attempt < 10; attempt += 1) {
+        if (await client.open(wallet).getSeqno() > previousSeqno) {
+          return true;
+        }
+        await new Promise((resolve) => setTimeout(resolve, 1_000));
+      }
+      return false;
     }
   };
 }
@@ -339,6 +417,12 @@ export const prismaTonDepositSweepRepository: TonDepositSweepRepository = {
         network: input.network,
         status: "PAID",
         walletVersion: "v5r1",
+        sweeps: {
+          none: {
+            asset: "USDT",
+            status: { in: activeAssetSweepStatuses }
+          }
+        },
         OR: [
           {
             sweepStatus: "NOT_STARTED"
@@ -376,6 +460,12 @@ export const prismaTonDepositSweepRepository: TonDepositSweepRepository = {
         status: "PAID",
         sweepStatus: {
           in: ["NOT_STARTED", "FAILED"]
+        },
+        sweeps: {
+          none: {
+            asset: "USDT",
+            status: { in: activeAssetSweepStatuses }
+          }
         }
       },
       data: {
@@ -469,12 +559,15 @@ export async function sweepTonDepositAddress(input: {
   config: TonDepositSweepConfig;
   repository?: TonDepositSweepRepository;
   blockchain?: TonDepositSweepBlockchain;
+  signingLease?: TonWalletSigningLease;
+  signingLeaseMs?: number;
   now?: () => Date;
 }): Promise<TonDepositSweepOutcome> {
   const repository = input.repository ?? prismaTonDepositSweepRepository;
   const blockchain = input.blockchain ?? createTonSweepBlockchainClient(input.config);
   const now = input.now ?? (() => new Date());
   const addressMasked = maskValue(input.record.address);
+  const signingOwner = `native-sweep:${input.record.id}:${randomUUID()}`;
   const claimed = await repository.claimSweepCandidate({
     id: input.record.id,
     now: now()
@@ -493,6 +586,15 @@ export async function sweepTonDepositAddress(input: {
       record: claimed,
       config: input.config
     });
+    if (input.signingLease && !await input.signingLease.acquire({
+      network: input.config.network,
+      addressRaw: claimed.addressRaw,
+      owner: signingOwner,
+      now: now(),
+      leaseMs: input.signingLeaseMs ?? 60_000
+    })) {
+      throw new Error("TON deposit wallet is busy with another outgoing transfer.");
+    }
     const recipientAddress = Address.parse(input.config.recipientAddress);
     const balanceNano = await blockchain.getBalance(wallet.address);
     const amountNano = balanceNano - input.config.reserveNano;
@@ -504,6 +606,13 @@ export async function sweepTonDepositAddress(input: {
         error,
         failedAt: now()
       });
+      if (input.signingLease) {
+        await input.signingLease.release({
+          network: input.config.network,
+          addressRaw: claimed.addressRaw,
+          owner: signingOwner
+        });
+      }
 
       return {
         status: "insufficient-balance",
@@ -533,6 +642,16 @@ export async function sweepTonDepositAddress(input: {
       seqno: sent.seqno,
       sentAt
     });
+    const broadcastAccepted = input.signingLease && sent.seqno !== null
+      ? await blockchain.waitForWalletSeqno(wallet, sent.seqno).catch(() => false)
+      : false;
+    if (input.signingLease && broadcastAccepted) {
+      await input.signingLease.release({
+        network: input.config.network,
+        addressRaw: claimed.addressRaw,
+        owner: signingOwner
+      });
+    }
 
     return {
       status: "sent",
@@ -569,12 +688,15 @@ export async function runTonDepositSweepBatch(input: {
   config?: TonDepositSweepConfig;
   repository?: TonDepositSweepRepository;
   blockchain?: TonDepositSweepBlockchain;
+  signingLease?: TonWalletSigningLease;
+  signingLeaseMs?: number;
   now?: () => Date;
 }) {
   const now = input.now ?? (() => new Date());
   const config = input.config ?? resolveTonDepositSweepConfig(input.network);
   const repository = input.repository ?? prismaTonDepositSweepRepository;
   const blockchain = input.blockchain ?? createTonSweepBlockchainClient(config);
+  const signingLease = input.signingLease ?? prismaTonWalletSigningLease;
   const retryBefore = new Date(now().getTime() - (input.retryAfterMs ?? defaultSweepRetryMs));
   const candidates = await repository.listSweepCandidates({
     network: input.network,
@@ -590,6 +712,8 @@ export async function runTonDepositSweepBatch(input: {
         config,
         repository,
         blockchain,
+        signingLease,
+        signingLeaseMs: input.signingLeaseMs,
         now
       })
     );

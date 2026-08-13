@@ -26,7 +26,8 @@ import {
   type TonDepositSweepBlockchain,
   type TonDepositSweepConfig,
   type TonDepositSweepRecord,
-  type TonDepositSweepRepository
+  type TonDepositSweepRepository,
+  type TonWalletSigningLease
 } from "../worker/src/sweep";
 
 process.env.TON_ALLOWED_NETWORKS = "testnet,mainnet";
@@ -580,6 +581,7 @@ test("native GRAM sweep sends balance minus reserve and persists the broadcast m
   const transferAmounts: bigint[] = [];
   const blockchain: TonDepositSweepBlockchain = {
     getBalance: async () => 1_000_000_000n,
+    waitForWalletSeqno: async () => true,
     sendSweepTransfer: async (input) => {
       transferAmounts.push(input.amountNano);
       return { seqno: 7 };
@@ -609,6 +611,7 @@ test("native GRAM sweep below reserve is retained and recorded as a retryable fa
   let broadcasts = 0;
   const blockchain: TonDepositSweepBlockchain = {
     getBalance: async () => 50_500_000n,
+    waitForWalletSeqno: async () => true,
     sendSweepTransfer: async () => {
       broadcasts += 1;
       return { seqno: 1 };
@@ -650,7 +653,8 @@ test("native GRAM sweep makes no blockchain call when another worker already cla
     sendSweepTransfer: async () => {
       blockchainCalls += 1;
       return { seqno: 1 };
-    }
+    },
+    waitForWalletSeqno: async () => true
   };
 
   const outcome = await sweepTonDepositAddress({
@@ -669,6 +673,7 @@ test("native GRAM sweep persists a broadcast failure for retry", async () => {
   const repository = createSweepRepositoryHarness(record);
   const blockchain: TonDepositSweepBlockchain = {
     getBalance: async () => 1_000_000_000n,
+    waitForWalletSeqno: async () => true,
     sendSweepTransfer: async () => {
       throw new Error("simulated broadcast failure");
     }
@@ -685,4 +690,40 @@ test("native GRAM sweep persists a broadcast failure for retry", async () => {
   assert.equal(outcome.status, "failed");
   assert.equal(repository.sent(), null);
   assert.equal(repository.failed()?.error, "simulated broadcast failure");
+});
+
+test("native GRAM sweep cannot sign while the deposit wallet is leased by an asset sweep", async () => {
+  const record = makeSweepRecord();
+  const repository = createSweepRepositoryHarness(record);
+  let blockchainCalls = 0;
+  const signingLease: TonWalletSigningLease = {
+    acquire: async () => false,
+    release: async () => {
+      assert.fail("a lease that was not acquired must not be released");
+    }
+  };
+  const blockchain: TonDepositSweepBlockchain = {
+    getBalance: async () => {
+      blockchainCalls += 1;
+      return 1_000_000_000n;
+    },
+    sendSweepTransfer: async () => {
+      blockchainCalls += 1;
+      return { seqno: 1 };
+    },
+    waitForWalletSeqno: async () => true
+  };
+
+  const outcome = await sweepTonDepositAddress({
+    record,
+    config: makeSweepConfig(),
+    repository: repository.repository,
+    blockchain,
+    signingLease,
+    now: () => new Date("2026-05-11T10:15:00.000Z")
+  });
+
+  assert.equal(outcome.status, "failed");
+  assert.equal(blockchainCalls, 0);
+  assert.match(repository.failed()?.error ?? "", /busy with another outgoing transfer/);
 });

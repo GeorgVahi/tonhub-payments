@@ -59,6 +59,10 @@ replay is idempotent, and observed movements do not mutate settlement state.
 It also drives `/check` through the strict GRAM ledger source on both database
 histories, proving that aborted transfers are excluded, replay remains unique,
 and valid movements preserve the compatible `PARTIAL` to `PAID` transition.
+Both histories also execute the official-USDT sweep repository through
+`QUEUED` → gas top-up → `SENT` → `CONFIRMED`, verify the outgoing movement,
+recovery case, and manual retry path, and ensure the gas/query seqno state is
+preserved by real PostgreSQL transactions.
 
 During rollout, apply migrations immediately before deploying the compatible
 application. The repository can still read an unlinked legacy row and will
@@ -71,7 +75,12 @@ covering invoices created by an old process near the migration boundary.
   `PARTIAL` attempt.
 - A deposit asset can have many confirmed historical sweeps, but only one
   unfinished sweep (including a retryable `FAILED` row); every sweep also
-  carries a unique idempotency key.
+  carries a unique idempotency key. Mainnet USDT sweeps additionally persist a
+  unique uint64 query ID and non-negative gas/deposit wallet seqno plans before
+  either signing operation. A unique gas-service plan key fences the central
+  wallet seqno across initial top-ups and post-transfer reserve repairs, even
+  after a process lease expires. The step-13 migration queues any positive
+  official-USDT ledger balance journaled by the earlier observer.
 - Movement blockchain facts cannot be updated and movement rows cannot be
   deleted or truncated. Evidence fields may be attached once. Status follows
   explicit forward transitions; `RECOVERY` may re-enter validation, while

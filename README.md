@@ -49,12 +49,13 @@ The official mainnet USDT observer is a separate, disabled-by-default runtime:
 
 ```bash
 TON_USDT_MAINNET_ADAPTER_ENABLED=true npm run worker:scan:usdt-mainnet -- --watch
+TON_USDT_MAINNET_ADAPTER_ENABLED=true npm run worker:sweep:usdt-mainnet -- --watch
 ```
 
 It can only scan mainnet and does not expose USDT in public checkout. New
 invoices also need `TON_MOVEMENT_SETTLEMENT_ENABLED=true` to receive the sticky
-fiat-ledger policy that can allocate observed USDT. Jetton gas top-up and sweep
-remain disabled until the following rollout stage.
+fiat-ledger policy that can allocate observed USDT. The second runtime consumes
+the durable asset-sweep queue; it does not expose USDT in public checkout.
 
 The frontend and backend are enough to create invoices and detect payments, but
 they do not sweep funds to the main wallet. The sweep worker must be running for
@@ -68,10 +69,23 @@ paid deposit-wallet balances to move to `TON_*_SWEEP_RECIPIENT_ADDRESS`.
 - `TON_TESTNET_DEPOSIT_PUBLIC_KEY`, `TON_MAINNET_DEPOSIT_PUBLIC_KEY`
 - `TON_TESTNET_DEPOSIT_SECRET_KEY`, `TON_MAINNET_DEPOSIT_SECRET_KEY`
 - `TON_TESTNET_SWEEP_RECIPIENT_ADDRESS`, `TON_MAINNET_SWEEP_RECIPIENT_ADDRESS`
+- `TON_MAINNET_GAS_SERVICE_SECRET_KEY` (USDT sweep worker only)
 
 Keep `TON_*_DEPOSIT_SECRET_KEY` only in the worker environment. The backend
 derives unique deposit addresses from public keys and does not need signing
 credentials.
+
+The mainnet treasury is deliberately reused as the gas service, avoiding an
+extra operational wallet: its standard V5R1 address, derived from
+`TON_MAINNET_GAS_SERVICE_SECRET_KEY`, must exactly equal
+`TON_MAINNET_SWEEP_RECIPIENT_ADDRESS`. Keep this secret in the isolated sweep
+worker only. The gas service tops each deposit wallet up to 0.15 TON by default,
+the deposit attaches 0.05 TON to the TEP-74 transfer, requests a 1-nanoton
+notification, reserves another 0.05 TON as an explicit wallet-fee cushion, and
+is expected to retain at least 0.05 TON. These values are configurable, but the
+target must cover the transfer value, a positive fee cushion, and the reserve.
+All TON top-up and execution cost is merchant cost; the worker sweeps the full
+verified USDT jetton-wallet balance without deducting a user fee.
 
 The rate worker writes immutable GRAM/USD, GRAM/EUR, USDT/USD, and USDT/EUR
 snapshots. `TON_RATE_SNAPSHOT_INTERVAL_SECONDS` controls its polling interval;
@@ -294,10 +308,24 @@ streams to completion, and overlaps the previous hour so delayed provider
 indexing is replayed safely through immutable fingerprints. Active attempts are
 checked every 15 seconds by default; terminal attempts are checked daily for 30
 days. The `TON_USDT_MAINNET_SCAN_*` variables in `.env.example` tune those
-cadences, pagination, retry, and lease limits. The worker only observes and
-journals; the mixed-settlement worker performs fiat allocation, and no USDT
-sweep is created in this stage. The scan batch size has a minimum of two so a
-busy active queue always leaves capacity for terminal-address monitoring.
+cadences, pagination, retry, and lease limits. The mixed-settlement worker
+performs fiat allocation. A newly journaled official incoming USDT movement
+atomically queues a sweep; replay does not duplicate it. The sweep worker
+verifies invoice/deposit/master/asset-wallet ownership again, persists the gas
+and deposit-wallet seqno plans before broadcast, globally reserves each gas
+wallet seqno across sweep rows, sends all USDT with a
+deterministic TEP-74 query ID, and confirms only exact outgoing provider
+evidence. If actual fees consume the retained reserve despite the configured
+cushion, confirmation first performs an idempotent merchant-funded reserve
+repair. A second incoming movement that lands during an in-flight sweep is
+picked up by a follow-up queue item; if provider indexing is late, immutable
+outgoing ledger coverage prevents a false empty sweep. Deployment backfills
+previously journaled official-USDT balances from the step-12 adapter. Failures
+open a recovery case and can be retried through the exported admin action. Native GRAM sweep remains separate,
+but both paths share a per-deposit signing lease, and native sweep skips wallets
+with an active USDT lifecycle so it cannot drain the top-up. The scanner batch
+size has a minimum of two so a busy active queue always leaves capacity for
+terminal-address monitoring.
 
 The GRAM `/check` read path has been cut over to the same strict movement facts.
 It resolves the deposit relation as the scan owner, synchronously journals the

@@ -7,6 +7,8 @@ import {
   rateSnapshotMaxAgeMs,
 } from "./rate-snapshots";
 import { parseTonNetwork, type TonNetwork } from "./ton/direct-payments";
+import { canonicalTonAddress } from "./ton/gram-shadow-scanner";
+import { officialMainnetUsdtMasterAddress } from "./ton/jetton-identities";
 import {
   assertPaymentAssetSnapshot,
   formatAssetAmount,
@@ -78,6 +80,8 @@ type PrismaLike = {
   tonhubPaymentOrder: any;
   tonhubPaymentInvoice: any;
   tonhubDepositAddress: any;
+  tonhubDepositAssetAccount: any;
+  tonhubAssetSweep: any;
   tonhubRecoveryCase: any;
   tonhubRateSnapshot: any;
 };
@@ -298,6 +302,132 @@ function movementFactsIdentity(value: PaymentMovementDraft) {
     blockchainAt: value.blockchainAt.toISOString(),
     rawPayload: JSON.parse(jsonIdentity(value.rawPayload)),
   });
+}
+
+function officialUsdtPayload(value: unknown) {
+  return value !== null &&
+    typeof value === "object" &&
+    !Array.isArray(value) &&
+    (value as Record<string, unknown>).officialUsdt === true &&
+    (value as Record<string, unknown>).internalTestAsset !== true;
+}
+
+async function enqueueOfficialUsdtSweep(tx: PrismaLike, movement: PaymentMovementRecord) {
+  if (
+    movement.network !== "mainnet" ||
+    movement.direction !== "INCOMING" ||
+    movement.asset !== "USDT" ||
+    movement.assetKind !== "JETTON" ||
+    movement.assetDecimals !== 6 ||
+    canonicalTonAddress(movement.jettonMasterAddress) !== officialMainnetUsdtMasterAddress ||
+    !officialUsdtPayload(movement.rawPayload) ||
+    !movement.depositAddressId
+  ) {
+    return null;
+  }
+  const deposit = await tx.tonhubDepositAddress.findUnique({
+    where: { id: movement.depositAddressId },
+    include: {
+      invoice: true,
+      assetAccounts: { where: { asset: "USDT" } },
+    },
+  });
+  const invoice = deposit?.invoice;
+  const account = deposit?.assetAccounts?.[0];
+  const accountWalletAddress = canonicalTonAddress(account?.assetWalletAddress);
+  const movementWalletAddress = canonicalTonAddress(movement.jettonWalletAddress);
+  const ownerAddresses = [
+    deposit?.address,
+    deposit?.addressRaw,
+    invoice?.address,
+    invoice?.addressRaw,
+    movement.toAddress,
+    movement.ownerAddress,
+  ].map(canonicalTonAddress);
+  if (
+    !deposit || !invoice || !account ||
+    deposit.network !== "mainnet" ||
+    invoice.network !== "mainnet" ||
+    ownerAddresses.some((address) => !address || address !== ownerAddresses[0]) ||
+    account.network !== "mainnet" ||
+    account.asset !== "USDT" ||
+    account.assetKind !== "JETTON" ||
+    account.assetDecimals !== 6 ||
+    account.status !== "VERIFIED" ||
+    canonicalTonAddress(account.jettonMasterAddress) !== officialMainnetUsdtMasterAddress ||
+    !accountWalletAddress ||
+    !movementWalletAddress ||
+    accountWalletAddress !== movementWalletAddress
+  ) {
+    throw new MovementAllocationConflictError(
+      `Official USDT movement ${movement.id} cannot queue a sweep because ownership evidence is inconsistent.`,
+    );
+  }
+  const idempotencyKey = `official-usdt-movement:${movement.id}`;
+  await tx.$queryRawUnsafe(
+    `SELECT "id" FROM "TonhubAssetSweep"
+     WHERE "depositAddressId" = $1 AND "asset" = 'USDT'
+       AND "status" IN ('QUEUED', 'GAS_CHECK', 'GAS_TOPUP_REQUIRED', 'GAS_TOPUP_SENT', 'READY', 'SENT', 'FAILED')
+     FOR UPDATE`,
+    deposit.id,
+  );
+  const ledgerMovements = await tx.tonhubPaymentMovement.findMany({
+    where: {
+      depositAddressId: deposit.id,
+      network: "mainnet",
+      asset: "USDT",
+      assetKind: "JETTON",
+      status: { not: "REJECTED" },
+    },
+    select: { direction: true, amountAtomic: true },
+  });
+  const unsweptAtomic = ledgerMovements.reduce(
+    (balance: bigint, candidate: { direction: string; amountAtomic: string }) =>
+      balance + (candidate.direction === "INCOMING" ? 1n : -1n) * BigInt(candidate.amountAtomic),
+    0n,
+  );
+  if (unsweptAtomic <= 0n) {
+    return null;
+  }
+  await tx.tonhubAssetSweep.createMany({
+    data: {
+      idempotencyKey,
+      depositAddressId: deposit.id,
+      orderId: invoice.orderId,
+      invoiceId: invoice.id,
+      asset: "USDT",
+      assetKind: "JETTON",
+      status: "QUEUED",
+    },
+    skipDuplicates: true,
+  });
+  const sweep = await tx.tonhubAssetSweep.findFirst({
+    where: {
+      depositAddressId: deposit.id,
+      asset: "USDT",
+      OR: [
+        { idempotencyKey },
+        {
+          status: {
+            in: [
+              "QUEUED",
+              "GAS_CHECK",
+              "GAS_TOPUP_REQUIRED",
+              "GAS_TOPUP_SENT",
+              "READY",
+              "SENT",
+              "FAILED",
+            ],
+          },
+        },
+      ],
+    },
+    orderBy: { createdAt: "desc" },
+  });
+  if (!sweep) {
+    throw new Error(`Official USDT movement ${movement.id} did not create or join an active sweep.`);
+  }
+  return sweep;
 }
 
 function compareMovementChronology(left: PaymentMovementRecord, right: PaymentMovementRecord) {
@@ -741,6 +871,7 @@ export function createMovementLedger(db: PrismaLike) {
         if (movementFactsIdentity(movement) !== movementFactsIdentity(draft)) {
           throw new MovementFingerprintConflictError(draft.fingerprint);
         }
+        await enqueueOfficialUsdtSweep(tx, movement);
         return movement;
       });
     },
