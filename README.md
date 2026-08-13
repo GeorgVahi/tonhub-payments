@@ -186,6 +186,22 @@ the selected GRAM rate for the remaining partial-payment window when movement
 allocation is enabled in the following rollout stage. The current legacy GRAM
 settlement path remains unchanged while this snapshot writer runs in parallel.
 
+The neutral movement ledger records immutable on-chain facts by a unique
+fingerprint and values incoming assets in fiat micros using the latest eligible
+snapshot at or before their blockchain time. Valuation always rounds down.
+Allocation replay updates `creditedFiatMicros` up to the order obligation and
+keeps excess value separately in `overpaymentFiatMicros`; `paidAt` is derived
+from blockchain chronology, not worker execution order. One movement can credit
+only one order. Corrections append a full `REVERSAL` and move the order into
+`RECOVERY`; neither movement facts nor earlier allocations are rewritten. This
+ledger remains additive until the shadow scanner and settlement cutover stages.
+It refuses to overwrite a non-zero legacy order balance that has not yet been
+backfilled into allocations, routing that rollout gap to explicit recovery
+handling instead of silently losing or double-counting prior credit. Automatic
+credit always derives ownership through movement deposit address → invoice →
+order; invoice-less reassignment is reserved for a later authenticated and
+audited recovery workflow.
+
 ## Frontend
 
 ```tsx

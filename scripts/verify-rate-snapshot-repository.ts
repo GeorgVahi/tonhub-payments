@@ -106,7 +106,7 @@ try {
       fetchedAt: new Date("2026-08-13T12:02:30.000Z"),
       payload: forgedEvidence,
     }]),
-    /component snapshot does not match stored evidence/,
+    /component snapshot does not match stored evidence|rate snapshot violates payment rate policy/,
   );
   assert.equal(
     await prisma.tonhubRateSnapshot.count({

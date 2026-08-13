@@ -148,6 +148,13 @@ try {
   run(process.execPath, [tsxCli, "scripts/verify-rate-snapshot-repository.ts"], {
     env: { ...process.env, DATABASE_URL: databaseUrl("clean_migration") },
   });
+  run(process.execPath, [tsxCli, "scripts/verify-movement-ledger.ts"], {
+    env: {
+      ...process.env,
+      DATABASE_URL: databaseUrl("clean_migration"),
+      TONHUB_LEDGER_VERIFY_SUFFIX: "clean",
+    },
+  });
   prisma(
     databaseUrl("clean_migration"),
     "migrate",
@@ -229,6 +236,13 @@ try {
   prisma(databaseUrl("legacy_migration"), "migrate", "status");
   run(process.execPath, [tsxCli, "scripts/verify-rate-snapshot-repository.ts"], {
     env: { ...process.env, DATABASE_URL: databaseUrl("legacy_migration") },
+  });
+  run(process.execPath, [tsxCli, "scripts/verify-movement-ledger.ts"], {
+    env: {
+      ...process.env,
+      DATABASE_URL: databaseUrl("legacy_migration"),
+      TONHUB_LEDGER_VERIFY_SUFFIX: "legacy",
+    },
   });
 
   assertEqual(
@@ -353,10 +367,10 @@ try {
   psql(
     "legacy_migration",
     `INSERT INTO "TonhubDepositAddress" (
-       "id", "network", "address", "addressRaw", "walletVersion", "walletWorkchain",
+       "id", "invoiceId", "network", "address", "addressRaw", "walletVersion", "walletWorkchain",
        "walletContext", "walletNetworkGlobalId", "walletPublicKeyHash", "updatedAt"
      ) VALUES (
-       'deposit-1', 'testnet', 'deposit-address', '0:deposit-address', 'v5r1', 0,
+       'deposit-1', 'replacement-attempt', 'testnet', 'deposit-address', '0:deposit-address', 'v5r1', 0,
        4, -3, 'deposit-key-hash', CURRENT_TIMESTAMP
      );
      INSERT INTO "TonhubAssetSweep" (
@@ -436,7 +450,7 @@ try {
     `INSERT INTO "TonhubRateSnapshot" (
        "id", "asset", "baseCurrency", "quoteCurrency", "price", "source", "observedAt", "fetchedAt"
      ) VALUES (
-       'rate-1', 'GRAM', 'GRAM', 'EUR', 2.5, 'rehearsal', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP
+       'rate-1', 'GRAM', 'GRAM', 'EUR', 2.5, 'coingecko', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP
      );
      INSERT INTO "TonhubPaymentMovement" (
        "id", "fingerprint", "depositAddressId", "network", "direction", "asset", "assetKind",

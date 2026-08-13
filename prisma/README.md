@@ -74,3 +74,11 @@ covering invoices created by an old process near the migration boundary.
   They cannot be updated, deleted, or truncated. Allocation corrections use one
   full `REVERSAL` row that must exactly mirror and reference the original
   `CREDIT` allocation instead of editing it.
+- Each on-chain movement can have at most one `CREDIT` allocation. PostgreSQL
+  also requires that allocation to match the movement's terminal fiat evidence;
+  automatic credit requires an invoice whose order and deposit address own the
+  movement. The database validates supported rate source/asset precision,
+  exact USDT/USD peg policy, and immutable USDT/EUR component provenance before
+  accepting either a snapshot or credit. Application transactions lock the
+  order before replaying active allocations, preventing lost updates and
+  deriving `paidAt` deterministically from blockchain time.

@@ -254,7 +254,7 @@ function validateDraft(draft: RateSnapshotDraft) {
   };
 }
 
-function normalizeRecord(value: any): RateSnapshotRecord {
+export function normalizeRateSnapshotRecord(value: any): RateSnapshotRecord {
   const draft = validateDraft({
     asset: value.asset,
     baseCurrency: value.baseCurrency,
@@ -312,7 +312,7 @@ async function assertDerivedComponents(tx: PrismaLike, drafts: RateSnapshotDraft
     where: { OR: componentIds.map((id) => ({ id })) },
   });
   const byId = new Map<string, RateSnapshotRecord>(
-    rows.map((row: any) => [row.id, normalizeRecord(row)]),
+    rows.map((row: any) => [row.id, normalizeRateSnapshotRecord(row)]),
   );
   for (const item of evidence) {
     for (const component of [item.components.gramEur, item.components.gramUsd]) {
@@ -362,7 +362,7 @@ export function createPrismaRateSnapshotRepository(db: PrismaLike): RateSnapshot
           },
         });
         const storedRecords: RateSnapshotRecord[] = (stored as any[])
-          .map((value) => normalizeRecord(value));
+          .map((value) => normalizeRateSnapshotRecord(value));
         await assertDerivedComponents(tx, storedRecords);
         const byKey = new Map<string, RateSnapshotRecord>(
           storedRecords.map((value) => [snapshotKey(value), value]),
@@ -398,7 +398,7 @@ export function createPrismaRateSnapshotRepository(db: PrismaLike): RateSnapshot
       if (!value) {
         return null;
       }
-      const record = normalizeRecord(value);
+      const record = normalizeRateSnapshotRecord(value);
       return at.getTime() - record.observedAt.getTime() <= maxAgeMs ? record : null;
     },
   };
