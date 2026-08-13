@@ -236,7 +236,7 @@ function MovementCard({ record, csrfToken }: { record: any; csrfToken: string })
   );
 }
 
-function WebhookCard({ record }: { record: any }) {
+function WebhookCard({ record, csrfToken }: { record: any; csrfToken: string }) {
   return (
     <article className="record">
       <div className="record__header">
@@ -250,6 +250,23 @@ function WebhookCard({ record }: { record: any }) {
         <Field label="Delivered" value={record.deliveredAt} />
         <Field label="Last error" value={record.lastError} />
       </dl>
+      {record.deliveryAttempts?.length ? (
+        <div className="allocation-list">
+          {record.deliveryAttempts.map((attempt: any) => (
+            <span key={attempt.id}>
+              #{attempt.attemptNumber} · {attempt.status} · HTTP {attempt.httpStatus ?? "—"} · {attempt.durationMs ?? "—"} ms
+              {attempt.error ? ` · ${attempt.error}` : ""}
+            </span>
+          ))}
+        </div>
+      ) : null}
+      {record.status === "FAILED" ? (
+        <form className="action-row" method="post" action="/admin/actions/webhooks/retry">
+          <Csrf token={csrfToken} />
+          <input type="hidden" name="outboxEventId" value={record.id} />
+          <button className="button" type="submit">Retry delivery</button>
+        </form>
+      ) : null}
     </article>
   );
 }
@@ -267,6 +284,25 @@ function AuditCard({ record }: { record: any }) {
         <Field label="Audit ID" value={record.id} mono />
       </dl>
       {record.payload ? <pre>{JSON.stringify(record.payload, null, 2)}</pre> : null}
+    </article>
+  );
+}
+
+function WebhookAttemptCard({ record }: { record: any }) {
+  return (
+    <article className={record.status === "FAILED" ? "record record--alert" : "record"}>
+      <div className="record__header">
+        <div><span className="eyebrow">{record.topic} · attempt #{record.attemptNumber}</span><h2 className="mono">{record.eventId}</h2></div>
+        <Status value={record.status} />
+      </div>
+      <dl className="field-grid">
+        <Field label="HTTP status" value={record.httpStatus} />
+        <Field label="Duration ms" value={record.durationMs} />
+        <Field label="Started" value={record.startedAt} />
+        <Field label="Completed" value={record.completedAt} />
+        <Field label="Error" value={record.error} />
+        <Field label="Attempt ID" value={record.id} mono />
+      </dl>
     </article>
   );
 }
@@ -425,7 +461,7 @@ export function renderAdminSection(input: {
           if (input.page.section === "movements") return <MovementCard key={record.id} record={record} csrfToken={input.csrfToken} />;
           if (input.page.section === "recovery") return <RecoveryCard key={record.id} record={record} csrfToken={input.csrfToken} />;
           if (input.page.section === "sweeps") return <SweepCard key={record.id} record={record} csrfToken={input.csrfToken} />;
-          if (input.page.section === "webhooks") return <WebhookCard key={record.id} record={record} />;
+          if (input.page.section === "webhooks") return <WebhookCard key={record.id} record={record} csrfToken={input.csrfToken} />;
           return <AuditCard key={record.id} record={record} />;
         }) : <div className="empty">No records on this page.</div>}
       </div>
@@ -466,6 +502,15 @@ export function renderAdminSection(input: {
             ))}
           </div>
           <SecondaryPager page={input.page} label="Native sweeps" />
+        </>
+      ) : null}
+      {input.page.section === "webhooks" && input.page.secondaryRecords?.length ? (
+        <>
+          <section className="section-heading"><div><span className="eyebrow">At-least-once journal</span><h2>Every delivery attempt</h2></div></section>
+          <div className="records">
+            {input.page.secondaryRecords.map((record) => <WebhookAttemptCard key={record.id} record={record} />)}
+          </div>
+          <SecondaryPager page={input.page} label="Delivery attempts" />
         </>
       ) : null}
       <Pager page={input.page} />

@@ -279,6 +279,33 @@ sign or broadcast. `TON_DEPOSIT_SECRET_KEY`, network-specific deposit secret
 keys, and `TON_MAINNET_GAS_SERVICE_SECRET_KEY` are rejected from the API process
 environment; deploy signing workers with a separate environment.
 
+## Webhooks
+
+Set one global `TONHUB_WEBHOOK_URL` and `TONHUB_WEBHOOK_SECRET` in the webhook
+worker environment, then run `npm run worker:webhooks -- --watch`. Both values
+are required together. The URL must be HTTPS and cannot contain credentials,
+query parameters, or a fragment; invoices never accept an individual callback
+URL. This keeps the outbound destination under merchant deployment control and
+removes invoice-driven SSRF and data-exfiltration paths.
+
+PostgreSQL transaction triggers create immutable-identity outbox events for
+`invoice.partial`, `invoice.paid`, `invoice.expired`, `recovery.opened`, and
+`sweep.failed` in the same transaction as their authoritative state change.
+Delivery is at least once: receivers must persist and deduplicate the `id` (also
+sent as `X-Tonhub-Event-Id`) before applying side effects. Failed events retry
+forever with bounded exponential backoff; an admin can make a failed event due
+immediately without changing its event ID or attempt counter. Every claimed
+attempt is journaled before the HTTP request, including stale attempts left by a
+worker crash.
+
+The request body is UTF-8 JSON with `id`, `type`, `createdAt`, and `data`.
+`X-Tonhub-Timestamp` is the Unix timestamp used to sign it and
+`X-Tonhub-Signature` is `v1=` followed by lowercase hex HMAC-SHA256 over
+`timestamp + "." + exactRawBody`. Receivers should use a timing-safe comparison,
+reject stale timestamps according to their own clock-skew policy, and still
+deduplicate event IDs because a valid request can be replayed. The journal never
+stores the secret, signature, or response body.
+
 New API consumers should use `asset`, `assetKind`, `assetDecimals`,
 `amountAtomic`, `amountFormatted`, and the corresponding `expected`, `paid`,
 and `remaining` neutral fields. Existing GRAM-only fields such as `amountNano`,

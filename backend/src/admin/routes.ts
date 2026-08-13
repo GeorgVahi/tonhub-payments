@@ -48,6 +48,7 @@ const notices: Record<string, string> = {
   sweepQueued: "Sweep job was queued. A separate signing worker will process it.",
   sweepRetried: "Failed sweep was reset to the worker queue.",
   refundRegistered: "Executed refund evidence was registered in the immutable audit log.",
+  webhookRetried: "Failed webhook delivery was returned to the outbox queue.",
 };
 
 class AdminFormError extends Error {
@@ -410,6 +411,14 @@ export function createAdminRoutes(input: {
       blockchainAt: dateFromIso(values.blockchainAt),
     });
     return redirectWithNotice(context, "/admin/audit", "refundRegistered");
+  }));
+
+  app.post("/admin/actions/webhooks/retry", (context) => mutation(context, async (values, session) => {
+    await repository.retryWebhook({
+      adminUsername: session.username,
+      outboxEventId: values.outboxEventId,
+    });
+    return redirectWithNotice(context, "/admin/webhooks", "webhookRetried");
   }));
 
   return app;

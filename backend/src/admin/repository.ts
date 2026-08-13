@@ -96,6 +96,10 @@ export type AdminRepository = {
     transactionLt?: string | null;
     blockchainAt: Date;
   }) => Promise<{ refundId: string }>;
+  retryWebhook: (input: {
+    adminUsername: string;
+    outboxEventId: string;
+  }) => Promise<void>;
 };
 
 function requiredText(value: unknown, field: string, maxLength = 512) {
@@ -313,6 +317,36 @@ function serializeOutbox(value: any) {
     deliveredAt: iso(value.deliveredAt),
     lastError: value.lastError,
     createdAt: iso(value.createdAt),
+    deliveryAttempts: (value.deliveryAttempts ?? []).map((attempt: any) => ({
+      id: attempt.id,
+      attemptNumber: attempt.attemptNumber,
+      status: attempt.status,
+      webhookUrl: attempt.webhookUrl,
+      requestTimestamp: attempt.requestTimestamp,
+      httpStatus: attempt.httpStatus,
+      error: attempt.error,
+      durationMs: attempt.durationMs,
+      startedAt: iso(attempt.startedAt),
+      completedAt: iso(attempt.completedAt),
+    })),
+  };
+}
+
+function serializeWebhookAttempt(attempt: any) {
+  return {
+    id: attempt.id,
+    outboxEventId: attempt.outboxEventId,
+    eventId: attempt.outboxEvent?.eventId ?? null,
+    topic: attempt.outboxEvent?.topic ?? null,
+    attemptNumber: attempt.attemptNumber,
+    status: attempt.status,
+    webhookUrl: attempt.webhookUrl,
+    requestTimestamp: attempt.requestTimestamp,
+    httpStatus: attempt.httpStatus,
+    error: attempt.error,
+    durationMs: attempt.durationMs,
+    startedAt: iso(attempt.startedAt),
+    completedAt: iso(attempt.completedAt),
   };
 }
 
@@ -446,15 +480,36 @@ export function createPrismaAdminRepository(db: any = prisma): AdminRepository {
         };
       }
       if (section === "webhooks") {
-        const [total, records] = await Promise.all([
+        const [total, records, secondaryTotal, attempts] = await Promise.all([
           db.tonhubOutboxEvent.count(),
           db.tonhubOutboxEvent.findMany({
+            include: {
+              deliveryAttempts: {
+                orderBy: [{ attemptNumber: "desc" }],
+                take: 3,
+              },
+            },
             orderBy: [{ createdAt: "desc" }, { id: "desc" }],
             skip,
             take: adminPageSize,
           }),
+          db.tonhubWebhookDeliveryAttempt.count(),
+          db.tonhubWebhookDeliveryAttempt.findMany({
+            include: { outboxEvent: { select: { eventId: true, topic: true } } },
+            orderBy: [{ startedAt: "desc" }, { id: "desc" }],
+            skip: secondarySkip,
+            take: adminPageSize,
+          }),
         ]);
-        return { section, page, total, records: records.map(serializeOutbox) };
+        return {
+          section,
+          page,
+          total,
+          records: records.map(serializeOutbox),
+          secondaryRecords: attempts.map(serializeWebhookAttempt),
+          secondaryPage,
+          secondaryTotal,
+        };
       }
       const [total, records] = await Promise.all([
         db.tonhubAdminAuditEvent.count(),
@@ -848,6 +903,31 @@ export function createPrismaAdminRepository(db: any = prisma): AdminRepository {
         skipDuplicates: true,
       });
       return { refundId };
+    }),
+
+    retryWebhook: async (input) => db.$transaction(async (tx: any) => {
+      const outboxEventId = requiredText(input.outboxEventId, "Outbox event id");
+      const retried = await tx.tonhubOutboxEvent.updateMany({
+        where: { id: outboxEventId, status: "FAILED" },
+        data: {
+          status: "PENDING",
+          availableAt: new Date(),
+          leaseOwner: null,
+          leaseExpiresAt: null,
+          lastError: null,
+        },
+      });
+      if (retried.count !== 1) {
+        throw new Error("Webhook event is missing or not in FAILED state.");
+      }
+      await tx.tonhubAdminAuditEvent.create({
+        data: auditData({
+          adminUsername: input.adminUsername,
+          action: "WEBHOOK_RETRY_QUEUED",
+          targetType: "TonhubOutboxEvent",
+          targetId: outboxEventId,
+        }),
+      });
     }),
   };
 }

@@ -45,6 +45,7 @@ function fakeRepository(overrides: Partial<AdminRepository> = {}): AdminReposito
     queueSweep: async () => ({ jobId: "sweep-1", status: "QUEUED" }),
     retrySweep: async () => undefined,
     registerRefund: async () => ({ refundId: "refund-1" }),
+    retryWebhook: async () => undefined,
     ...overrides,
   };
 }
@@ -476,4 +477,42 @@ test("failed USDT sweep retries resume from immutable persisted chain plans", ()
   assert.throws(() => resumableFailedUsdtSweepStatus({
     gasTopupAmountNano: "1",
   }), /incomplete persisted gas top-up plan/i);
+});
+
+test("admin webhook view keeps failed delivery retry and full attempt pagination visible", () => {
+  const html = renderAdminSection({
+    username: "merchant",
+    csrfToken: "csrf",
+    page: {
+      section: "webhooks",
+      page: 1,
+      total: 1,
+      secondaryPage: 2,
+      secondaryTotal: 51,
+      records: [{
+        id: "event-row-1",
+        eventId: "invoice.paid:invoice-1:3",
+        topic: "invoice.paid",
+        aggregateType: "TonhubPaymentInvoice",
+        aggregateId: "invoice-1",
+        status: "FAILED",
+        attempts: 2,
+        deliveryAttempts: [],
+      }],
+      secondaryRecords: [{
+        id: "attempt-51",
+        eventId: "invoice.paid:invoice-1:3",
+        topic: "invoice.paid",
+        attemptNumber: 51,
+        status: "FAILED",
+        httpStatus: 503,
+        durationMs: 25,
+        error: "HTTP 503",
+      }],
+    },
+  });
+  assert.match(html, /Retry delivery/);
+  assert.match(html, /name="csrfToken" value="csrf"/);
+  assert.match(html, /Delivery attempts: page 2 of 2/);
+  assert.match(html, /HTTP 503/);
 });

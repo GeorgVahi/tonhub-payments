@@ -93,6 +93,12 @@ covering invoices created by an old process near the migration boundary.
 - Login throttling is durable across API replicas but intentionally mutable and
   contains only an HMAC-derived rate key. Registered refunds retain canonical
   chain facts and order/attempt ownership separately from the operator audit.
+- Invoice/recovery/sweep state changes enqueue webhook rows through PostgreSQL
+  triggers in the same transaction. Delivery attempts are created before each
+  HTTP request and may move exactly once from `STARTED` to `DELIVERED` or
+  `FAILED`; terminal attempt evidence cannot be edited or deleted. Outbox rows
+  remain mutable only through the lease/delivery lifecycle and retain one stable
+  event ID across at-least-once retries.
 - Each on-chain movement can have at most one `CREDIT` allocation. PostgreSQL
   also requires that allocation to match the movement's terminal fiat evidence;
   automatic credit requires an invoice whose order and deposit address own the

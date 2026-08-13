@@ -71,6 +71,12 @@ enum TonhubOutboxEventStatus {
   FAILED
 }
 
+enum TonhubWebhookAttemptStatus {
+  STARTED
+  DELIVERED
+  FAILED
+}
+
 model TonhubPaymentOrder {
   id                    String                     @id @default(cuid())
   externalId            String?                    @unique
@@ -401,10 +407,30 @@ model TonhubOutboxEvent {
   lastError      String?
   createdAt      DateTime                @default(now())
   updatedAt      DateTime                @updatedAt
+  deliveryAttempts TonhubWebhookDeliveryAttempt[]
 
   @@index([status, availableAt])
   @@index([aggregateType, aggregateId, createdAt])
   @@index([leaseExpiresAt])
+}
+
+model TonhubWebhookDeliveryAttempt {
+  id              String                       @id
+  outboxEventId   String
+  attemptNumber   Int
+  status          TonhubWebhookAttemptStatus   @default(STARTED)
+  webhookUrl      String
+  requestTimestamp String
+  httpStatus      Int?
+  error           String?
+  durationMs      Int?
+  startedAt       DateTime                     @default(now())
+  completedAt     DateTime?
+  outboxEvent     TonhubOutboxEvent            @relation(fields: [outboxEventId], references: [id], onDelete: Restrict)
+
+  @@unique([outboxEventId, attemptNumber])
+  @@index([status, startedAt])
+  @@index([outboxEventId, startedAt])
 }
 
 model TonhubAdminAuditEvent {

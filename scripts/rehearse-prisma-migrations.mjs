@@ -261,6 +261,13 @@ try {
       TONHUB_ADMIN_VERIFY_SUFFIX: "clean",
     },
   });
+  run(process.execPath, [tsxCli, "scripts/verify-webhook-outbox.ts"], {
+    env: {
+      ...process.env,
+      DATABASE_URL: databaseUrl("clean_migration"),
+      TONHUB_WEBHOOK_VERIFY_SUFFIX: "clean",
+    },
+  });
   prisma(
     databaseUrl("clean_migration"),
     "migrate",
@@ -376,6 +383,13 @@ try {
       ...process.env,
       DATABASE_URL: databaseUrl("legacy_migration"),
       TONHUB_ADMIN_VERIFY_SUFFIX: "legacy",
+    },
+  });
+  run(process.execPath, [tsxCli, "scripts/verify-webhook-outbox.ts"], {
+    env: {
+      ...process.env,
+      DATABASE_URL: databaseUrl("legacy_migration"),
+      TONHUB_WEBHOOK_VERIFY_SUFFIX: "legacy",
     },
   });
 
