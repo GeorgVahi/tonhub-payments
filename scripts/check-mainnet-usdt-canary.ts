@@ -14,4 +14,3 @@ void inspectMainnetUsdtCanary({ db: prisma as any })
     process.exitCode = 1;
   })
   .finally(() => prisma.$disconnect());
-
