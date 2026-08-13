@@ -28,6 +28,11 @@ const input = {
   reference: "REPOSITORY-REHEARSAL",
   quote: {
     source: "coingecko" as const,
+    asset: "GRAM" as const,
+    assetDecimals: 9,
+    fiatPerAsset: 2.5,
+    amountAtomic: "2000000000",
+    amountFormatted: "2.00 GRAM (ex TON)",
     fiatAmountCents: 500,
     fiatAmount: 5,
     fiatCurrency: "USD" as const,

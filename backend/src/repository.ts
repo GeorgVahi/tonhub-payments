@@ -7,6 +7,7 @@ import type {
   TonhubRateQuote,
 } from "./types";
 import { gramAsset, type TonNetwork } from "./ton/direct-payments";
+import { assertPaymentAssetSnapshot, parsePaymentAsset } from "../../shared/payment-assets";
 
 type PrismaLike = {
   $transaction: <T>(handler: (tx: PrismaLike) => Promise<T>) => Promise<T>;
@@ -78,6 +79,10 @@ function normalizeInvoice(value: unknown): TonhubPaymentInvoiceRecord {
   const fiatAmountMicros = invoice.fiatAmountMicros ?? fiatCentsToMicros(invoice.fiatAmountCents);
   const paidAmountAtomic = invoice.paidAmountAtomic ?? invoice.paidNano ?? "0";
   const amountAtomic = invoice.amountAtomic ?? invoice.amountNano;
+  const asset = assertPaymentAssetSnapshot(parsePaymentAsset(invoice.checkoutAsset ?? invoice.asset), {
+    kind: invoice.assetKind,
+    decimals: invoice.assetDecimals,
+  });
   const creditedFiatMicros = invoice.creditedFiatMicros ?? calculateFiatCreditMicros({
     fiatAmountMicros,
     amountAtomic,
@@ -89,9 +94,9 @@ function normalizeInvoice(value: unknown): TonhubPaymentInvoiceRecord {
     externalId: order ? order.externalId : invoice.externalId,
     orderId: invoice.orderId ?? null,
     order,
-    checkoutAsset: invoice.checkoutAsset ?? (invoice.asset === "TON" ? gramAsset.symbol : invoice.asset),
-    assetKind: invoice.assetKind ?? "NATIVE",
-    assetDecimals: invoice.assetDecimals ?? 9,
+    checkoutAsset: asset.symbol,
+    assetKind: asset.kind,
+    assetDecimals: asset.decimals,
     fiatAmountMicros,
     creditedFiatMicros,
     remainingFiatMicros: invoice.remainingFiatMicros ?? (
@@ -202,6 +207,10 @@ async function ensureInvoiceOrder(
   const fiatAmountMicros = invoice.fiatAmountMicros ?? fiatCentsToMicros(invoice.fiatAmountCents);
   const amountAtomic = invoice.amountAtomic ?? invoice.amountNano;
   const paidAmountAtomic = invoice.paidAmountAtomic ?? invoice.paidNano ?? "0";
+  const invoiceAsset = assertPaymentAssetSnapshot(parsePaymentAsset(invoice.checkoutAsset ?? invoice.asset), {
+    kind: invoice.assetKind,
+    decimals: invoice.assetDecimals,
+  });
   const creditedFiatMicros = invoice.status === "PAID"
     ? fiatAmountMicros
     : calculateFiatCreditMicros({ fiatAmountMicros, amountAtomic, paidAmountAtomic });
@@ -267,9 +276,9 @@ async function ensureInvoiceOrder(
     data: {
       orderId: order.id,
       status: attachedStatus,
-      checkoutAsset: invoice.asset === "TON" ? gramAsset.symbol : invoice.asset,
-      assetKind: invoice.assetKind ?? "NATIVE",
-      assetDecimals: invoice.assetDecimals ?? 9,
+      checkoutAsset: invoiceAsset.symbol,
+      assetKind: invoiceAsset.kind,
+      assetDecimals: invoiceAsset.decimals,
       fiatAmountMicros,
       creditedFiatMicros,
       remainingFiatMicros: (
@@ -553,7 +562,7 @@ export function createPrismaTonhubPaymentRepository(db: PrismaLike): TonhubPayme
               asset: gramAsset.symbol,
               checkoutAsset: gramAsset.symbol,
               assetKind: "NATIVE",
-              assetDecimals: 9,
+              assetDecimals: gramAsset.decimals,
               fiatAmountCents: input.amountCents,
               fiatAmountMicros,
               creditedFiatMicros: "0",
@@ -569,7 +578,7 @@ export function createPrismaTonhubPaymentRepository(db: PrismaLike): TonhubPayme
               walletPublicKeyHash: input.depositAddress.walletPublicKeyHash,
               amountNano: input.quote.amountNano,
               paidNano: "0",
-              amountAtomic: input.quote.amountNano,
+              amountAtomic: input.quote.amountAtomic ?? input.quote.amountNano,
               paidAmountAtomic: "0",
               reference: input.reference,
               status: "PENDING",

@@ -7,6 +7,7 @@
     "./frontend": "./frontend/src/index.ts",
     "./frontend/styles.css": "./frontend/src/styles.css",
     "./backend": "./backend/src/app.ts",
+    "./assets": "./shared/payment-assets.ts",
     "./worker/sweep": "./worker/src/sweep.ts"
   },
   "overrides": {
@@ -23,7 +24,7 @@
     "db:migrate:rehearse": "node scripts/rehearse-prisma-migrations.mjs",
     "db:push": "prisma db push",
     "typecheck": "tsc --noEmit",
-    "test": "tsx --test tests/tonhub-payments.test.ts tests/gram-flow-characterization.test.ts tests/order-attempts.test.ts",
+    "test": "tsx --test tests/tonhub-payments.test.ts tests/gram-flow-characterization.test.ts tests/order-attempts.test.ts tests/payment-assets.test.ts",
     "build": "vite build --config vite.config.ts",
     "preview": "vite preview --config vite.config.ts"
   },

@@ -42,6 +42,14 @@ import type {
   TonhubRateQuote
 } from "./types";
 import { resolveTonApiConfig } from "./ton/direct-payments";
+import {
+  assertPaymentAssetSnapshot,
+  ceilAtomicToPaymentUnit,
+  formatAssetAmount,
+  formatCheckoutAssetAmount,
+  parsePaymentAsset,
+  paymentAssets,
+} from "../../shared/payment-assets";
 
 type TonhubPaymentDependencies = {
   repository: TonhubPaymentRepository;
@@ -157,6 +165,10 @@ function observedPayment(match: TonInvoiceMatch): TonhubObservedPayment {
 
   return {
     transactionId,
+    asset: paymentAssets.GRAM.symbol,
+    assetDecimals: paymentAssets.GRAM.decimals,
+    amountAtomic: match.amountNano,
+    amountFormatted,
     amountNano: match.amountNano,
     amountGram: amountFormatted,
     amountTon: amountFormatted,
@@ -190,19 +202,37 @@ function normalizeStoredObservedPayment(value: unknown): TonhubObservedPayment |
   const transactionId = typeof value.transactionId === "string" && value.transactionId
     ? value.transactionId
     : null;
-  const amountNano = validNanoAmount(value.amountNano) ? value.amountNano : null;
+  const amountNano = validNanoAmount(value.amountAtomic)
+    ? value.amountAtomic
+    : validNanoAmount(value.amountNano)
+      ? value.amountNano
+      : null;
 
   if (!transactionId || !amountNano) {
     return null;
   }
 
-  const amountFormatted = formatNanoTon(amountNano);
+  let asset;
+  try {
+    asset = parsePaymentAsset(typeof value.asset === "string" ? value.asset : paymentAssets.GRAM.symbol);
+  } catch {
+    return null;
+  }
+  const amountFormatted = formatAssetAmount(amountNano, asset);
 
   return {
     transactionId,
-    amountNano,
-    amountGram: amountFormatted,
-    amountTon: amountFormatted,
+    asset: asset.symbol,
+    assetDecimals: asset.decimals,
+    amountAtomic: amountNano,
+    amountFormatted,
+    ...(asset.symbol === paymentAssets.GRAM.symbol
+      ? {
+          amountNano,
+          amountGram: amountFormatted,
+          amountTon: amountFormatted,
+        }
+      : {}),
     createdAt: typeof value.createdAt === "string" ? value.createdAt : null,
     status: "observed",
     comment: typeof value.comment === "string" ? value.comment : ""
@@ -248,7 +278,7 @@ function mergeObservedPayments(...groups: TonhubObservedPayment[][]) {
 
 function sumObservedPayments(payments: TonhubObservedPayment[]) {
   return payments
-    .reduce((sum, payment) => sum + BigInt(payment.amountNano), BigInt(0))
+    .reduce((sum, payment) => sum + BigInt(payment.amountAtomic ?? payment.amountNano ?? "0"), BigInt(0))
     .toString();
 }
 
@@ -263,16 +293,27 @@ function extractQuote(invoice: TonhubPaymentInvoiceRecord): TonhubRateQuote | nu
   }
 
   const quote = invoice.payload.quote;
+  const asset = assertPaymentAssetSnapshot(
+    parsePaymentAsset(typeof quote.asset === "string" ? quote.asset : paymentAssets.GRAM.symbol),
+    { decimals: typeof quote.assetDecimals === "number" ? quote.assetDecimals : undefined },
+  );
   const fiatAmountCents = typeof quote.fiatAmountCents === "number" ? quote.fiatAmountCents : null;
   const fiatAmount = typeof quote.fiatAmount === "number" ? quote.fiatAmount : null;
   const fiatCurrency = quote.fiatCurrency === "EUR" || quote.fiatCurrency === "USD" ? quote.fiatCurrency : null;
-  const fiatPerGram = typeof quote.fiatPerGram === "number"
-    ? quote.fiatPerGram
-    : typeof quote.fiatPerTon === "number"
-      ? quote.fiatPerTon
+  const fiatPerAsset = typeof quote.fiatPerAsset === "number"
+    ? quote.fiatPerAsset
+    : asset.symbol === paymentAssets.GRAM.symbol && typeof quote.fiatPerGram === "number"
+      ? quote.fiatPerGram
+      : asset.symbol === paymentAssets.GRAM.symbol && typeof quote.fiatPerTon === "number"
+        ? quote.fiatPerTon
+        : null;
+  const rawAmountAtomic = typeof quote.amountAtomic === "string" && validNanoAmount(quote.amountAtomic)
+    ? quote.amountAtomic
+    : typeof quote.amountNano === "string" && validNanoAmount(quote.amountNano)
+      ? quote.amountNano
       : null;
-  const amountNano = typeof quote.amountNano === "string" && validNanoAmount(quote.amountNano)
-    ? ceilNanoTonToPaymentUnit(quote.amountNano)
+  const amountNano = rawAmountAtomic
+    ? ceilAtomicToPaymentUnit(rawAmountAtomic, asset)
     : null;
   const updatedAt = typeof quote.updatedAt === "string" && quote.updatedAt ? new Date(quote.updatedAt) : null;
   const fetchedAt = typeof quote.fetchedAt === "string" ? new Date(quote.fetchedAt) : null;
@@ -281,7 +322,9 @@ function extractQuote(invoice: TonhubPaymentInvoiceRecord): TonhubRateQuote | nu
     fiatAmountCents === null ||
     fiatAmount === null ||
     !fiatCurrency ||
-    fiatPerGram === null ||
+    fiatPerAsset === null ||
+    !Number.isFinite(fiatPerAsset) ||
+    fiatPerAsset <= 0 ||
     !amountNano ||
     !fetchedAt ||
     Number.isNaN(fetchedAt.getTime()) ||
@@ -290,58 +333,93 @@ function extractQuote(invoice: TonhubPaymentInvoiceRecord): TonhubRateQuote | nu
     return null;
   }
 
-  const amountFormatted = formatPaymentNanoTon(amountNano);
+  const amountFormatted = formatCheckoutAssetAmount(amountNano, asset);
 
   return {
-    source: "coingecko",
+    source: quote.source === "usd-peg" ? "usd-peg" : "coingecko",
+    asset: asset.symbol,
+    assetDecimals: asset.decimals,
+    fiatPerAsset,
+    amountAtomic: amountNano,
+    amountFormatted,
     fiatAmountCents,
     fiatAmount,
     fiatCurrency,
-    fiatPerGram,
-    fiatPerTon: fiatPerGram,
-    amountNano,
-    amountGram: amountFormatted,
-    amountTon: amountFormatted,
+    ...(asset.symbol === paymentAssets.GRAM.symbol
+      ? {
+          fiatPerGram: fiatPerAsset,
+          fiatPerTon: fiatPerAsset,
+          amountNano,
+          amountGram: amountFormatted,
+          amountTon: amountFormatted,
+        }
+      : {}),
     updatedAt,
     fetchedAt
   };
 }
 
 function serializeQuote(quote: TonhubRateQuote | null) {
-  return quote
-    ? {
+  if (!quote) {
+    return null;
+  }
+  const asset = assertPaymentAssetSnapshot(parsePaymentAsset(quote.asset), {
+    decimals: quote.assetDecimals,
+  });
+  const amountAtomic = quote.amountAtomic;
+  return {
         source: quote.source,
+        asset: asset.symbol,
+        assetDecimals: asset.decimals,
         fiatAmountCents: quote.fiatAmountCents,
         fiatAmount: quote.fiatAmount,
         fiatCurrency: quote.fiatCurrency,
-        fiatPerGram: quote.fiatPerGram,
-        fiatPerTon: quote.fiatPerTon,
-        amountNano: quote.amountNano,
-        amountGram: quote.amountGram,
-        amountTon: quote.amountTon,
+        fiatPerGram: asset.symbol === paymentAssets.GRAM.symbol ? quote.fiatPerGram ?? quote.fiatPerAsset : null,
+        fiatPerTon: asset.symbol === paymentAssets.GRAM.symbol ? quote.fiatPerTon ?? quote.fiatPerAsset : null,
+        fiatPerAsset: quote.fiatPerAsset,
+        amountAtomic,
+        amountFormatted: formatCheckoutAssetAmount(amountAtomic, asset),
+        amountNano: asset.symbol === paymentAssets.GRAM.symbol ? quote.amountNano ?? amountAtomic : null,
+        amountGram: asset.symbol === paymentAssets.GRAM.symbol
+          ? quote.amountGram ?? formatCheckoutAssetAmount(amountAtomic, asset)
+          : null,
+        amountTon: asset.symbol === paymentAssets.GRAM.symbol
+          ? quote.amountTon ?? formatCheckoutAssetAmount(amountAtomic, asset)
+          : null,
         updatedAt: quote.updatedAt?.toISOString() ?? null,
         fetchedAt: quote.fetchedAt.toISOString()
-      }
-    : null;
+      };
 }
 
 function serializeInvoice(invoice: TonhubPaymentInvoiceRecord, quote = extractQuote(invoice)) {
-  const paidNano = invoice.paidNano || "0";
-  const expectedAmountNano = ceilNanoTonToPaymentUnit(invoice.amountNano);
+  const asset = assertPaymentAssetSnapshot(parsePaymentAsset(invoice.checkoutAsset ?? invoice.asset), {
+    kind: invoice.assetKind,
+    decimals: invoice.assetDecimals,
+  });
+  const paidNano = invoice.paidAmountAtomic ?? (invoice.paidNano || "0");
+  const expectedAmountNano = ceilAtomicToPaymentUnit(invoice.amountAtomic ?? invoice.amountNano, asset);
   const remainingExactNano = subtractNano(expectedAmountNano, paidNano);
-  const remainingNano = remainingExactNano === "0" ? "0" : ceilNanoTonToPaymentUnit(remainingExactNano);
+  const remainingNano = remainingExactNano === "0"
+    ? "0"
+    : ceilAtomicToPaymentUnit(remainingExactNano, asset);
   const payableNano = remainingNano === "0" ? expectedAmountNano : remainingNano;
-  const amountGram = formatPaymentNanoTon(payableNano);
-  const expectedAmountGram = formatPaymentNanoTon(expectedAmountNano);
-  const paidGram = formatNanoTon(paidNano);
-  const remainingGram = formatPaymentNanoTon(remainingNano);
+  const amountFormatted = formatCheckoutAssetAmount(payableNano, asset);
+  const expectedAmountFormatted = formatCheckoutAssetAmount(expectedAmountNano, asset);
+  const paidAmountFormatted = formatAssetAmount(paidNano, asset);
+  const remainingAmountFormatted = formatCheckoutAssetAmount(remainingNano, asset);
+  const amountGram = asset.symbol === paymentAssets.GRAM.symbol ? amountFormatted : null;
+  const expectedAmountGram = asset.symbol === paymentAssets.GRAM.symbol ? expectedAmountFormatted : null;
+  const paidGram = asset.symbol === paymentAssets.GRAM.symbol ? paidAmountFormatted : null;
+  const remainingGram = asset.symbol === paymentAssets.GRAM.symbol ? remainingAmountFormatted : null;
 
   return {
     id: invoice.id,
     orderId: invoice.orderId ?? null,
     externalId: invoice.externalId,
     network: invoice.network,
-    asset: invoice.asset === "TON" ? gramAsset.symbol : invoice.asset,
+    asset: asset.symbol,
+    assetKind: asset.kind,
+    assetDecimals: asset.decimals,
     fiatAmountCents: invoice.fiatAmountCents,
     fiatAmount: invoice.fiatAmountCents / 100,
     fiatCurrency: invoice.fiatCurrency,
@@ -349,24 +427,34 @@ function serializeInvoice(invoice: TonhubPaymentInvoiceRecord, quote = extractQu
     address: invoice.address,
     addressMasked: maskValue(invoice.address),
     addressStrategy: invoice.addressStrategy,
-    amountNano: payableNano,
+    amountNano: asset.symbol === paymentAssets.GRAM.symbol ? payableNano : null,
     amountGram,
     amountTon: amountGram,
-    expectedAmountNano,
+    amountAtomic: payableNano,
+    amountFormatted,
+    expectedAmountNano: asset.symbol === paymentAssets.GRAM.symbol ? expectedAmountNano : null,
     expectedAmountGram,
     expectedAmountTon: expectedAmountGram,
-    paidNano,
+    expectedAmountAtomic: expectedAmountNano,
+    expectedAmountFormatted,
+    paidNano: asset.symbol === paymentAssets.GRAM.symbol ? paidNano : null,
     paidGram,
     paidTon: paidGram,
-    remainingNano,
+    paidAmountAtomic: paidNano,
+    paidAmountFormatted,
+    remainingNano: asset.symbol === paymentAssets.GRAM.symbol ? remainingNano : null,
     remainingGram,
     remainingTon: remainingGram,
+    remainingAmountAtomic: remainingNano,
+    remainingAmountFormatted,
     reference: invoice.reference,
-    deeplink: buildTonTransferLink({
-      address: invoice.address,
-      amountNano: payableNano,
-      comment: invoice.reference
-    }),
+    deeplink: asset.kind === "NATIVE"
+      ? buildTonTransferLink({
+          address: invoice.address,
+          amountNano: payableNano,
+          comment: invoice.reference
+        })
+      : null,
     status: invoice.status,
     createdAt: invoice.createdAt.toISOString(),
     expiresAt: invoice.expiresAt?.toISOString() ?? null,
@@ -374,7 +462,7 @@ function serializeInvoice(invoice: TonhubPaymentInvoiceRecord, quote = extractQu
     priceLockedUntil: invoice.priceLockedUntil?.toISOString() ?? invoice.expiresAt?.toISOString() ?? null,
     partialPaymentStartedAt: invoice.partialPaymentStartedAt?.toISOString() ?? null,
     partialPaymentExpiresAt: invoice.partialPaymentExpiresAt?.toISOString() ?? null,
-    observedPayments: Array.isArray(invoice.observedPayments) ? invoice.observedPayments : [],
+    observedPayments: storedObservedPayments(invoice),
     quote: serializeQuote(quote),
     order: invoice.order
       ? {
@@ -397,6 +485,10 @@ function serializeMatch(match: TonInvoiceMatch | null) {
   return match
     ? {
         transactionHashMasked: maskValue(match.transaction.hash || match.transaction.lt || "unknown"),
+        asset: paymentAssets.GRAM.symbol,
+        assetDecimals: paymentAssets.GRAM.decimals,
+        amountAtomic: match.amountNano,
+        amountFormatted: formatAssetAmount(match.amountNano, paymentAssets.GRAM),
         amountNano: match.amountNano,
         amountTon: formatNanoTon(match.amountNano),
         createdAt: match.createdAt,
@@ -793,6 +885,11 @@ export async function createTonhubPaymentInvoice(
     });
     const quote: TonhubRateQuote = {
       source: "coingecko",
+      asset: paymentAssets.GRAM.symbol,
+      assetDecimals: paymentAssets.GRAM.decimals,
+      fiatPerAsset: rate.fiatPerTon,
+      amountAtomic: amountNano,
+      amountFormatted: formatPaymentNanoTon(amountNano),
       fiatAmountCents: amountCents,
       fiatAmount: amountCents / 100,
       fiatCurrency: currency,

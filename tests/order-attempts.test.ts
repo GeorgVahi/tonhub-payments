@@ -154,6 +154,11 @@ function createMemoryPrisma() {
 const createdAt = new Date("2026-08-13T10:00:00.000Z");
 const quote: TonhubRateQuote = {
   source: "coingecko",
+  asset: "GRAM",
+  assetDecimals: 9,
+  fiatPerAsset: 2.47,
+  amountAtomic: "2030000000",
+  amountFormatted: "2.03 GRAM (ex TON)",
   fiatAmountCents: 500,
   fiatAmount: 5,
   fiatCurrency: "USD",
@@ -685,7 +690,7 @@ test("invoice transitions dual-write the owning order", async () => {
   const paid = await repository.markInvoicePaid({
     invoiceId: invoice.id,
     transactionId: "paid-transaction",
-    paidNano: quote.amountNano,
+    paidNano: quote.amountAtomic,
     observedPayments: [],
     paidAt: new Date("2026-08-13T10:20:00.000Z"),
   });
@@ -715,7 +720,7 @@ test("a direct full payment records its blockchain time as firstMovementAt", asy
   const paid = await repository.markInvoicePaid({
     invoiceId: invoice.id,
     transactionId: "direct-paid-transaction",
-    paidNano: quote.amountNano,
+    paidNano: quote.amountAtomic,
     observedPayments: [],
     paidAt,
   });

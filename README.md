@@ -149,6 +149,26 @@ reconstructed only when the worker's secret key matches its stored public-key
 hash. See `prisma/README.md` for clean deployment, legacy baselining, and the
 Docker migration rehearsal.
 
+## Asset and amount contract
+
+The shared registry in `shared/payment-assets.ts` is the canonical definition
+of payment-asset identity and precision:
+
+- `GRAM` is the TON native coin exposed under the product name
+  `GRAM (ex TON)`. The legacy input alias `TON` resolves to `GRAM`; amounts use
+  9 atomic decimals and checkout amounts are rounded up to 2 displayed digits.
+- `USDT` is a TON jetton with 6 atomic decimals and a USD-peg pricing strategy.
+  Listing it in the registry does not yet enable it in checkout: the config
+  endpoint continues to return `checkoutAssets: ["GRAM"]` until the verified
+  jetton scanner and canonical deployment are enabled in later rollout stages.
+
+New API consumers should use `asset`, `assetKind`, `assetDecimals`,
+`amountAtomic`, `amountFormatted`, and the corresponding `expected`, `paid`,
+and `remaining` neutral fields. Existing GRAM-only fields such as `amountNano`,
+`amountGram`, and `amountTon` remain available for GRAM clients during the
+compatibility window. Atomic conversion uses decimal strings and `BigInt`; it
+does not route financial values through JavaScript floating-point numbers.
+
 ## Frontend
 
 ```tsx

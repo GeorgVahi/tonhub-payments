@@ -7,6 +7,7 @@ import {
 import { parseFiatCurrency, resolveAllowedNetworks, resolveDefaultNetwork } from "../config";
 import { fetchTonFiatRate } from "../rates";
 import { gramAsset } from "../ton/direct-payments";
+import { listPaymentAssets, paymentAssets } from "../../../shared/payment-assets";
 
 export function createTonhubPaymentRoutes() {
   const app = new Hono();
@@ -24,6 +25,17 @@ export function createTonhubPaymentRoutes() {
         defaultNetwork: resolveDefaultNetwork(),
         allowedNetworks: resolveAllowedNetworks(),
         currencies: ["EUR", "USD"],
+        defaultAsset: paymentAssets.GRAM.symbol,
+        checkoutAssets: [paymentAssets.GRAM.symbol],
+        assets: listPaymentAssets().map((asset) => ({
+          symbol: asset.symbol,
+          label: asset.label,
+          network: asset.network,
+          kind: asset.kind,
+          decimals: asset.decimals,
+          checkoutFractionDigits: asset.checkoutFractionDigits,
+          pricingStrategy: asset.pricingStrategy
+        })),
         invoiceTtlMinutes: Number.parseInt(process.env.TON_INVOICE_TTL_MINUTES || "60", 10),
         partialPaymentTtlHours: Number.parseInt(process.env.TON_PARTIAL_PAYMENT_TTL_HOURS || "24", 10)
       }
@@ -41,6 +53,9 @@ export function createTonhubPaymentRoutes() {
           currency: rate.currency,
           fiatPerGram: rate.fiatPerTon,
           fiatPerTon: rate.fiatPerTon,
+          asset: paymentAssets.GRAM.symbol,
+          assetDecimals: paymentAssets.GRAM.decimals,
+          fiatPerAsset: rate.fiatPerTon,
           updatedAt: rate.updatedAt?.toISOString() ?? null,
           fetchedAt: rate.fetchedAt.toISOString()
         }

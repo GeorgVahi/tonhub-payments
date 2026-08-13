@@ -1,5 +1,13 @@
 import { randomBytes } from "node:crypto";
 import { Buffer } from "node:buffer";
+import {
+  ceilAtomicToPaymentUnit,
+  formatAssetAmount,
+  formatCheckoutAssetAmount,
+  parseAssetAmountToAtomic,
+  paymentAssets,
+  paymentUnitAtomic,
+} from "../../../shared/payment-assets";
 
 export type TonNetwork = "testnet" | "mainnet";
 
@@ -46,14 +54,10 @@ export type TonInvoiceMatch = {
   status: "observed" | "aborted" | "unknown";
 };
 
-export const gramAsset = {
-  symbol: "GRAM",
-  label: "GRAM (ex TON)"
-} as const;
+export const gramAsset = paymentAssets.GRAM;
 
-const nanoPerTon = BigInt("1000000000");
-export const tonPaymentFractionDigits = 2;
-export const tonPaymentAmountNanoStep = BigInt("10000000");
+export const tonPaymentFractionDigits = gramAsset.checkoutFractionDigits;
+export const tonPaymentAmountNanoStep = paymentUnitAtomic(gramAsset);
 
 export const tonNetworkConfig: Record<TonNetwork, {
   baseUrl: string;
@@ -167,35 +171,12 @@ export function resolveTonApiConfig(
 }
 
 export function parseTonAmountToNano(value: string) {
-  const trimmed = value.trim();
-
-  if (!/^\d+(\.\d{1,9})?$/.test(trimmed)) {
-    throw new Error(`${gramAsset.label} amount must be a positive decimal with up to 9 fractional digits.`);
-  }
-
-  const [wholeText, fractionalText = ""] = trimmed.split(".");
-  const whole = BigInt(wholeText);
-  const fractional = BigInt(fractionalText.padEnd(9, "0"));
-  const nano = whole * nanoPerTon + fractional;
-
-  if (nano <= 0) {
-    throw new Error(`${gramAsset.label} amount must be greater than zero.`);
-  }
-
-  return nano.toString();
+  return parseAssetAmountToAtomic(value, gramAsset);
 }
 
 export function ceilNanoTonToPaymentUnit(value: string | bigint) {
   const nano = typeof value === "bigint" ? value : BigInt(value);
-
-  if (nano <= BigInt(0)) {
-    return "0";
-  }
-
-  return (
-    ((nano + tonPaymentAmountNanoStep - BigInt(1)) / tonPaymentAmountNanoStep) *
-    tonPaymentAmountNanoStep
-  ).toString();
+  return nano <= BigInt(0) ? "0" : ceilAtomicToPaymentUnit(nano, gramAsset);
 }
 
 export function formatNanoTon(
@@ -213,27 +194,20 @@ export function formatNanoTon(
   }
 
   try {
-    const nano = BigInt(value);
-    const whole = nano / nanoPerTon;
-    const fractional = nano % nanoPerTon;
     if (typeof options.fixedFractionDigits === "number") {
-      const digits = Math.max(0, Math.min(9, Math.trunc(options.fixedFractionDigits)));
-      const fractionalText = fractional.toString().padStart(9, "0").slice(0, digits);
-      return `${whole.toString()}${digits ? `.${fractionalText}` : ""} ${gramAsset.label}`;
+      const digits = Math.max(0, Math.min(gramAsset.decimals, Math.trunc(options.fixedFractionDigits)));
+      const hiddenUnit = BigInt(10) ** BigInt(gramAsset.decimals - digits);
+      const truncatedNano = (BigInt(value) / hiddenUnit) * hiddenUnit;
+      return formatAssetAmount(truncatedNano, gramAsset, { fixedFractionDigits: digits });
     }
-
-    const fractionalText = fractional.toString().padStart(9, "0").replace(/0+$/, "");
-
-    return `${whole.toString()}${fractionalText ? `.${fractionalText}` : ""} ${gramAsset.label}`;
+    return formatAssetAmount(value, gramAsset);
   } catch {
     return `${value} nanotons`;
   }
 }
 
 export function formatPaymentNanoTon(value: string | undefined) {
-  return formatNanoTon(value ? ceilNanoTonToPaymentUnit(value) : "0", {
-    fixedFractionDigits: tonPaymentFractionDigits
-  });
+  return formatCheckoutAssetAmount(value ?? "0", gramAsset);
 }
 
 function tonTransactionHashForExplorer(value: string) {

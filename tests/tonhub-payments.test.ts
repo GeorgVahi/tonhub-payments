@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import {
   buildTonTransferLink,
+  ceilNanoTonToPaymentUnit,
   formatNanoTon,
   parseTonAmountToNano,
   type TonCenterTransaction
@@ -28,6 +29,9 @@ process.env.TON_INVOICE_REFERENCE_PREFIX = "TESTPAY";
 
 assert.equal(parseTonAmountToNano("0.01"), "10000000");
 assert.equal(formatNanoTon("1234567890"), "1.23456789 GRAM (ex TON)");
+assert.equal(formatNanoTon("1234567890", { fixedFractionDigits: 2 }), "1.23 GRAM (ex TON)");
+assert.equal(formatNanoTon("1234567890", { fixedFractionDigits: 20 }), "1.234567890 GRAM (ex TON)");
+assert.equal(ceilNanoTonToPaymentUnit("-1"), "0");
 assert.equal(
   ceilTonAmountNanoFromFiat({
     amountCents: 500,
@@ -109,7 +113,7 @@ const repository: TonhubPaymentRepository = {
       walletContext: input.depositAddress.walletContext,
       walletNetworkGlobalId: input.depositAddress.walletNetworkGlobalId,
       walletPublicKeyHash: input.depositAddress.walletPublicKeyHash,
-      amountNano: input.quote.amountNano,
+      amountNano: input.quote.amountNano ?? input.quote.amountAtomic,
       paidNano: "0",
       reference: input.reference,
       status: "PENDING",
@@ -198,6 +202,26 @@ const created = await createTonhubPaymentInvoice(
 assert.equal(created.status, 200);
 assert.equal((created.body.invoice as { amountNano: string }).amountNano, "2030000000");
 assert.equal((created.body.invoice as { amountGram: string }).amountGram, "2.03 GRAM (ex TON)");
+assert.deepEqual(
+  {
+    asset: (created.body.invoice as { asset: string }).asset,
+    assetKind: (created.body.invoice as { assetKind: string }).assetKind,
+    assetDecimals: (created.body.invoice as { assetDecimals: number }).assetDecimals,
+    amountAtomic: (created.body.invoice as { amountAtomic: string }).amountAtomic,
+    amountFormatted: (created.body.invoice as { amountFormatted: string }).amountFormatted,
+  },
+  {
+    asset: "GRAM",
+    assetKind: "NATIVE",
+    assetDecimals: 9,
+    amountAtomic: "2030000000",
+    amountFormatted: "2.03 GRAM (ex TON)",
+  },
+);
+assert.equal(
+  (created.body.invoice as { quote: { amountAtomic: string } }).quote.amountAtomic,
+  "2030000000",
+);
 assert.ok(
   ((created.body.invoice as { deeplink: string }).deeplink).includes("amount=2030000000")
 );
@@ -224,6 +248,10 @@ assert.equal((partial.body.invoice as { paidNano: string }).paidNano, "101000000
 assert.equal((partial.body.invoice as { remainingNano: string }).remainingNano, "1020000000");
 assert.equal((partial.body.invoice as { amountNano: string }).amountNano, "1020000000");
 assert.equal((partial.body.invoice as { remainingGram: string }).remainingGram, "1.02 GRAM (ex TON)");
+assert.equal((partial.body.invoice as { amountAtomic: string }).amountAtomic, "1020000000");
+assert.equal((partial.body.invoice as { amountFormatted: string }).amountFormatted, "1.02 GRAM (ex TON)");
+assert.equal((partial.body.invoice as { paidAmountAtomic: string }).paidAmountAtomic, "1010000000");
+assert.equal((partial.body.invoice as { paidAmountFormatted: string }).paidAmountFormatted, "1.01 GRAM (ex TON)");
 
 currentTransactions = [
   ...currentTransactions,
@@ -242,6 +270,8 @@ const paid = await checkTonhubPaymentInvoice("tonhub-invoice-1", dependencies);
 assert.equal(paid.status, 200);
 assert.equal((paid.body.invoice as { status: string }).status, "PAID");
 assert.equal((paid.body.invoice as { paidNano: string }).paidNano, "2030000000");
+assert.equal((paid.body.invoice as { paidAmountAtomic: string }).paidAmountAtomic, "2030000000");
+assert.equal((paid.body.invoice as { remainingAmountAtomic: string }).remainingAmountAtomic, "0");
 assert.equal((paid.body as { finalized: boolean }).finalized, true);
 const paidInvoice = currentInvoice as TonhubPaymentInvoiceRecord | null;
 assert.ok(paidInvoice);

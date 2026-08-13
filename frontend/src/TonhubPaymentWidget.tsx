@@ -29,6 +29,8 @@ type TonhubInvoice = {
   externalId: string | null;
   network: TonNetwork;
   asset: string;
+  assetKind: "NATIVE" | "JETTON";
+  assetDecimals: number;
   fiatAmountCents: number;
   fiatAmount: number;
   fiatCurrency: FiatCurrency;
@@ -37,6 +39,14 @@ type TonhubInvoice = {
   amountNano: string;
   amountGram: string;
   amountTon: string;
+  amountAtomic: string;
+  amountFormatted: string;
+  expectedAmountAtomic: string;
+  expectedAmountFormatted: string;
+  paidAmountAtomic: string;
+  paidAmountFormatted: string;
+  remainingAmountAtomic: string;
+  remainingAmountFormatted: string;
   expectedAmountGram: string;
   expectedAmountTon: string;
   paidGram: string;
@@ -49,6 +59,11 @@ type TonhubInvoice = {
   priceLockedUntil: string | null;
   partialPaymentExpiresAt: string | null;
   quote: {
+    asset: string;
+    assetDecimals: number;
+    fiatPerAsset: number;
+    amountAtomic: string;
+    amountFormatted: string;
     fiatPerGram: number;
     fiatPerTon: number;
     fetchedAt: string;
@@ -60,6 +75,16 @@ type ApiConfig = {
   defaultNetwork: TonNetwork;
   allowedNetworks: TonNetwork[];
   currencies: FiatCurrency[];
+  defaultAsset: string;
+  checkoutAssets: string[];
+  assets: Array<{
+    symbol: string;
+    label: string;
+    kind: "NATIVE" | "JETTON";
+    decimals: number;
+    checkoutFractionDigits: number;
+    pricingStrategy: "MARKET" | "USD_PEG";
+  }>;
 };
 
 export type TonhubPaymentWidgetProps = {

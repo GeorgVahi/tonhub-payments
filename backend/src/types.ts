@@ -1,5 +1,6 @@
 import type { FiatCurrency } from "./config";
 import type { TonNetwork, TonInvoiceMatch } from "./ton/direct-payments";
+import type { PaymentAssetSymbol } from "../../shared/payment-assets";
 
 export type TonhubPaymentStatus = "PENDING" | "PARTIAL" | "PAID" | "EXPIRED" | "CANCELLED" | "FAILED";
 export type TonhubPaymentOrderStatus = TonhubPaymentStatus | "RECOVERY";
@@ -22,24 +23,33 @@ export type TonhubPaymentOrderRecord = {
 
 export type TonhubObservedPayment = {
   transactionId: string;
-  amountNano: string;
-  amountGram: string;
-  amountTon: string;
+  asset?: PaymentAssetSymbol;
+  assetDecimals?: number;
+  amountAtomic?: string;
+  amountFormatted?: string;
+  amountNano?: string;
+  amountGram?: string;
+  amountTon?: string;
   createdAt: string | null;
   status: TonInvoiceMatch["status"];
   comment: string;
 };
 
 export type TonhubRateQuote = {
-  source: "coingecko";
+  source: "coingecko" | "usd-peg";
+  asset: PaymentAssetSymbol;
+  assetDecimals: number;
+  fiatPerAsset: number;
+  amountAtomic: string;
+  amountFormatted: string;
   fiatAmountCents: number;
   fiatAmount: number;
   fiatCurrency: FiatCurrency;
-  fiatPerGram: number;
-  fiatPerTon: number;
-  amountNano: string;
-  amountGram: string;
-  amountTon: string;
+  fiatPerGram?: number;
+  fiatPerTon?: number;
+  amountNano?: string;
+  amountGram?: string;
+  amountTon?: string;
   updatedAt: Date | null;
   fetchedAt: Date;
 };
