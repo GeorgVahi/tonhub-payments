@@ -92,7 +92,11 @@ type TonhubPaymentDependencies = {
     maxAgeMs: number;
   }) => Promise<RateSnapshotRecord | null>;
   rateSnapshotMaxAgeMs: () => number;
-  checkoutAssetAvailable: (asset: "GRAM" | "USDT", network: TonNetwork) => boolean;
+  checkoutAssetAvailable: (
+    asset: "GRAM" | "USDT",
+    network: TonNetwork,
+    externalId?: string,
+  ) => boolean;
   createTonDepositAddress: (input: { network: TonNetwork }) => TonUniqueDepositAddress;
   createTonInvoiceReference: (prefix?: string) => string;
   gramLedgerSource: GramLedgerSettlementSource;
@@ -730,7 +734,9 @@ function resolveDependencies(
     fetchTonFiatRate,
     findRateSnapshot: (input) => prismaRateSnapshotRepository.findAt(input),
     rateSnapshotMaxAgeMs,
-    checkoutAssetAvailable: (asset, network) => isCheckoutAssetAvailable(asset, network),
+    checkoutAssetAvailable: (asset, network, externalId) => (
+      isCheckoutAssetAvailable(asset, network, process.env, externalId)
+    ),
     createTonDepositAddress: ({ network }) => createTonV5R1DepositAddressFromEnv({ network }),
     createTonInvoiceReference,
     gramLedgerSource: prismaGramLedgerSettlementSource,
@@ -1324,7 +1330,7 @@ export async function createTonhubPaymentInvoice(
       };
     }
 
-    if (!deps.checkoutAssetAvailable(asset.symbol, network)) {
+    if (!deps.checkoutAssetAvailable(asset.symbol, network, parsed.data.externalId)) {
       return {
         status: 400,
         body: {

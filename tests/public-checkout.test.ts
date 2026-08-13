@@ -4,6 +4,7 @@ import { createTonhubPaymentInvoice } from "../backend/src/payments";
 import type { TonhubPaymentRepository } from "../backend/src/repository";
 import type { TonhubPaymentInvoiceRecord } from "../backend/src/types";
 import { officialMainnetUsdtMasterFriendlyAddress } from "../backend/src/ton/mainnet-usdt";
+import { isCheckoutAssetAvailable } from "../backend/src/checkout-assets";
 
 const createdAt = new Date("2026-08-13T12:00:00.000Z");
 const depositAddress = {
@@ -126,6 +127,107 @@ test("public mainnet checkout creates a USDT attempt from a fresh immutable rate
   assert.equal(deeplink.searchParams.get("amount"), "12340000");
   assert.equal(fixture.createdInput().quote.asset, "USDT");
   assert.equal(fixture.createdInput().activationThresholdFiatMicros, "6170000");
+});
+
+test("mainnet canary issuance passes the merchant external id into the owner policy", async () => {
+  const env = {
+    TON_USDT_MAINNET_CHECKOUT_ENABLED: "false",
+    TON_USDT_MAINNET_ADAPTER_ENABLED: "true",
+    TON_MOVEMENT_SETTLEMENT_ENABLED: "true",
+    TON_GRAM_SETTLEMENT_MODE: "ledger",
+    TON_USDT_MAINNET_CANARY_EXTERNAL_IDS: "merchant-canary-order",
+  };
+  let checkedExternalId: string | undefined;
+  const fixture = publicDependencies({
+    checkoutAssetAvailable: (asset: "GRAM" | "USDT", network: "testnet" | "mainnet", externalId?: string) => {
+      checkedExternalId = externalId;
+      return isCheckoutAssetAvailable(asset, network, env, externalId);
+    },
+  });
+  const response = await createTonhubPaymentInvoice({
+    amount: "5.00",
+    currency: "USD",
+    network: "mainnet",
+    asset: "USDT",
+    externalId: "merchant-canary-order",
+  }, fixture.dependencies as any);
+  assert.equal(response.status, 200);
+  assert.equal(checkedExternalId, "merchant-canary-order");
+
+  let sideEffects = 0;
+  const denied = publicDependencies({
+    checkoutAssetAvailable: (asset: "GRAM" | "USDT", network: "testnet" | "mainnet", externalId?: string) => (
+      isCheckoutAssetAvailable(asset, network, env, externalId)
+    ),
+    findRateSnapshot: async () => { sideEffects += 1; return null; },
+    createTonDepositAddress: () => { sideEffects += 1; return depositAddress; },
+  });
+  const deniedResponse = await createTonhubPaymentInvoice({
+    amount: "5.00",
+    currency: "USD",
+    network: "mainnet",
+    asset: "USDT",
+    externalId: "ordinary-order",
+  }, denied.dependencies as any);
+  assert.equal(deniedResponse.status, 400);
+  assert.equal(sideEffects, 0);
+  assert.equal(denied.createdInput(), null);
+});
+
+test("stopping mainnet canary issuance still reuses an already issued USDT attempt", async () => {
+  const fixture = publicDependencies();
+  let availabilityChecks = 0;
+  let rateCalls = 0;
+  let addressCalls = 0;
+  const issued = {
+    ...(await fixture.dependencies.repository.createPendingInvoice({
+      externalId: "stopped-canary-order",
+      amountCents: 500,
+      currency: "USD",
+      network: "mainnet",
+      depositAddress,
+      reference: "STOPPED-CANARY",
+      quote: {
+        source: "usd-peg",
+        rateSnapshotId: "snapshot",
+        asset: "USDT",
+        assetDecimals: 6,
+        fiatPerAsset: 1,
+        amountAtomic: "5000000",
+        amountFormatted: "5.00 USDT",
+        fiatAmountCents: 500,
+        fiatAmount: 5,
+        fiatCurrency: "USD",
+        updatedAt: createdAt,
+        fetchedAt: createdAt,
+      },
+      createdAt,
+      expiresAt: new Date(createdAt.getTime() + 3_600_000),
+      priceLockedAt: createdAt,
+      priceLockedUntil: new Date(createdAt.getTime() + 3_600_000),
+      activationThresholdFiatMicros: "2500000",
+    })),
+    status: "PAID" as const,
+    paidAmountAtomic: "5000000",
+    paidNano: "5000000",
+  };
+  const response = await createTonhubPaymentInvoice({
+    amount: "5.00",
+    currency: "USD",
+    network: "mainnet",
+    asset: "USDT",
+    externalId: "stopped-canary-order",
+  }, {
+    ...fixture.dependencies,
+    repository: { ...fixture.dependencies.repository, findReusableInvoice: async () => issued },
+    checkoutAssetAvailable: () => { availabilityChecks += 1; return false; },
+    findRateSnapshot: async () => { rateCalls += 1; return null; },
+    createTonDepositAddress: () => { addressCalls += 1; return depositAddress; },
+  } as any);
+  assert.equal(response.status, 200);
+  assert.equal(response.body.reused, true);
+  assert.equal((response.body.invoice as any).asset, "USDT");
+  assert.equal(availabilityChecks + rateCalls + addressCalls, 0);
 });
 
 test("USDT is rejected on public testnet before rates, address allocation, or persistence", async () => {

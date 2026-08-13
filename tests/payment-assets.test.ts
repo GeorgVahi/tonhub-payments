@@ -15,7 +15,7 @@ import {
   paymentAssets,
   paymentUnitAtomic,
 } from "../shared/payment-assets";
-import { resolveCheckoutAssetPolicy } from "../backend/src/checkout-assets";
+import { isCheckoutAssetAvailable, resolveCheckoutAssetPolicy } from "../backend/src/checkout-assets";
 import { buildTonJettonTransferLink } from "../backend/src/ton/direct-payments";
 import { officialMainnetUsdtMasterFriendlyAddress } from "../backend/src/ton/mainnet-usdt";
 import { createTonQrSvg } from "../frontend/src/createTonQrSvg";
@@ -110,6 +110,49 @@ test("public USDT policy requires all independent mainnet settlement flags", () 
     TON_MOVEMENT_SETTLEMENT_ENABLED: "true",
     TON_GRAM_SETTLEMENT_MODE: "legacy",
   }).usdtMainnetEnabled, false);
+});
+
+test("mainnet USDT canary is exact-order allowlisted without public checkout exposure", () => {
+  const env = {
+    TON_USDT_MAINNET_CHECKOUT_ENABLED: "false",
+    TON_USDT_MAINNET_ADAPTER_ENABLED: "true",
+    TON_MOVEMENT_SETTLEMENT_ENABLED: "true",
+    TON_GRAM_SETTLEMENT_MODE: "ledger",
+    TON_USDT_MAINNET_CANARY_EXTERNAL_IDS: "canary-order-1,canary-order-2",
+  };
+  const policy = resolveCheckoutAssetPolicy(env);
+  assert.equal(policy.usdtMainnetEnabled, false);
+  assert.equal(policy.usdtMainnetCanaryEnabled, true);
+  assert.deepEqual(policy.checkoutAssetsByNetwork.mainnet, ["GRAM"]);
+  assert.equal(isCheckoutAssetAvailable("USDT", "mainnet", env, "canary-order-1"), true);
+  assert.equal(isCheckoutAssetAvailable("USDT", "mainnet", env, "CANARY-ORDER-1"), false);
+  assert.equal(isCheckoutAssetAvailable("USDT", "mainnet", env, "not-allowlisted"), false);
+  assert.equal(isCheckoutAssetAvailable("USDT", "testnet", env, "canary-order-1"), false);
+  assert.equal(isCheckoutAssetAvailable("GRAM", "mainnet", env), true);
+  assert.equal(isCheckoutAssetAvailable("USDT", "mainnet", {
+    ...env,
+    TON_GRAM_SETTLEMENT_MODE: "compare",
+  }, "canary-order-1"), false);
+});
+
+test("mainnet USDT canary configuration fails closed on ambiguous or oversized allowlists", () => {
+  const base = {
+    TON_USDT_MAINNET_ADAPTER_ENABLED: "true",
+    TON_MOVEMENT_SETTLEMENT_ENABLED: "true",
+    TON_GRAM_SETTLEMENT_MODE: "ledger",
+  };
+  assert.throws(() => resolveCheckoutAssetPolicy({
+    ...base,
+    TON_USDT_MAINNET_CANARY_EXTERNAL_IDS: "canary-1,,canary-2",
+  }), /non-empty/i);
+  assert.throws(() => resolveCheckoutAssetPolicy({
+    ...base,
+    TON_USDT_MAINNET_CANARY_EXTERNAL_IDS: "duplicate,duplicate",
+  }), /unique/i);
+  assert.throws(() => resolveCheckoutAssetPolicy({
+    ...base,
+    TON_USDT_MAINNET_CANARY_EXTERNAL_IDS: Array.from({ length: 21 }, (_, index) => `order-${index}`).join(","),
+  }), /at most 20/i);
 });
 
 test("the widget waits for server policy and applies USDT as the mainnet default", () => {

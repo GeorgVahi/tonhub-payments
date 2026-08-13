@@ -63,6 +63,48 @@ GRAM shadow observer, settlement, native-sweep, and asset-sweep workers before
 enabling the public switch. The GRAM observer must include mainnet so a native
 transfer sent to a USDT checkout is still discovered and valued in fiat.
 
+### Small mainnet USDT canary
+
+Run the canary without opening USDT to general checkout traffic. Keep
+`TON_USDT_MAINNET_CHECKOUT_ENABLED=false`, set the adapter and movement
+settlement flags to `true`, keep `TON_GRAM_SETTLEMENT_MODE=ledger`, and put only
+the selected merchant order IDs in `TON_USDT_MAINNET_CANARY_EXTERNAL_IDS`.
+The allowlist is exact, case-sensitive, rejects ambiguous/duplicate values, and
+is capped at 20 orders. It enables USDT creation only when the invoice request
+carries one of those `externalId` values; `/config` and the public widget remain
+GRAM-only until the separate public rollout switch is enabled.
+
+Before issuing a real invoice, apply migrations with `prisma migrate deploy`,
+start the rate, mainnet USDT observer, mainnet GRAM shadow observer, mixed
+settlement, native sweep, USDT sweep, and webhook workers, then run:
+
+```bash
+npm run canary:usdt-mainnet:status
+```
+
+The read-only command prints no keys or blockchain addresses and exits non-zero
+if the required migration or fresh USD/EUR snapshots are missing, public USDT
+was accidentally enabled, mainnet/ledger prerequisites are wrong, or an
+allowlisted order has open recovery, a failed sweep, or a failed webhook that
+must be retried and delivered before the canary continues.
+
+Issue one merchant-approved low-value order at a time through the normal invoice
+API with an allowlisted `externalId`. For each real transfer, verify in admin:
+the official master and verified deposit jetton wallet, immutable inbound
+movement, fiat allocation and terminal order state, gas top-up, confirmed USDT
+sweep and treasury receipt, retained TON reserve, and delivered webhook. Record
+the transaction hashes externally in the rollout change log. Exercise the
+supported wallets in separate bounded payments rather than combining variables
+in one transaction.
+
+Stop new issuance immediately by clearing the canary allowlist if any identity
+drift, stale rate, unexpected recovery, insufficient gas, failed/repeated
+top-up, failed sweep, or treasury mismatch appears. Keep observers, settlement,
+sweep, and webhook workers running until already issued attempts are terminal
+and all detected funds are reconciled; disabling those workers is not a safe
+rollback for an in-flight payment. Only after this live evidence is reviewed
+should the public checkout flag be enabled in the next rollout step.
+
 The frontend and backend are enough to create invoices and detect payments, but
 they do not sweep funds to the main wallet. The sweep worker must be running for
 paid deposit-wallet balances to move to `TON_*_SWEEP_RECIPIENT_ADDRESS`.
