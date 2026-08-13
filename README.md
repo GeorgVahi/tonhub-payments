@@ -237,6 +237,16 @@ cross snapshot, calculates micro-USDT with integer arithmetic, and returns a
 standard `ton://transfer` jetton link plus the unique owner address and manual
 amount fallback. The link pins the compiled official mainnet USDT master.
 
+The React widget also supports TON Connect through the official
+`@tonconnect/ui-react` client. Pass an HTTPS manifest URL through the
+`tonConnectManifestUrl` prop (the demo reads `VITE_TONCONNECT_MANIFEST_URL`).
+Connected wallets receive an explicit network-bound request: a raw native
+message for GRAM or a structured official-master jetton item for USDT. The
+request expires no later than the invoice payment window, and a submitted wallet
+request never marks the invoice paid locally; the server ledger remains the
+authority. Wallet rejection or unsupported structured jetton support leaves the
+standard wallet deeplink, QR, address, and amount available as fallbacks.
+
 New API consumers should use `asset`, `assetKind`, `assetDecimals`,
 `amountAtomic`, `amountFormatted`, and the corresponding `expected`, `paid`,
 and `remaining` neutral fields. Existing GRAM-only fields such as `amountNano`,

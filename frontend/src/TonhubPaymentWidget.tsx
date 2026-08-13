@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { Component, lazy, Suspense, useEffect, useMemo, useState, type ReactNode } from "react";
 import {
   AlertTriangle,
   CheckCircle2,
@@ -11,6 +11,34 @@ import {
   copyableAssetAmount,
   TonManualTransferFields
 } from "./TonManualTransferFields";
+import { normalizeTonConnectManifestUrl } from "./ton-connect-manifest";
+
+const TonConnectPayment = lazy(() => import("./TonConnectPayment").then((module) => ({
+  default: module.TonConnectPayment,
+})));
+
+class TonConnectFallbackBoundary extends Component<{
+  children: ReactNode;
+}, {
+  failed: boolean;
+}> {
+  state = { failed: false };
+
+  static getDerivedStateFromError() {
+    return { failed: true };
+  }
+
+  render() {
+    if (this.state.failed) {
+      return (
+        <p className="tonhub-payment-widget__ton-connect-loading" role="status">
+          Wallet connection is unavailable. Use the QR, wallet link, or manual details below.
+        </p>
+      );
+    }
+    return this.props.children;
+  }
+}
 
 type TonNetwork = "testnet" | "mainnet";
 type FiatCurrency = "EUR" | "USD";
@@ -41,6 +69,7 @@ type TonhubInvoice = {
   remainingFiatMicros: string | null;
   remainingFiatFormatted: string | null;
   address: string;
+  addressStrategy: "unique-address" | string;
   amountNano: string | null;
   amountGram: string | null;
   amountTon: string | null;
@@ -61,6 +90,7 @@ type TonhubInvoice = {
   reference: string;
   deeplink: string | null;
   status: InvoiceStatus;
+  expiresAt: string | null;
   priceLockedUntil: string | null;
   partialPaymentExpiresAt: string | null;
   quote: {
@@ -102,6 +132,7 @@ export type TonhubPaymentWidgetProps = {
   initialAsset?: PaymentAsset;
   externalId?: string;
   metadata?: unknown;
+  tonConnectManifestUrl?: string;
   onPaid?: (invoice: TonhubInvoice) => void;
 };
 
@@ -267,9 +298,14 @@ export function TonhubPaymentWidget({
   initialAsset,
   externalId,
   metadata,
+  tonConnectManifestUrl,
   onPaid
 }: TonhubPaymentWidgetProps) {
   const base = useMemo(() => normalizeApiBase(apiBase), [apiBase]);
+  const tonConnectManifest = useMemo(
+    () => normalizeTonConnectManifestUrl(tonConnectManifestUrl),
+    [tonConnectManifestUrl],
+  );
   const [amount, setAmount] = useState(initialAmount);
   const [currency, setCurrency] = useState<FiatCurrency>(initialCurrency);
   const [network, setNetwork] = useState<TonNetwork>(initialNetwork ?? "testnet");
@@ -639,6 +675,31 @@ export function TonhubPaymentWidget({
                 </div>
                 <span className="tonhub-payment-widget__status-pill">{statusLabels[invoice.status]}</span>
               </div>
+              {tonConnectManifest ? (
+                <TonConnectFallbackBoundary key={`${invoice.id}:${invoice.amountAtomic}`}>
+                  <Suspense fallback={<div className="tonhub-payment-widget__ton-connect-loading">Loading wallet connection...</div>}>
+                    <TonConnectPayment
+                      manifestUrl={tonConnectManifest}
+                      invoice={invoice}
+                      onSubmitted={() => setNotice({
+                        tone: "info",
+                        title: "Transaction submitted",
+                        message: "The wallet accepted the request. Confirmation still comes from the on-chain payment ledger.",
+                      })}
+                      onError={() => setNotice({
+                        tone: "warning",
+                        title: "Wallet did not submit the payment",
+                        message: "Try TON Connect again, open a wallet directly, or use the manual address and amount below.",
+                      })}
+                    />
+                  </Suspense>
+                </TonConnectFallbackBoundary>
+              ) : null}
+              {tonConnectManifest && qrSvg ? (
+                <div className="tonhub-payment-widget__fallback-separator" aria-hidden="true">
+                  <span>or scan / copy manually</span>
+                </div>
+              ) : null}
               {qrSvg ? (
                 <div className="tonhub-payment-widget__qr-shell">
                   <div

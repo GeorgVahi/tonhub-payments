@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { Address } from "@ton/core";
 import { getTonhubPaymentInvoice } from "../backend/src/payments";
 import type { TonhubPaymentRepository } from "../backend/src/repository";
 import type { TonhubPaymentInvoiceRecord } from "../backend/src/types";
@@ -26,6 +27,10 @@ import {
   PaymentStatusAnnouncement,
   TonhubPaymentWidget,
 } from "../frontend/src/TonhubPaymentWidget";
+import {
+  buildTonConnectTransaction,
+} from "../frontend/src/ton-connect-transaction";
+import { normalizeTonConnectManifestUrl } from "../frontend/src/ton-connect-manifest";
 
 test("the asset registry and default-off public policy keep testnet GRAM-only", async () => {
   assert.deepEqual(
@@ -175,6 +180,135 @@ test("official USDT deeplink carries the unique deposit owner, master, and micro
   assert.ok(qr);
   assert.match(qr, /viewBox="0 0 53 53"/);
   assert.match(qr, /aria-label="USDT payment QR"/);
+});
+
+test("TON Connect builds exact network-bound native and official-USDT payment requests", () => {
+  const now = new Date("2026-08-13T10:00:00.000Z");
+  const mainnetAddress = Address.parse(`0:${"21".repeat(32)}`).toString({
+    bounceable: true,
+    testOnly: false,
+  });
+  const testnetAddress = Address.parse(`0:${"22".repeat(32)}`).toString({
+    bounceable: true,
+    testOnly: true,
+  });
+  assert.equal(
+    normalizeTonConnectManifestUrl("https://merchant.example/tonconnect-manifest.json"),
+    "https://merchant.example/tonconnect-manifest.json",
+  );
+  assert.equal(normalizeTonConnectManifestUrl("http://merchant.example/manifest.json"), null);
+  assert.equal(normalizeTonConnectManifestUrl("not-a-url"), null);
+
+  assert.deepEqual(buildTonConnectTransaction({
+    network: "testnet",
+    asset: "GRAM",
+    assetKind: "NATIVE",
+    assetDecimals: 9,
+    address: testnetAddress,
+    addressStrategy: "unique-address",
+    amountAtomic: "1250000000",
+    expiresAt: "2026-08-13T10:05:00.000Z",
+    priceLockedUntil: "2026-08-13T10:05:00.000Z",
+    partialPaymentExpiresAt: null,
+  }, now), {
+    validUntil: Math.floor(now.getTime() / 1000) + 300,
+    network: "-3",
+    messages: [{ address: testnetAddress, amount: "1250000000" }],
+  });
+
+  assert.deepEqual(buildTonConnectTransaction({
+    network: "mainnet",
+    asset: "USDT",
+    assetKind: "JETTON",
+    assetDecimals: 6,
+    address: mainnetAddress,
+    addressStrategy: "unique-address",
+    amountAtomic: "12340000",
+    expiresAt: "2026-08-13T11:00:00.000Z",
+    priceLockedUntil: "2026-08-13T11:00:00.000Z",
+    partialPaymentExpiresAt: null,
+  }, now), {
+    validUntil: Math.floor(now.getTime() / 1000) + 600,
+    network: "-239",
+    items: [{
+      type: "jetton",
+      master: officialMainnetUsdtMasterFriendlyAddress,
+      destination: mainnetAddress,
+      amount: "12340000",
+    }],
+  });
+  assert.throws(() => buildTonConnectTransaction({
+    network: "mainnet",
+    asset: "USDT",
+    assetKind: "JETTON",
+    assetDecimals: 6,
+    address: mainnetAddress,
+    addressStrategy: "unique-address",
+    amountAtomic: "12340000",
+    expiresAt: "2026-08-13T09:59:59.000Z",
+    priceLockedUntil: "2026-08-13T09:59:59.000Z",
+    partialPaymentExpiresAt: null,
+  }, now), /payment window has ended/i);
+  assert.throws(() => buildTonConnectTransaction({
+    network: "mainnet",
+    asset: "FAKE",
+    assetKind: "JETTON",
+    assetDecimals: 6,
+    address: mainnetAddress,
+    addressStrategy: "unique-address",
+    amountAtomic: "12340000",
+    expiresAt: "2026-08-13T11:00:00.000Z",
+    priceLockedUntil: "2026-08-13T11:00:00.000Z",
+    partialPaymentExpiresAt: null,
+  } as never, now), /unsupported TON payment asset/i);
+  assert.throws(() => buildTonConnectTransaction({
+    network: "sandbox",
+    asset: "GRAM",
+    assetKind: "NATIVE",
+    assetDecimals: 9,
+    address: mainnetAddress,
+    addressStrategy: "unique-address",
+    amountAtomic: "12340000",
+    expiresAt: "2026-08-13T11:00:00.000Z",
+    priceLockedUntil: "2026-08-13T11:00:00.000Z",
+    partialPaymentExpiresAt: null,
+  } as never, now), /unsupported TON payment network/i);
+  assert.throws(() => buildTonConnectTransaction({
+    network: "mainnet",
+    asset: "USDT",
+    assetKind: "NATIVE",
+    assetDecimals: 9,
+    address: mainnetAddress,
+    addressStrategy: "unique-address",
+    amountAtomic: "12340000",
+    expiresAt: "2026-08-13T11:00:00.000Z",
+    priceLockedUntil: "2026-08-13T11:00:00.000Z",
+    partialPaymentExpiresAt: null,
+  } as never, now), /asset identity does not match/i);
+  assert.throws(() => buildTonConnectTransaction({
+    network: "testnet",
+    asset: "GRAM",
+    assetKind: "NATIVE",
+    assetDecimals: 9,
+    address: testnetAddress,
+    addressStrategy: "reference",
+    amountAtomic: "1250000000",
+    expiresAt: "2026-08-13T10:05:00.000Z",
+    priceLockedUntil: "2026-08-13T10:05:00.000Z",
+    partialPaymentExpiresAt: null,
+  }, now), /unique deposit address/i);
+  assert.throws(() => buildTonConnectTransaction({
+    network: "testnet",
+    asset: "GRAM",
+    assetKind: "NATIVE",
+    assetDecimals: 9,
+    address: testnetAddress,
+    addressStrategy: "unique-address",
+    amountAtomic: "1250000000",
+    expiresAt: null,
+    priceLockedUntil: null,
+    partialPaymentExpiresAt: null,
+  }, now), /authoritative payment deadline/i);
 });
 
 test("atomic conversion is exact for native GRAM and six-decimal USDT", () => {

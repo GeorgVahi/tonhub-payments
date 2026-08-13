@@ -14,6 +14,7 @@ function DemoApp() {
       <TonhubPaymentWidget
         apiBase={import.meta.env.VITE_TONHUB_PAYMENTS_API_BASE || "/api/tonhub-payments"}
         initialNetwork={defaultNetwork}
+        tonConnectManifestUrl={import.meta.env.VITE_TONCONNECT_MANIFEST_URL}
       />
     </main>
   );

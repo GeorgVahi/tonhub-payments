@@ -281,6 +281,55 @@
   font-size: 1.05rem;
 }
 
+.tonhub-payment-widget__ton-connect {
+  display: grid;
+  grid-template-columns: auto minmax(180px, 1fr);
+  gap: 10px;
+  align-items: center;
+  border: 1px solid var(--tonhub-line);
+  border-radius: 8px;
+  background: var(--tonhub-panel-muted);
+  padding: 11px;
+}
+
+.tonhub-payment-widget__ton-connect-button {
+  min-width: 172px;
+}
+
+.tonhub-payment-widget__ton-connect > p {
+  grid-column: 2;
+  margin: 0;
+  color: var(--tonhub-muted-strong);
+  font-size: 0.88rem;
+  line-height: 1.45;
+}
+
+.tonhub-payment-widget__ton-connect-loading {
+  min-height: 58px;
+  border: 1px solid var(--tonhub-line);
+  border-radius: 8px;
+  background: var(--tonhub-panel-muted);
+  color: var(--tonhub-muted-strong);
+  padding: 18px;
+}
+
+.tonhub-payment-widget__fallback-separator {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  color: var(--tonhub-muted);
+  font-size: 0.78rem;
+  text-align: center;
+}
+
+.tonhub-payment-widget__fallback-separator::before,
+.tonhub-payment-widget__fallback-separator::after {
+  height: 1px;
+  flex: 1;
+  background: var(--tonhub-line);
+  content: "";
+}
+
 .tonhub-payment-widget__status-pill {
   display: inline-flex;
   min-height: 30px;
@@ -575,6 +624,16 @@
   .tonhub-payment-widget__paybox-header {
     align-items: flex-start;
     flex-direction: column;
+  }
+
+  .tonhub-payment-widget__ton-connect {
+    grid-template-columns: 1fr;
+  }
+
+  .tonhub-payment-widget__ton-connect-button,
+  .tonhub-payment-widget__ton-connect > p {
+    grid-column: 1;
+    justify-self: stretch;
   }
 
   .tonhub-payment-widget__primary {
