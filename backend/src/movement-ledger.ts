@@ -745,6 +745,84 @@ export function createMovementLedger(db: PrismaLike) {
       });
     },
 
+    recordRejected: async (input: {
+      movement: PaymentMovementDraft;
+      validationCode: string;
+      reason: string;
+      title: string;
+      details: Record<string, unknown>;
+    }) => {
+      const draft = validateMovementDraft(input.movement);
+      const validationCode = requiredText(input.validationCode, "Movement validationCode");
+      const reason = requiredText(input.reason, "Recovery reason");
+      const title = requiredText(input.title, "Recovery title");
+      const details = canonicalJsonValue(input.details) as Record<string, unknown>;
+      return db.$transaction(async (tx) => {
+        await tx.tonhubPaymentMovement.createMany({
+          data: [{
+            ...draft,
+            status: "REJECTED",
+            validationCode,
+            rawPayload: draft.rawPayload === null
+              ? Prisma.DbNull
+              : draft.rawPayload as Prisma.InputJsonValue,
+          }],
+          skipDuplicates: true,
+        });
+        const stored = await tx.tonhubPaymentMovement.findUnique({
+          where: { fingerprint: draft.fingerprint },
+        });
+        if (!stored) {
+          throw new Error(`Rejected movement was not persisted: ${draft.fingerprint}.`);
+        }
+        const movement = normalizeMovement(stored);
+        if (movementFactsIdentity(movement) !== movementFactsIdentity(draft)) {
+          throw new MovementFingerprintConflictError(draft.fingerprint);
+        }
+        if (movement.status !== "REJECTED" || movement.validationCode !== validationCode) {
+          throw new MovementAllocationConflictError(
+            `Movement ${movement.id} already has a different validation lifecycle.`,
+          );
+        }
+        const deposit = movement.depositAddressId
+          ? await tx.tonhubDepositAddress.findUnique({
+              where: { id: movement.depositAddressId },
+              include: { invoice: { select: { id: true, orderId: true } } },
+            })
+          : null;
+        const recoveryId = `rejected:${movement.id}`;
+        await tx.tonhubRecoveryCase.createMany({
+          data: {
+            id: recoveryId,
+            movementId: movement.id,
+            orderId: deposit?.invoice?.orderId ?? null,
+            invoiceId: deposit?.invoice?.id ?? null,
+            reason,
+            title,
+            details: details as Prisma.InputJsonValue,
+          },
+          skipDuplicates: true,
+        });
+        const recovery = await tx.tonhubRecoveryCase.findUnique({
+          where: { id: recoveryId },
+        });
+        if (
+          !recovery ||
+          recovery.movementId !== movement.id ||
+          recovery.orderId !== (deposit?.invoice?.orderId ?? null) ||
+          recovery.invoiceId !== (deposit?.invoice?.id ?? null) ||
+          recovery.reason !== reason ||
+          recovery.title !== title ||
+          jsonIdentity(recovery.details) !== jsonIdentity(details)
+        ) {
+          throw new MovementAllocationConflictError(
+            `Movement ${movement.id} recovery evidence conflicts with its immutable rejection.`,
+          );
+        }
+        return movement;
+      });
+    },
+
     creditMovement: async (input: {
       movementId: string;
       orderId: string;

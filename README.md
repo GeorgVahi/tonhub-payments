@@ -252,8 +252,17 @@ npm run worker:scan:jetton-testnet -- --deposit-id=<id> --not-before=<ISO date>
 
 Use `--not-after`, `--limit`, and `--offset` for a bounded historical page.
 The adapter follows TON Center's `/jetton/masters`, `/jetton/wallets`, and
-wallet-bound `/jetton/transfers` contracts; fake-master and malformed-transfer
-hardening remain a separate rollout gate before any public jetton support.
+wallet-bound `/jetton/transfers` contracts. It correlates the official
+`/transactions` response by trace to verify the destination wallet and raw
+notification when present. Fake-master and malformed-transfer hardening rejects
+aborted or malformed transfers, wrong master-to-wallet identity, and malformed
+raw notifications. A raw notification must have opcode `0x7362d09c` and matching
+query, amount, and sender facts. Symbol, name, image, and other token metadata
+are never authentication evidence. A separate owner-only discovery pass can
+only produce rejection evidence; it can never credit a payment.
+Structurally valid unsupported jetton candidates are journaled as `REJECTED`
+with an open recovery case; they cannot be allocated as payment and do not
+create an automatic asset sweep.
 
 The GRAM `/check` read path has been cut over to the same strict movement facts.
 It resolves the deposit relation as the scan owner, synchronously journals the

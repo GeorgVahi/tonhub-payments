@@ -1,3 +1,5 @@
+import { Buffer } from "node:buffer";
+import { Cell } from "@ton/core";
 import { paymentAssets } from "../../../shared/payment-assets";
 import type { PaymentMovementDraft } from "../movement-ledger";
 import {
@@ -38,6 +40,15 @@ export type TonCenterJettonTransfer = {
   transaction_now?: unknown;
 };
 
+export type TonCenterJettonNotification = {
+  traceId?: unknown;
+  accountAddress?: unknown;
+  walletAddress?: unknown;
+  destinationAddress?: unknown;
+  transactionAborted?: unknown;
+  body?: unknown;
+};
+
 export type InternalTestnetJettonRejectionCode =
   | "TRANSACTION_ID_INVALID"
   | "TRANSACTION_TIME_INVALID"
@@ -45,14 +56,20 @@ export type InternalTestnetJettonRejectionCode =
   | "TRANSACTION_NOT_SUCCESSFUL"
   | "QUERY_ID_INVALID"
   | "MASTER_MISMATCH"
+  | "WALLET_MISMATCH"
   | "DESTINATION_MISMATCH"
   | "SOURCE_INVALID"
   | "SOURCE_WALLET_INVALID"
-  | "AMOUNT_INVALID";
+  | "AMOUNT_INVALID"
+  | "NOTIFICATION_MALFORMED"
+  | "NOTIFICATION_OPCODE_MISMATCH"
+  | "NOTIFICATION_FACTS_MISMATCH";
 
 export type InternalTestnetJettonRejection = {
+  transferIndex: number;
   transactionHash: string | null;
   transactionLt: string | null;
+  observedAssetWalletAddress: string | null;
   code: InternalTestnetJettonRejectionCode;
 };
 
@@ -63,7 +80,16 @@ type PrismaLike = {
 
 type MovementLedgerLike = {
   recordObserved: (movement: PaymentMovementDraft) => Promise<unknown>;
+  recordRejected: (input: {
+    movement: PaymentMovementDraft;
+    validationCode: string;
+    reason: string;
+    title: string;
+    details: Record<string, unknown>;
+  }) => Promise<unknown>;
 };
+
+export const jettonTransferNotificationOpcode = 0x7362d09c;
 
 type AdapterDependencies = {
   db: PrismaLike;
@@ -78,17 +104,26 @@ function text(value: unknown) {
   return typeof value === "string" && value.trim() ? value.trim() : null;
 }
 
-function canonicalInteger(value: unknown, options: { positive?: boolean } = {}) {
+const uint64Max = (BigInt(1) << BigInt(64)) - BigInt(1);
+const jettonAmountMax = (BigInt(1) << BigInt(120)) - BigInt(1);
+
+function canonicalInteger(value: unknown, options: {
+  positive?: boolean;
+  max?: bigint;
+} = {}) {
   const raw = text(value);
   if (!raw || !/^\d+$/.test(raw)) {
     return null;
   }
   const normalized = BigInt(raw).toString();
-  return options.positive && normalized === "0" ? null : normalized;
+  if (options.positive && normalized === "0") {
+    return null;
+  }
+  return options.max !== undefined && BigInt(normalized) > options.max ? null : normalized;
 }
 
 function transactionDate(value: unknown) {
-  if (!Number.isSafeInteger(value) || Number(value) <= 0) {
+  if (!Number.isSafeInteger(value) || Number(value) <= 0 || Number(value) > 0xffffffff) {
     return null;
   }
   const result = new Date(Number(value) * 1000);
@@ -97,6 +132,66 @@ function transactionDate(value: unknown) {
 
 function validDate(value: unknown): value is Date {
   return value instanceof Date && !Number.isNaN(value.getTime());
+}
+
+function strictBocBytes(value: unknown) {
+  const raw = text(value);
+  if (!raw || !/^[A-Za-z0-9+/_-]+={0,2}$/.test(raw) || raw.length % 4 === 1) {
+    return null;
+  }
+  const standardUnpadded = raw
+    .replace(/=+$/u, "")
+    .replace(/-/gu, "+")
+    .replace(/_/gu, "/");
+  try {
+    const bytes = Buffer.from(
+      `${standardUnpadded}${"=".repeat((4 - standardUnpadded.length % 4) % 4)}`,
+      "base64",
+    );
+    if (!bytes.length || bytes.toString("base64").replace(/=+$/u, "") !== standardUnpadded) {
+      return null;
+    }
+    return bytes;
+  } catch {
+    return null;
+  }
+}
+
+export function parseJettonTransferNotificationBody(value: unknown) {
+  const bytes = strictBocBytes(value);
+  if (!bytes) {
+    return null;
+  }
+  try {
+    const cells = Cell.fromBoc(bytes);
+    if (cells.length !== 1) {
+      return null;
+    }
+    const slice = cells[0].beginParse();
+    const opcode = slice.loadUint(32);
+    const queryId = slice.loadUintBig(64).toString();
+    const amountAtomic = slice.loadCoins().toString();
+    const sender = slice.loadAddress();
+    if (!sender || slice.remainingBits < 1) {
+      return null;
+    }
+    const payloadByReference = slice.loadBit();
+    if (payloadByReference) {
+      if (slice.remainingBits !== 0 || slice.remainingRefs !== 1) {
+        return null;
+      }
+      slice.loadRef();
+    }
+    return {
+      body: bytes.toString("base64"),
+      opcode,
+      queryId,
+      amountAtomic,
+      senderAddress: sender.toRawString(),
+    };
+  } catch {
+    return null;
+  }
 }
 
 function parseBooleanFlag(value: unknown) {
@@ -156,10 +251,14 @@ async function fetchJson(input: {
 function rejection(
   transfer: TonCenterJettonTransfer,
   code: InternalTestnetJettonRejectionCode,
+  transferIndex: number,
+  observedAssetWalletAddress: string | null = null,
 ): InternalTestnetJettonRejection {
   return {
+    transferIndex,
     transactionHash: canonicalTonTransactionHash(transfer.transaction_hash),
-    transactionLt: canonicalInteger(transfer.transaction_lt),
+    transactionLt: canonicalInteger(transfer.transaction_lt, { max: uint64Max }),
+    observedAssetWalletAddress,
     code,
   };
 }
@@ -172,6 +271,7 @@ export function scanInternalTestnetJettonTransfers(input: {
   notBefore: Date;
   notAfter: Date;
   transfers: TonCenterJettonTransfer[];
+  notifications?: TonCenterJettonNotification[];
 }) {
   const ownerAddress = canonicalTonAddress(input.ownerAddress);
   const masterAddress = canonicalTonAddress(input.masterAddress);
@@ -189,58 +289,133 @@ export function scanInternalTestnetJettonTransfers(input: {
 
   const movements: PaymentMovementDraft[] = [];
   const rejections: InternalTestnetJettonRejection[] = [];
-  for (const transfer of input.transfers) {
+  for (const [transferIndex, transfer] of input.transfers.entries()) {
     const transactionHash = canonicalTonTransactionHash(transfer.transaction_hash);
-    const transactionLt = canonicalInteger(transfer.transaction_lt, { positive: true });
+    const transactionLt = canonicalInteger(transfer.transaction_lt, { positive: true, max: uint64Max });
     if (!transactionHash || !transactionLt) {
-      rejections.push(rejection(transfer, "TRANSACTION_ID_INVALID"));
+      rejections.push(rejection(transfer, "TRANSACTION_ID_INVALID", transferIndex));
       continue;
     }
     const blockchainAt = transactionDate(transfer.transaction_now);
     if (!blockchainAt) {
-      rejections.push(rejection(transfer, "TRANSACTION_TIME_INVALID"));
+      rejections.push(rejection(transfer, "TRANSACTION_TIME_INVALID", transferIndex));
       continue;
     }
     if (
       blockchainAt.getTime() < input.notBefore.getTime() ||
       blockchainAt.getTime() > input.notAfter.getTime()
     ) {
-      rejections.push(rejection(transfer, "TRANSACTION_OUTSIDE_WINDOW"));
+      rejections.push(rejection(transfer, "TRANSACTION_OUTSIDE_WINDOW", transferIndex));
       continue;
     }
     if (transfer.transaction_aborted !== false) {
-      rejections.push(rejection(transfer, "TRANSACTION_NOT_SUCCESSFUL"));
+      rejections.push(rejection(transfer, "TRANSACTION_NOT_SUCCESSFUL", transferIndex));
       continue;
     }
-    const queryId = canonicalInteger(transfer.query_id);
+    const queryId = canonicalInteger(transfer.query_id, { max: uint64Max });
     if (!queryId) {
-      rejections.push(rejection(transfer, "QUERY_ID_INVALID"));
-      continue;
-    }
-    if (canonicalTonAddress(transfer.jetton_master) !== masterAddress) {
-      rejections.push(rejection(transfer, "MASTER_MISMATCH"));
+      rejections.push(rejection(transfer, "QUERY_ID_INVALID", transferIndex));
       continue;
     }
     if (canonicalTonAddress(transfer.destination) !== ownerAddress) {
-      rejections.push(rejection(transfer, "DESTINATION_MISMATCH"));
+      rejections.push(rejection(transfer, "DESTINATION_MISMATCH", transferIndex));
       continue;
     }
     const source = canonicalTonAddress(transfer.source);
     if (!source) {
-      rejections.push(rejection(transfer, "SOURCE_INVALID"));
+      rejections.push(rejection(transfer, "SOURCE_INVALID", transferIndex));
       continue;
     }
     const sourceWallet = canonicalTonAddress(transfer.source_wallet);
     if (!sourceWallet) {
-      rejections.push(rejection(transfer, "SOURCE_WALLET_INVALID"));
+      rejections.push(rejection(transfer, "SOURCE_WALLET_INVALID", transferIndex));
       continue;
     }
-    const amountAtomic = canonicalInteger(transfer.amount, { positive: true });
+    const amountAtomic = canonicalInteger(transfer.amount, { positive: true, max: jettonAmountMax });
     if (!amountAtomic) {
-      rejections.push(rejection(transfer, "AMOUNT_INVALID"));
+      rejections.push(rejection(transfer, "AMOUNT_INVALID", transferIndex));
       continue;
     }
     const traceId = canonicalTonTransactionHash(transfer.trace_id);
+    const notificationMatches = traceId
+      ? (input.notifications ?? []).filter((value) =>
+          canonicalTonTransactionHash(value.traceId) === traceId)
+      : [];
+    if (notificationMatches.length > 1) {
+      rejections.push(rejection(transfer, "NOTIFICATION_MALFORMED", transferIndex));
+      continue;
+    }
+    const notificationEvidence = notificationMatches[0] ?? null;
+    const notificationWallet = notificationEvidence
+      ? canonicalTonAddress(notificationEvidence.walletAddress)
+      : null;
+    if (
+      notificationEvidence &&
+      (
+        notificationEvidence.transactionAborted !== false ||
+        canonicalTonAddress(notificationEvidence.accountAddress) !== ownerAddress ||
+        canonicalTonAddress(notificationEvidence.destinationAddress) !== ownerAddress ||
+        !notificationWallet
+      )
+    ) {
+      rejections.push(rejection(transfer, "NOTIFICATION_MALFORMED", transferIndex));
+      continue;
+    }
+    const notification = notificationEvidence
+      ? parseJettonTransferNotificationBody(notificationEvidence.body)
+      : null;
+    if (notificationEvidence && !notification) {
+      rejections.push(rejection(
+        transfer,
+        "NOTIFICATION_MALFORMED",
+        transferIndex,
+        notificationWallet,
+      ));
+      continue;
+    }
+    if (notification && notification.opcode !== jettonTransferNotificationOpcode) {
+      rejections.push(rejection(
+        transfer,
+        "NOTIFICATION_OPCODE_MISMATCH",
+        transferIndex,
+        notificationWallet,
+      ));
+      continue;
+    }
+    if (
+      notification &&
+      (
+        notification.queryId !== queryId ||
+        notification.amountAtomic !== amountAtomic ||
+        notification.senderAddress !== source
+      )
+    ) {
+      rejections.push(rejection(
+        transfer,
+        "NOTIFICATION_FACTS_MISMATCH",
+        transferIndex,
+        notificationWallet,
+      ));
+      continue;
+    }
+    if (canonicalTonAddress(transfer.jetton_master) !== masterAddress) {
+      rejections.push(rejection(
+        transfer,
+        "MASTER_MISMATCH",
+        transferIndex,
+        notificationWallet,
+      ));
+      continue;
+    }
+    if (notificationWallet && notificationWallet !== assetWalletAddress) {
+      rejections.push(rejection(
+        transfer,
+        "WALLET_MISMATCH",
+        transferIndex,
+        notificationWallet,
+      ));
+      continue;
+    }
     const asset = paymentAssets.USDT;
     movements.push({
       fingerprint: `ton:testnet:jetton-in:${transactionHash}:${queryId}:${masterAddress}`,
@@ -277,10 +452,110 @@ export function scanInternalTestnetJettonTransfers(input: {
           transactionLt,
           transactionNow: Math.floor(blockchainAt.getTime() / 1000),
         },
+        ...(notification
+          ? {
+              notification: {
+                body: notification.body,
+                opcode: `0x${notification.opcode.toString(16).padStart(8, "0")}`,
+                queryId: notification.queryId,
+                amount: notification.amountAtomic,
+                sender: notification.senderAddress,
+              },
+            }
+          : {}),
       },
     });
   }
   return { movements, rejections };
+}
+
+function rejectedJettonCandidate(input: {
+  depositAddressId: string;
+  ownerAddress: string;
+  configuredMaster: string;
+  verifiedAssetWalletAddress: string;
+  observedAssetWalletAddress: string;
+  notBefore: Date;
+  notAfter: Date;
+  transfer: TonCenterJettonTransfer;
+  code: "MASTER_MISMATCH" | "WALLET_MISMATCH";
+}) {
+  const transactionHash = canonicalTonTransactionHash(input.transfer.transaction_hash);
+  const transactionLt = canonicalInteger(input.transfer.transaction_lt, {
+    positive: true,
+    max: uint64Max,
+  });
+  const blockchainAt = transactionDate(input.transfer.transaction_now);
+  const queryId = canonicalInteger(input.transfer.query_id, { max: uint64Max });
+  const actualMaster = canonicalTonAddress(input.transfer.jetton_master);
+  const actualWallet = canonicalTonAddress(input.observedAssetWalletAddress);
+  const destination = canonicalTonAddress(input.transfer.destination);
+  const source = canonicalTonAddress(input.transfer.source);
+  const sourceWallet = canonicalTonAddress(input.transfer.source_wallet);
+  const amountAtomic = canonicalInteger(input.transfer.amount, {
+    positive: true,
+    max: jettonAmountMax,
+  });
+  if (
+    !transactionHash ||
+    !transactionLt ||
+    !blockchainAt ||
+    blockchainAt.getTime() < input.notBefore.getTime() ||
+    blockchainAt.getTime() > input.notAfter.getTime() ||
+    input.transfer.transaction_aborted !== false ||
+    !queryId ||
+    !actualMaster ||
+    !actualWallet ||
+    destination !== input.ownerAddress ||
+    !source ||
+    !sourceWallet ||
+    !amountAtomic
+  ) {
+    return null;
+  }
+  const asset = paymentAssets.USDT;
+  return {
+    fingerprint: `ton:testnet:jetton-rejected:${transactionHash}:${queryId}:${actualMaster}:${actualWallet}`,
+    depositAddressId: input.depositAddressId,
+    network: "testnet" as const,
+    direction: "INCOMING" as const,
+    asset: asset.symbol,
+    assetKind: asset.kind,
+    assetDecimals: asset.decimals,
+    amountAtomic,
+    fromAddress: source,
+    toAddress: input.ownerAddress,
+    ownerAddress: input.ownerAddress,
+    jettonMasterAddress: actualMaster,
+    jettonWalletAddress: actualWallet,
+    transactionHash,
+    transactionLt,
+    traceId: canonicalTonTransactionHash(input.transfer.trace_id),
+    queryId,
+    blockchainAt,
+    rawPayload: {
+      evidenceVersion: 1,
+      provider: "toncenter-v3-jetton-transfers",
+      internalTestAsset: true,
+      untrustedJettonCandidate: true,
+      rejectionCode: input.code,
+      configuredMasterAddress: input.configuredMaster,
+      verifiedAssetWalletAddress: input.verifiedAssetWalletAddress,
+      transfer: {
+        amount: amountAtomic,
+        destination: input.ownerAddress,
+        jettonMaster: actualMaster,
+        jettonWallet: actualWallet,
+        queryId,
+        source,
+        sourceWallet,
+        transactionAborted: false,
+        transactionHash,
+        transactionLt,
+        transactionNow: Math.floor(blockchainAt.getTime() / 1000),
+      },
+    },
+  } satisfies PaymentMovementDraft;
 }
 
 function requireRecord(value: unknown, field: string) {
@@ -295,6 +570,46 @@ function requireArray(value: unknown, field: string) {
     throw new Error(`${field} response must be an array.`);
   }
   return value;
+}
+
+function notificationEvidenceFromTransactions(value: unknown) {
+  return requireArray(value, "Notification transactions").flatMap((candidate) => {
+    if (!candidate || typeof candidate !== "object" || Array.isArray(candidate)) {
+      return [];
+    }
+    const transaction = candidate as Record<string, unknown>;
+    const traceId = canonicalTonTransactionHash(transaction.trace_id);
+    const inMessage = transaction.in_msg &&
+      typeof transaction.in_msg === "object" &&
+      !Array.isArray(transaction.in_msg)
+      ? transaction.in_msg as Record<string, unknown>
+      : null;
+    if (!traceId || !inMessage) {
+      return [];
+    }
+    const description = transaction.description &&
+      typeof transaction.description === "object" &&
+      !Array.isArray(transaction.description)
+      ? transaction.description as Record<string, unknown>
+      : null;
+    const messageContent = inMessage.message_content &&
+      typeof inMessage.message_content === "object" &&
+      !Array.isArray(inMessage.message_content)
+      ? inMessage.message_content as Record<string, unknown>
+      : null;
+    return [{
+      traceId,
+      accountAddress: transaction.account,
+      walletAddress: inMessage.source,
+      destinationAddress: inMessage.destination,
+      transactionAborted: description?.aborted === false &&
+        Array.isArray(transaction.out_msgs) &&
+        transaction.out_msgs.length === 0
+        ? false
+        : true,
+      body: messageContent?.body,
+    } satisfies TonCenterJettonNotification];
+  });
 }
 
 function assertAccountIdentity(account: any, input: {
@@ -464,6 +779,46 @@ export function createInternalTestnetJettonAdapter(dependencies: AdapterDependen
         },
         fetchImpl,
       }), "Jetton transfers");
+      const discoveryPayload = requireRecord(await fetchJson({
+        config: readConfig,
+        path: "jetton/transfers",
+        search: {
+          owner_address: ownerAddressRaw,
+          direction: "in",
+          start_utime: startUtime,
+          end_utime: endUtime,
+          limit,
+          offset,
+          sort: "asc",
+        },
+        fetchImpl,
+      }), "Jetton discovery transfers");
+      const notificationPayload = requireRecord(await fetchJson({
+        config: readConfig,
+        path: "transactions",
+        search: {
+          account: ownerAddressRaw,
+          start_utime: startUtime,
+          end_utime: endUtime,
+          limit: 1000,
+          offset: 0,
+          sort: "asc",
+        },
+        fetchImpl,
+      }), "Notification transactions");
+      const transfers = requireArray(
+        transfersPayload.jetton_transfers,
+        "Jetton transfers",
+      ) as TonCenterJettonTransfer[];
+      const discoveryTransfers = requireArray(
+        discoveryPayload.jetton_transfers,
+        "Jetton discovery transfers",
+      ) as TonCenterJettonTransfer[];
+      const notificationTransactions = requireArray(
+        notificationPayload.transactions,
+        "Notification transactions",
+      );
+      const notifications = notificationEvidenceFromTransactions(notificationTransactions);
       const parsed = scanInternalTestnetJettonTransfers({
         depositAddressId: deposit.id,
         ownerAddress: ownerAddressRaw,
@@ -471,16 +826,120 @@ export function createInternalTestnetJettonAdapter(dependencies: AdapterDependen
         assetWalletAddress,
         notBefore: input.notBefore,
         notAfter: input.notAfter,
-        transfers: requireArray(transfersPayload.jetton_transfers, "Jetton transfers") as TonCenterJettonTransfer[],
+        transfers,
+        notifications,
       });
+      const discovered = scanInternalTestnetJettonTransfers({
+        depositAddressId: deposit.id,
+        ownerAddress: ownerAddressRaw,
+        masterAddress: configuredMaster,
+        assetWalletAddress,
+        notBefore: input.notBefore,
+        notAfter: input.notAfter,
+        transfers: discoveryTransfers,
+        notifications,
+      });
+      const observedWallets = new Map<string, string | null>();
+      const resolveObservedWallet = async (masterAddress: string) => {
+        if (observedWallets.has(masterAddress)) {
+          return observedWallets.get(masterAddress) ?? null;
+        }
+        const payload = requireRecord(await fetchJson({
+          config: readConfig,
+          path: "jetton/wallets",
+          search: {
+            owner_address: ownerAddressRaw,
+            jetton_address: masterAddress,
+            limit: 10,
+          },
+          fetchImpl,
+        }), "Rejected jetton wallets");
+        const addresses = [...new Set(requireArray(payload.jetton_wallets, "Rejected jetton wallets")
+          .flatMap((value) => {
+            if (!value || typeof value !== "object" || Array.isArray(value)) {
+              return [];
+            }
+            const wallet = value as Record<string, unknown>;
+            const address = canonicalTonAddress(wallet.address);
+            return canonicalTonAddress(wallet.owner) === ownerAddressRaw &&
+              canonicalTonAddress(wallet.jetton) === masterAddress &&
+              address
+              ? [address]
+              : [];
+          }))];
+        const resolved = addresses.length === 1 ? addresses[0] : null;
+        observedWallets.set(masterAddress, resolved);
+        return resolved;
+      };
+      let rejectionsRecorded = 0;
+      const recordedFingerprints = new Set<string>();
+      for (const source of [
+        { rejections: parsed.rejections, transfers },
+        { rejections: discovered.rejections, transfers: discoveryTransfers },
+      ]) {
+        for (const rejected of source.rejections) {
+          if (rejected.code !== "MASTER_MISMATCH" && rejected.code !== "WALLET_MISMATCH") {
+            continue;
+          }
+          const transfer = source.transfers[rejected.transferIndex];
+          if (!transfer) {
+            continue;
+          }
+          const observedMaster = canonicalTonAddress(transfer.jetton_master);
+          const observedAssetWalletAddress = rejected.observedAssetWalletAddress ?? (
+            observedMaster ? await resolveObservedWallet(observedMaster) : null
+          );
+          if (!observedAssetWalletAddress) {
+            continue;
+          }
+          const candidate = rejectedJettonCandidate({
+            depositAddressId: deposit.id,
+            ownerAddress: ownerAddressRaw,
+            configuredMaster,
+            verifiedAssetWalletAddress: assetWalletAddress,
+            observedAssetWalletAddress,
+            notBefore: input.notBefore,
+            notAfter: input.notAfter,
+            transfer,
+            code: rejected.code,
+          });
+          if (!candidate || recordedFingerprints.has(candidate.fingerprint)) {
+            continue;
+          }
+          await dependencies.ledger.recordRejected({
+            movement: candidate,
+            validationCode: rejected.code === "MASTER_MISMATCH"
+              ? "JETTON_MASTER_NOT_ALLOWLISTED"
+              : "JETTON_WALLET_NOT_VERIFIED",
+            reason: rejected.code === "MASTER_MISMATCH"
+              ? "UNSUPPORTED_JETTON_MASTER"
+              : "UNVERIFIED_JETTON_WALLET",
+            title: rejected.code === "MASTER_MISMATCH"
+              ? "Unsupported jetton received by a deposit address"
+              : "Jetton transfer references an unverified wallet",
+            details: {
+              configuredMasterAddress: configuredMaster,
+              verifiedAssetWalletAddress: assetWalletAddress,
+              observedMasterAddress: candidate.jettonMasterAddress,
+              observedAssetWalletAddress: candidate.jettonWalletAddress,
+              transactionHash: candidate.transactionHash,
+            },
+          });
+          recordedFingerprints.add(candidate.fingerprint);
+          rejectionsRecorded += 1;
+        }
+      }
       for (const movement of parsed.movements) {
         await dependencies.ledger.recordObserved(movement);
       }
       return {
         account,
-        transfersScanned: requireArray(transfersPayload.jetton_transfers, "Jetton transfers").length,
+        transfersScanned: transfers.length,
+        discoveryTransfersScanned: discoveryTransfers.length,
+        notificationTransactionsScanned: notificationTransactions.length,
         movementsObserved: parsed.movements.length,
-        rejections: parsed.rejections,
+        rejectionsRecorded,
+        rejections: [...parsed.rejections, ...discovered.rejections],
         nextOffset: offset + limit,
       };
     },

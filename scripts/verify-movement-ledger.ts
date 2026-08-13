@@ -487,6 +487,9 @@ try {
           }],
         }), { status: 200 });
       }
+      if (url.pathname.endsWith("/transactions")) {
+        return new Response(JSON.stringify({ transactions: [] }), { status: 200 });
+      }
       return new Response(JSON.stringify({
         jetton_transfers: [{
           amount: "5000000",
@@ -529,6 +532,49 @@ try {
   assert.equal(internalMovement.asset, "USDT");
   assert.equal(internalMovement.assetDecimals, 6);
   assert.equal((internalMovement.rawPayload as any).internalTestAsset, true);
+  const rejectedJettonDraft = {
+    fingerprint: `ton:testnet:jetton-rejected:${"d4".repeat(32)}:85:${internalMasterRaw}:${internalWalletRaw}`,
+    depositAddressId: internalDepositId,
+    network: "testnet" as const,
+    direction: "INCOMING" as const,
+    asset: "USDT" as const,
+    assetKind: "JETTON" as const,
+    assetDecimals: 6,
+    amountAtomic: "5000000",
+    fromAddress: internalSenderRaw,
+    toAddress: internalOwnerRaw,
+    ownerAddress: internalOwnerRaw,
+    jettonMasterAddress: internalMasterRaw,
+    jettonWalletAddress: internalWalletRaw,
+    transactionHash: "d4".repeat(32),
+    transactionLt: "910002",
+    traceId: null,
+    queryId: "85",
+    blockchainAt: new Date("2026-08-13T10:20:00.000Z"),
+    rawPayload: { untrustedJettonCandidate: true },
+  };
+  const rejectedJetton = await ledger.recordRejected({
+    movement: rejectedJettonDraft,
+    validationCode: "JETTON_MASTER_NOT_ALLOWLISTED",
+    reason: "UNSUPPORTED_JETTON_MASTER",
+    title: "Unsupported jetton received by a deposit address",
+    details: { configuredMasterAddress: internalMasterRaw },
+  });
+  const rejectedReplay = await ledger.recordRejected({
+    movement: rejectedJettonDraft,
+    validationCode: "JETTON_MASTER_NOT_ALLOWLISTED",
+    reason: "UNSUPPORTED_JETTON_MASTER",
+    title: "Unsupported jetton received by a deposit address",
+    details: { configuredMasterAddress: internalMasterRaw },
+  });
+  assert.equal(rejectedJetton.status, "REJECTED");
+  assert.equal(rejectedReplay.id, rejectedJetton.id);
+  assert.equal(await prisma.tonhubRecoveryCase.count({
+    where: { movementId: rejectedJetton.id, reason: "UNSUPPORTED_JETTON_MASTER" },
+  }), 1);
+  assert.equal(await prisma.tonhubAssetSweep.count({
+    where: { depositAddressId: internalDepositId, asset: "USDT" },
+  }), 0);
 } finally {
   await prisma.$disconnect();
 }

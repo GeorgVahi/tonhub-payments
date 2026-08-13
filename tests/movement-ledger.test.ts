@@ -208,6 +208,14 @@ function createMemoryLedgerDb() {
       },
     },
     tonhubDepositAddress: {
+      findUnique: async ({ where }: any) => {
+        const deposit = deposits.find((row) => matches(row, where));
+        if (!deposit) {
+          return null;
+        }
+        const invoice = invoices.find((row) => row.depositAddress?.id === deposit.id) ?? null;
+        return { ...deposit, invoice };
+      },
       updateMany: async ({ where, data }: any) => {
         const rows = deposits.filter((row) => matches(row, where));
         rows.forEach((row) => Object.assign(row, data));
@@ -215,9 +223,11 @@ function createMemoryLedgerDb() {
       },
     },
     tonhubRecoveryCase: {
+      findUnique: async ({ where }: any) => recoveryCases.find((row) => matches(row, where)) ?? null,
       createMany: async ({ data, skipDuplicates }: any) => {
-        const duplicate = recoveryCases.some((row) =>
-          row.movementId === data.movementId && row.reason === data.reason);
+        const duplicate = recoveryCases.some((row) => row.id === data.id || (
+          row.movementId === data.movementId && row.reason === data.reason
+        ));
         if (duplicate && skipDuplicates) {
           return { count: 0 };
         }
@@ -274,6 +284,75 @@ test("movement valuation floors exact atomic asset value to fiat micros", () => 
     assetDecimals: 6,
     price: "1",
   }), /positive atomic integer/);
+});
+
+test("a rejected unsupported jetton is journaled once for recovery and can never credit an order", async () => {
+  const memory = createMemoryLedgerDb();
+  const ledger = createMovementLedger(memory.db);
+  const rejected = movement({
+    fingerprint: "ton:testnet:jetton-rejected:fake-master",
+    asset: "USDT",
+    assetKind: "JETTON",
+    assetDecimals: 6,
+    amountAtomic: "5000000",
+    jettonMasterAddress: "EQ_FAKE_MASTER",
+    jettonWalletAddress: "EQ_VERIFIED_DEPOSIT_WALLET",
+    transactionHash: "fake-master-transaction",
+    rawPayload: { untrustedJettonCandidate: true },
+  });
+  const rejection = {
+    movement: rejected,
+    validationCode: "JETTON_MASTER_NOT_ALLOWLISTED",
+    reason: "UNSUPPORTED_JETTON_MASTER",
+    title: "Unsupported jetton received by a deposit address",
+    details: { configuredMasterAddress: "EQ_ALLOWLISTED_MASTER" },
+  };
+
+  const first = await ledger.recordRejected(rejection);
+  const replay = await ledger.recordRejected(rejection);
+
+  assert.equal(first.id, replay.id);
+  assert.equal(first.status, "REJECTED");
+  assert.equal(first.validationCode, "JETTON_MASTER_NOT_ALLOWLISTED");
+  assert.equal(memory.movements.length, 1);
+  assert.equal(memory.allocations.length, 0);
+  assert.equal(memory.recoveryCases.length, 1);
+  assert.equal(memory.recoveryCases[0]?.movementId, first.id);
+  assert.equal(memory.recoveryCases[0]?.invoiceId, "invoice-1");
+  assert.equal(memory.recoveryCases[0]?.orderId, "order-1");
+  assert.equal(memory.recoveryCases[0]?.reason, "UNSUPPORTED_JETTON_MASTER");
+  await assert.rejects(
+    ledger.recordRejected({
+      ...rejection,
+      details: { configuredMasterAddress: "EQ_DIFFERENT_ALLOWLIST" },
+    }),
+    /recovery evidence conflicts/,
+  );
+  await assert.rejects(
+    ledger.recordRejected({
+      ...rejection,
+      reason: "DIFFERENT_REJECTION_REASON",
+      title: "Conflicting recovery classification",
+    }),
+    /recovery evidence conflicts/,
+  );
+  assert.equal(memory.recoveryCases.length, 1);
+  assert.equal(memory.recoveryCases[0]?.reason, "UNSUPPORTED_JETTON_MASTER");
+  memory.recoveryCases.splice(0, memory.recoveryCases.length);
+  await ledger.recordRejected(rejection);
+  assert.equal(memory.recoveryCases.length, 1);
+  assert.equal(memory.recoveryCases[0]?.movementId, first.id);
+  await assert.rejects(
+    ledger.creditMovement({
+      movementId: first.id,
+      orderId: "order-1",
+      invoiceId: "invoice-1",
+      validationCode: "JETTON_INBOUND_V1",
+    }),
+    /is REJECTED/,
+  );
+  assert.equal(memory.orders[0]?.creditedFiatMicros, "0");
+  assert.equal(memory.invoices[0]?.creditedFiatMicros, "0");
 });
 
 test("initial partial threshold is the capped maximum of half the order and twice merchant cost", () => {

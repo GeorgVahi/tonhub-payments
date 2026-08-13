@@ -56,7 +56,10 @@ async function main() {
   process.stdout.write(`${JSON.stringify({
     depositAssetAccountId: result.account.id,
     transfersScanned: result.transfersScanned,
+    discoveryTransfersScanned: result.discoveryTransfersScanned,
+    notificationTransactionsScanned: result.notificationTransactionsScanned,
     movementsObserved: result.movementsObserved,
+    rejectionsRecorded: result.rejectionsRecorded,
     rejections: result.rejections,
     nextOffset: result.nextOffset,
   })}\n`);
