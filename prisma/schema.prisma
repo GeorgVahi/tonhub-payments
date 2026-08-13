@@ -16,66 +16,167 @@ enum TonhubPaymentInvoiceStatus {
   FAILED
 }
 
+enum TonhubPaymentOrderStatus {
+  PENDING
+  PARTIAL
+  PAID
+  EXPIRED
+  CANCELLED
+  FAILED
+  RECOVERY
+}
+
+enum TonhubPaymentMovementDirection {
+  INCOMING
+  OUTGOING
+}
+
+enum TonhubPaymentMovementStatus {
+  OBSERVED
+  VALIDATED
+  RATE_PENDING
+  HELD_UNDER_MINIMUM
+  CREDITED
+  RECOVERY
+  REJECTED
+}
+
+enum TonhubMovementAllocationKind {
+  CREDIT
+  REVERSAL
+}
+
+enum TonhubAssetSweepStatus {
+  QUEUED
+  GAS_CHECK
+  GAS_TOPUP_REQUIRED
+  GAS_TOPUP_SENT
+  READY
+  SENT
+  CONFIRMED
+  FAILED
+}
+
+enum TonhubRecoveryCaseStatus {
+  OPEN
+  REVIEWED
+  RESOLVED
+  IGNORED
+}
+
+enum TonhubOutboxEventStatus {
+  PENDING
+  DELIVERING
+  DELIVERED
+  FAILED
+}
+
+model TonhubPaymentOrder {
+  id                    String                     @id @default(cuid())
+  externalId            String                     @unique
+  fiatAmountMicros      String
+  fiatCurrency          String
+  creditedFiatMicros    String                     @default("0")
+  overpaymentFiatMicros String                     @default("0")
+  status                TonhubPaymentOrderStatus   @default(PENDING)
+  paidAt                DateTime?
+  expiresAt             DateTime?
+  cancelledAt           DateTime?
+  createdAt             DateTime                   @default(now())
+  updatedAt             DateTime                   @updatedAt
+  metadata              Json?
+  invoices              TonhubPaymentInvoice[]
+  allocations           TonhubMovementAllocation[]
+  sweeps                TonhubAssetSweep[]
+  recoveryCases         TonhubRecoveryCase[]
+
+  @@index([status, createdAt])
+  @@index([status, expiresAt])
+}
+
 model TonhubPaymentInvoice {
-  id                      String                     @id @default(cuid())
-  externalId              String?                    @unique
-  network                 String
-  asset                   String                     @default("GRAM")
-  fiatAmountCents         Int
-  fiatCurrency            String                     @default("EUR")
-  address                 String
-  addressRaw              String
-  addressStrategy         String                     @default("unique-address")
-  walletVersion           String
-  walletWorkchain         Int
-  walletContext           Int
-  walletNetworkGlobalId   Int
-  walletPublicKeyHash     String
-  amountNano              String
-  paidNano                String                     @default("0")
-  reference               String                     @unique
-  status                  TonhubPaymentInvoiceStatus @default(PENDING)
-  providerName            String                     @default("ton-direct")
-  observedTransactionHash String?                    @unique
-  observedAt              DateTime?
-  partialPaymentStartedAt DateTime?
-  partialPaymentExpiresAt DateTime?
-  expiresAt               DateTime?
-  priceLockedAt           DateTime?
-  priceLockedUntil        DateTime?
-  observedPayments        Json?
-  createdAt               DateTime                   @default(now())
-  updatedAt               DateTime                   @updatedAt
-  metadata                Json?
-  payload                 Json?
-  depositAddress          TonhubDepositAddress?
-  transactions            TonhubPaymentTransaction[]
+  id                            String                     @id @default(cuid())
+  externalId                    String?                    @unique
+  orderId                       String?
+  network                       String
+  asset                         String                     @default("GRAM")
+  checkoutAsset                 String                     @default("GRAM")
+  assetKind                     String                     @default("NATIVE")
+  assetDecimals                 Int                        @default(9)
+  fiatAmountCents               Int
+  fiatAmountMicros              String?
+  creditedFiatMicros            String                     @default("0")
+  remainingFiatMicros           String?
+  activationThresholdFiatMicros String?
+  fiatCurrency                  String                     @default("EUR")
+  address                       String
+  addressRaw                    String
+  addressStrategy               String                     @default("unique-address")
+  walletVersion                 String
+  walletWorkchain               Int
+  walletContext                 Int
+  walletNetworkGlobalId         Int
+  walletPublicKeyHash           String
+  amountNano                    String
+  paidNano                      String                     @default("0")
+  amountAtomic                  String?
+  paidAmountAtomic              String?
+  reference                     String                     @unique
+  status                        TonhubPaymentInvoiceStatus @default(PENDING)
+  providerName                  String                     @default("ton-direct")
+  observedTransactionHash       String?                    @unique
+  observedAt                    DateTime?
+  firstMovementAt               DateTime?
+  partialPaymentStartedAt       DateTime?
+  partialPaymentExpiresAt       DateTime?
+  expiresAt                     DateTime?
+  priceLockedAt                 DateTime?
+  priceLockedUntil              DateTime?
+  terminalMonitorUntil          DateTime?
+  scanPriorityAt                DateTime?
+  lastScannedAt                 DateTime?
+  settlementReason              String?
+  version                       Int                        @default(0)
+  observedPayments              Json?
+  createdAt                     DateTime                   @default(now())
+  updatedAt                     DateTime                   @updatedAt
+  metadata                      Json?
+  payload                       Json?
+  order                         TonhubPaymentOrder?        @relation(fields: [orderId], references: [id], onDelete: SetNull)
+  depositAddress                TonhubDepositAddress?
+  transactions                  TonhubPaymentTransaction[]
+  allocations                   TonhubMovementAllocation[]
+  sweeps                        TonhubAssetSweep[]
+  recoveryCases                 TonhubRecoveryCase[]
 
   @@index([network, address, status])
   @@index([network, status, createdAt])
   @@index([status, expiresAt])
   @@index([status, priceLockedUntil])
   @@index([status, partialPaymentExpiresAt])
+  @@index([orderId, status, createdAt])
+  @@index([status, scanPriorityAt])
+  @@index([status, terminalMonitorUntil])
 }
 
 model TonhubDepositAddress {
-  id                    String   @id @default(cuid())
-  invoiceId             String?  @unique
+  id                    String                      @id @default(cuid())
+  invoiceId             String?                     @unique
   network               String
-  address               String   @unique
+  address               String                      @unique
   addressRaw            String
   walletVersion         String
   walletWorkchain       Int
   walletContext         Int
   walletNetworkGlobalId Int
   walletPublicKeyHash   String
-  invoiceKind           String   @default("tonhub-payment")
-  status                String   @default("RESERVED")
-  createdAt             DateTime @default(now())
-  updatedAt             DateTime @updatedAt
+  invoiceKind           String                      @default("tonhub-payment")
+  status                String                      @default("RESERVED")
+  createdAt             DateTime                    @default(now())
+  updatedAt             DateTime                    @updatedAt
   assignedAt            DateTime?
   paidAt                DateTime?
-  sweepStatus           String   @default("NOT_STARTED")
+  sweepStatus           String                      @default("NOT_STARTED")
   sweepAmountNano       String?
   sweepReserveNano      String?
   sweepRecipientAddress String?
@@ -85,8 +186,11 @@ model TonhubDepositAddress {
   sweepSentAt           DateTime?
   sweepConfirmedAt      DateTime?
   sweepLastError        String?
-  sweepAttempts         Int      @default(0)
-  invoice               TonhubPaymentInvoice? @relation(fields: [invoiceId], references: [id], onDelete: SetNull)
+  sweepAttempts         Int                         @default(0)
+  invoice               TonhubPaymentInvoice?       @relation(fields: [invoiceId], references: [id], onDelete: SetNull)
+  assetAccounts         TonhubDepositAssetAccount[]
+  movements             TonhubPaymentMovement[]
+  sweeps                TonhubAssetSweep[]
 
   @@unique([network, walletVersion, walletPublicKeyHash, walletContext])
   @@index([network, status, createdAt])
@@ -95,19 +199,229 @@ model TonhubDepositAddress {
   @@index([sweepStatus, updatedAt])
 }
 
+model TonhubDepositAssetAccount {
+  id                  String               @id @default(cuid())
+  depositAddressId    String
+  network             String
+  asset               String
+  assetKind           String
+  assetDecimals       Int
+  jettonMasterAddress String?
+  assetWalletAddress  String?
+  status              String               @default("PENDING")
+  verifiedAt          DateTime?
+  verificationError   String?
+  createdAt           DateTime             @default(now())
+  updatedAt           DateTime             @updatedAt
+  depositAddress      TonhubDepositAddress @relation(fields: [depositAddressId], references: [id], onDelete: Cascade)
+
+  @@unique([depositAddressId, asset])
+  @@unique([network, assetWalletAddress])
+  @@index([asset, status])
+  @@index([jettonMasterAddress, assetWalletAddress])
+}
+
+model TonhubRateSnapshot {
+  id            String                  @id @default(cuid())
+  asset         String
+  baseCurrency  String
+  quoteCurrency String
+  price         Decimal                 @db.Decimal(36, 18)
+  source        String
+  observedAt    DateTime
+  fetchedAt     DateTime
+  createdAt     DateTime                @default(now())
+  payload       Json?
+  movements     TonhubPaymentMovement[]
+
+  @@unique([asset, baseCurrency, quoteCurrency, source, observedAt])
+  @@index([asset, quoteCurrency, observedAt])
+}
+
+model TonhubPaymentMovement {
+  id                  String                         @id @default(cuid())
+  fingerprint         String                         @unique
+  depositAddressId    String?
+  network             String
+  direction           TonhubPaymentMovementDirection
+  asset               String
+  assetKind           String
+  assetDecimals       Int
+  amountAtomic        String
+  fromAddress         String?
+  toAddress           String
+  ownerAddress        String?
+  jettonMasterAddress String?
+  jettonWalletAddress String?
+  transactionHash     String
+  transactionLt       String?
+  traceId             String?
+  queryId             String?
+  blockchainAt        DateTime
+  status              TonhubPaymentMovementStatus    @default(OBSERVED)
+  validationCode      String?
+  rateSnapshotId      String?
+  fiatCreditMicros    String?
+  rawPayload          Json?
+  createdAt           DateTime                       @default(now())
+  updatedAt           DateTime                       @updatedAt
+  depositAddress      TonhubDepositAddress?          @relation(fields: [depositAddressId], references: [id], onDelete: Restrict)
+  rateSnapshot        TonhubRateSnapshot?            @relation(fields: [rateSnapshotId], references: [id], onDelete: Restrict)
+  allocations         TonhubMovementAllocation[]
+  recoveryCases       TonhubRecoveryCase[]
+
+  @@index([depositAddressId, asset, blockchainAt])
+  @@index([network, status, blockchainAt])
+  @@index([transactionHash])
+  @@index([jettonMasterAddress, jettonWalletAddress])
+}
+
+model TonhubMovementAllocation {
+  id                   String                       @id @default(cuid())
+  movementId           String
+  orderId              String
+  invoiceId            String?
+  kind                 TonhubMovementAllocationKind @default(CREDIT)
+  reversesAllocationId String?                      @unique
+  fiatCreditMicros     String
+  allocatedBy          String                       @default("system")
+  allocatedAt          DateTime                     @default(now())
+  note                 String?
+  movement             TonhubPaymentMovement        @relation(fields: [movementId], references: [id], onDelete: Restrict)
+  order                TonhubPaymentOrder           @relation(fields: [orderId], references: [id], onDelete: Restrict)
+  invoice              TonhubPaymentInvoice?        @relation(fields: [invoiceId], references: [id], onDelete: Restrict)
+  reversesAllocation   TonhubMovementAllocation?    @relation("TonhubAllocationReversal", fields: [reversesAllocationId], references: [id], onDelete: Restrict)
+  reversedByAllocation TonhubMovementAllocation?    @relation("TonhubAllocationReversal")
+
+  @@index([movementId, kind])
+  @@index([orderId, allocatedAt])
+  @@index([invoiceId, allocatedAt])
+}
+
+model TonhubScanCursor {
+  id             String    @id @default(cuid())
+  network        String
+  streamType     String
+  scopeKey       String
+  lastLt         String?
+  lastTimestamp  DateTime?
+  lastHash       String?
+  leaseOwner     String?
+  leaseExpiresAt DateTime?
+  createdAt      DateTime  @default(now())
+  updatedAt      DateTime  @updatedAt
+
+  @@unique([network, streamType, scopeKey])
+  @@index([leaseExpiresAt])
+}
+
+model TonhubAssetSweep {
+  id                      String                 @id @default(cuid())
+  idempotencyKey          String                 @unique
+  depositAddressId        String
+  orderId                 String?
+  invoiceId               String?
+  asset                   String
+  assetKind               String
+  status                  TonhubAssetSweepStatus @default(QUEUED)
+  amountAtomic            String?
+  reserveAtomic           String?
+  recipientAddress        String?
+  transactionHash         String?
+  seqno                   Int?
+  gasTopupAmountNano      String?
+  gasTopupTransactionHash String?
+  attempts                Int                    @default(0)
+  leaseOwner              String?
+  leaseExpiresAt          DateTime?
+  startedAt               DateTime?
+  sentAt                  DateTime?
+  confirmedAt             DateTime?
+  lastError               String?
+  createdAt               DateTime               @default(now())
+  updatedAt               DateTime               @updatedAt
+  depositAddress          TonhubDepositAddress   @relation(fields: [depositAddressId], references: [id], onDelete: Restrict)
+  order                   TonhubPaymentOrder?    @relation(fields: [orderId], references: [id], onDelete: SetNull)
+  invoice                 TonhubPaymentInvoice?  @relation(fields: [invoiceId], references: [id], onDelete: SetNull)
+
+  @@index([status, leaseExpiresAt])
+  @@index([depositAddressId, asset, createdAt])
+  @@index([orderId, createdAt])
+  @@index([invoiceId, createdAt])
+}
+
+model TonhubRecoveryCase {
+  id         String                   @id @default(cuid())
+  movementId String?
+  orderId    String?
+  invoiceId  String?
+  reason     String
+  status     TonhubRecoveryCaseStatus @default(OPEN)
+  title      String
+  details    Json?
+  reviewedBy String?
+  reviewedAt DateTime?
+  resolvedBy String?
+  resolvedAt DateTime?
+  createdAt  DateTime                 @default(now())
+  updatedAt  DateTime                 @updatedAt
+  movement   TonhubPaymentMovement?   @relation(fields: [movementId], references: [id], onDelete: SetNull)
+  order      TonhubPaymentOrder?      @relation(fields: [orderId], references: [id], onDelete: SetNull)
+  invoice    TonhubPaymentInvoice?    @relation(fields: [invoiceId], references: [id], onDelete: SetNull)
+
+  @@index([status, createdAt])
+  @@index([movementId])
+  @@index([orderId])
+  @@index([invoiceId])
+}
+
+model TonhubOutboxEvent {
+  id             String                  @id @default(cuid())
+  eventId        String                  @unique @default(cuid())
+  topic          String
+  aggregateType  String
+  aggregateId    String
+  payload        Json
+  status         TonhubOutboxEventStatus @default(PENDING)
+  attempts       Int                     @default(0)
+  availableAt    DateTime                @default(now())
+  leaseOwner     String?
+  leaseExpiresAt DateTime?
+  deliveredAt    DateTime?
+  lastError      String?
+  createdAt      DateTime                @default(now())
+  updatedAt      DateTime                @updatedAt
+
+  @@index([status, availableAt])
+  @@index([aggregateType, aggregateId, createdAt])
+  @@index([leaseExpiresAt])
+}
+
+model TonhubAdminAuditEvent {
+  id            String   @id @default(cuid())
+  adminUsername String
+  action        String
+  targetType    String
+  targetId      String
+  payload       Json?
+  createdAt     DateTime @default(now())
+
+  @@index([targetType, targetId, createdAt])
+  @@index([adminUsername, createdAt])
+}
+
 model TonhubPaymentTransaction {
-  id                    String                  @id @default(cuid())
+  id                    String                     @id @default(cuid())
   invoiceId             String
-  providerName          String                  @default("ton-direct")
+  providerName          String                     @default("ton-direct")
   providerTransactionId String?
   status                TonhubPaymentInvoiceStatus
   amountNano            String
-  asset                 String                  @default("GRAM")
+  asset                 String                     @default("GRAM")
   payload               Json?
-  createdAt             DateTime                @default(now())
-  invoice               TonhubPaymentInvoice    @relation(fields: [invoiceId], references: [id], onDelete: Cascade)
+  createdAt             DateTime                   @default(now())
+  invoice               TonhubPaymentInvoice       @relation(fields: [invoiceId], references: [id], onDelete: Cascade)
 
   @@index([invoiceId])
   @@index([providerTransactionId])
 }
-

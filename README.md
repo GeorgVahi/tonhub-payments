@@ -123,21 +123,28 @@ does not persist a transaction hash or advance `SENT` to on-chain
 
 ## Database Schema
 
-The Prisma schema is intentionally small and standalone:
+The current GRAM runtime still uses the three legacy models
+`TonhubPaymentInvoice`, `TonhubDepositAddress`, and
+`TonhubPaymentTransaction`. An additive migration now also provides the
+multi-asset persistence foundation without removing or renaming legacy fields:
 
-- `TonhubPaymentInvoice` stores the invoice lifecycle, fiat amount, locked GRAM
-  (ex TON) amount, invoice address, payment status, observed payment metadata,
-  expiration windows, and optional application metadata.
-- `TonhubDepositAddress` stores the generated unique wallet address and the V5R1
-  reconstruction metadata: workchain, wallet context, network global id, and
-  public-key hash. It also stores sweep state and the main-wallet recipient used
-  by the worker.
-- `TonhubPaymentTransaction` stores invoice transaction records for observed
-  payment transitions.
+- `TonhubPaymentOrder` owns the fiat obligation while invoice rows become
+  payment attempts; PostgreSQL permits only one active attempt per order.
+- `TonhubDepositAssetAccount` records the native or jetton account associated
+  with a unique deposit wallet.
+- `TonhubRateSnapshot`, `TonhubPaymentMovement`, and
+  `TonhubMovementAllocation` preserve valuation evidence and allocations.
+  Financial facts are database-protected from mutation; corrections are
+  compensating `REVERSAL` allocations.
+- `TonhubScanCursor` and `TonhubAssetSweep` support resumable scanners and
+  idempotent per-asset sweeps with only one active sweep per deposit asset.
+- `TonhubRecoveryCase`, `TonhubOutboxEvent`, and `TonhubAdminAuditEvent` support
+  operator recovery, reliable delivery, and append-only administration audit.
 
 Each invoice has at most one `TonhubDepositAddress`; the deposit address can be
-reconstructed only when the worker's secret key matches the public-key hash
-stored with that address.
+reconstructed only when the worker's secret key matches its stored public-key
+hash. See `prisma/README.md` for clean deployment, legacy baselining, and the
+Docker migration rehearsal.
 
 ## Frontend
 
