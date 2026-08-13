@@ -22,7 +22,7 @@
     "db:migrate:deploy": "prisma migrate deploy",
     "db:push": "prisma db push",
     "typecheck": "tsc --noEmit",
-    "test": "tsx tests/tonhub-payments.test.ts",
+    "test": "tsx --test tests/tonhub-payments.test.ts tests/gram-flow-characterization.test.ts",
     "build": "vite build --config vite.config.ts",
     "preview": "vite preview --config vite.config.ts"
   },
