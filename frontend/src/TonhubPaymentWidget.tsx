@@ -247,15 +247,18 @@ export function checkoutPaymentOffer(input: {
   };
 }
 
-export function refreshedPaymentInstructionAsset(input: {
-  current: PaymentAsset | null;
+export function checkoutPaymentAlternative(input: {
   invoiceAsset: PaymentAsset;
-  available: PaymentAsset[];
-  preserve: boolean;
+  options: Array<{
+    asset: PaymentAsset;
+    payableAmountFormatted: string | null;
+  }>;
+  gramSaving: string | null;
 }) {
-  return input.preserve && input.current && input.available.includes(input.current)
-    ? input.current
-    : input.invoiceAsset;
+  if (input.invoiceAsset !== "USDT") return null;
+  const gram = input.options.find((option) => option.asset === "GRAM");
+  if (!gram?.payableAmountFormatted) return null;
+  return `Or send exactly ${gram.payableAmountFormatted} to the same address${input.gramSaving ? ` and save up to ${input.gramSaving}` : ""} when the full order is paid in GRAM.`;
 }
 
 export function immutablePaymentOptionSaving(
@@ -418,7 +421,6 @@ export function TonhubPaymentWidget({
     EUR: { minimumOrderFiatMicros: "10000000", gramDiscountMaxFiatMicros: "1000000" },
   });
   const [invoice, setInvoice] = useState<TonhubInvoice | null>(null);
-  const [instructionAsset, setInstructionAsset] = useState<PaymentAsset | null>(null);
   const [notice, setNotice] = useState<WidgetNotice | null>(null);
   const [busy, setBusy] = useState(false);
   const [configReady, setConfigReady] = useState(false);
@@ -675,7 +677,7 @@ export function TonhubPaymentWidget({
         return;
       }
 
-      presentInvoice(body.invoice, { preserveInstruction: true });
+      presentInvoice(body.invoice);
       if (!response.ok) {
         if (!options.quiet) {
           setNotice(errorNotice({
@@ -716,23 +718,13 @@ export function TonhubPaymentWidget({
   function resetInvoice() {
     if (resumeKey) clearInvoiceResumeReference(window.localStorage, resumeKey);
     setInvoice(null);
-    setInstructionAsset(null);
     setNotice(null);
     lastNotifiedInvoiceRef.current = null;
     onInvoiceChangeRef.current?.(null);
   }
 
-  function presentInvoice(
-    nextInvoice: TonhubInvoice,
-    options: { preserveInstruction?: boolean } = {},
-  ) {
+  function presentInvoice(nextInvoice: TonhubInvoice) {
     setInvoice(nextInvoice);
-    setInstructionAsset((current) => refreshedPaymentInstructionAsset({
-      current,
-      invoiceAsset: nextInvoice.asset,
-      available: nextInvoice.paymentOptions.map((option) => option.asset),
-      preserve: options.preserveInstruction === true,
-    }));
     setAsset(nextInvoice.asset);
     setNetwork(nextInvoice.network);
     setCurrency(nextInvoice.fiatCurrency);
@@ -760,21 +752,7 @@ export function TonhubPaymentWidget({
     }));
   }
 
-  const activePaymentOption = invoice?.paymentOptions.find((option) =>
-    option.asset === (instructionAsset ?? invoice.asset)
-  ) ?? null;
-  const paymentInstruction = invoice && activePaymentOption?.payableAmountAtomic &&
-    activePaymentOption.payableAmountFormatted
-    ? {
-        ...invoice,
-        asset: activePaymentOption.asset,
-        assetKind: activePaymentOption.asset === "GRAM" ? "NATIVE" as const : "JETTON" as const,
-        assetDecimals: activePaymentOption.assetDecimals,
-        amountAtomic: activePaymentOption.payableAmountAtomic,
-        amountFormatted: activePaymentOption.payableAmountFormatted,
-        deeplink: activePaymentOption.deeplink,
-      }
-    : null;
+  const paymentInstruction = invoice;
   const qrSvg = paymentInstruction?.deeplink
     ? createTonQrSvg(
         paymentInstruction.deeplink,
@@ -796,6 +774,13 @@ export function TonhubPaymentWidget({
   );
   const invoiceGramSaving = invoice
     ? immutablePaymentOptionSaving(invoice.paymentOptions, "GRAM")
+    : null;
+  const alternativePayment = invoice
+    ? checkoutPaymentAlternative({
+        invoiceAsset: invoice.asset,
+        options: invoice.paymentOptions,
+        gramSaving: invoiceGramSaving,
+      })
     : null;
   const paymentOffer = checkoutPaymentOffer({
     network,
@@ -925,42 +910,14 @@ export function TonhubPaymentWidget({
                 <div>
                   <span>Pay on TON</span>
                   <strong>{invoice.status === "PARTIAL"
-                    ? `Finish with ${paymentInstruction ? assetLabels[paymentInstruction.asset] : assetLabels[invoice.asset]}`
-                    : `Send ${paymentInstruction ? assetLabels[paymentInstruction.asset] : assetLabels[invoice.asset]}`}</strong>
+                    ? `Finish with ${assetLabels[invoice.asset]}`
+                    : `Send ${assetLabels[invoice.asset]}`}</strong>
                 </div>
                 <span className="tonhub-payment-widget__status-pill">{statusLabels[invoice.status]}</span>
               </div>
-              {invoice.paymentOptions.length > 1 ? (
-                <div className="tonhub-payment-widget__rail-picker" role="group" aria-label="Payment instruction">
-                  {invoice.paymentOptions.map((option) => {
-                    const active = paymentInstruction?.asset === option.asset;
-                    return (
-                      <button
-                        className={active ? "is-selected" : ""}
-                        key={option.asset}
-                        type="button"
-                        aria-pressed={active}
-                        disabled={busy || !option.payableAmountAtomic}
-                        onClick={() => setInstructionAsset(option.asset)}
-                      >
-                        <span>
-                          <strong>Pay {option.label}</strong>
-                          <em>{active ? "Shown below" : "View details"}</em>
-                        </span>
-                        <b>{option.payableAmountFormatted ?? "Unavailable"}</b>
-                        <small>{option.asset === "USDT"
-                          ? "Familiar Tether on TON"
-                          : invoiceGramSaving
-                            ? `Pay the full order in GRAM to save up to ${invoiceGramSaving}`
-                            : "Native GRAM on TON"}</small>
-                      </button>
-                    );
-                  })}
-                </div>
-              ) : null}
-              {invoice.paymentOptions.length > 1 && invoiceGramSaving ? (
-                <p className="tonhub-payment-widget__rail-note">
-                  The GRAM saving applies only when the complete order is paid in GRAM. USD₮ + GRAM payments are combined by fiat value without the discount.
+              {alternativePayment ? (
+                <p className="tonhub-payment-widget__payment-alternative">
+                  {alternativePayment}
                 </p>
               ) : null}
               {tonConnectManifest && paymentInstruction ? (
@@ -997,31 +954,25 @@ export function TonhubPaymentWidget({
                   />
                 </div>
               ) : null}
-              {paymentInstruction ? (
-                <>
-                  <TonManualTransferFields
-                    address={invoice.address}
-                    amount={paymentInstruction.amountFormatted}
-                    amountCopyValue={copyableAssetAmount(paymentInstruction.amountFormatted)}
-                    addressLabel="Unique TON address"
-                    amountLabel="Exact amount"
-                    copyLabel="Copy"
-                    copiedLabel="Copied"
-                  />
-                  <p className="tonhub-payment-widget__wallet-note">
-                    Open with Tonhub, Tonkeeper, Trust Wallet, or Wallet in Telegram. Send only {assetLabels[paymentInstruction.asset]} on TON {invoice.network}.
-                  </p>
-                  {paymentInstruction.deeplink ? (
-                    <a className="tonhub-payment-widget__primary" href={paymentInstruction.deeplink}>
-                      Open wallet
-                    </a>
-                  ) : null}
-                </>
-              ) : (
-                <p className="tonhub-payment-widget__rail-note" role="alert">
-                  This payment instruction is unavailable. Return to the original method or check the invoice again.
-                </p>
-              )}
+              <TonManualTransferFields
+                address={invoice.address}
+                amount={invoice.amountFormatted}
+                amountCopyValue={copyableAssetAmount(invoice.amountFormatted)}
+                addressLabel="Unique TON address"
+                amountLabel="Exact amount"
+                copyLabel="Copy"
+                copiedLabel="Copied"
+              />
+              <p className="tonhub-payment-widget__wallet-note">
+                Open with Tonhub, Tonkeeper, Trust Wallet, or Wallet in Telegram. {alternativePayment
+                  ? `The QR and wallet button send ${assetLabels[invoice.asset]} on TON ${invoice.network}; GRAM can be sent manually to the same address using the exact alternative amount above.`
+                  : `Send only ${assetLabels[invoice.asset]} on TON ${invoice.network}.`}
+              </p>
+              {invoice.deeplink ? (
+                <a className="tonhub-payment-widget__primary" href={invoice.deeplink}>
+                  Open wallet
+                </a>
+              ) : null}
               <button
                 className="tonhub-payment-widget__secondary"
                 type="button"

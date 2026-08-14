@@ -33,11 +33,11 @@ import { renderToStaticMarkup } from "react-dom/server";
 import {
   checkoutAssetForNetwork,
   checkoutPaymentOffer,
+  checkoutPaymentAlternative,
   fiatPaymentProgress,
   formatFiatPolicyMicros,
   immutablePaymentOptionSaving,
   PaymentStatusAnnouncement,
-  refreshedPaymentInstructionAsset,
   TonhubPaymentWidget,
 } from "../frontend/src/TonhubPaymentWidget";
 import {
@@ -131,25 +131,20 @@ test("invoice resume reloads the authoritative server invoice and rejects mismat
   assert.deepEqual(mismatched, { state: "failed" });
 });
 
-test("invoice refresh preserves an explicitly opened top-up rail", () => {
-  assert.equal(refreshedPaymentInstructionAsset({
-    current: "GRAM",
+test("an issued USD₮ invoice describes GRAM as plain same-address alternative text", () => {
+  assert.equal(checkoutPaymentAlternative({
     invoiceAsset: "USDT",
-    available: ["USDT", "GRAM"],
-    preserve: true,
-  }), "GRAM");
-  assert.equal(refreshedPaymentInstructionAsset({
-    current: "GRAM",
+    options: [
+      { asset: "USDT", payableAmountFormatted: "11.48 USD₮" },
+      { asset: "GRAM", payableAmountFormatted: "7.83 GRAM (ex TON)" },
+    ],
+    gramSaving: "1.00 EUR",
+  }), "Or send exactly 7.83 GRAM (ex TON) to the same address and save up to 1.00 EUR when the full order is paid in GRAM.");
+  assert.equal(checkoutPaymentAlternative({
     invoiceAsset: "USDT",
-    available: ["USDT"],
-    preserve: true,
-  }), "USDT");
-  assert.equal(refreshedPaymentInstructionAsset({
-    current: "GRAM",
-    invoiceAsset: "USDT",
-    available: ["USDT", "GRAM"],
-    preserve: false,
-  }), "USDT");
+    options: [{ asset: "USDT", payableAmountFormatted: "11.48 USD₮" }],
+    gramSaving: "1.00 EUR",
+  }), null);
 });
 
 test("the asset registry and default-off public policy keep testnet GRAM-only", async () => {

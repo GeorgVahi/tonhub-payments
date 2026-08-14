@@ -299,11 +299,10 @@ immutable rate snapshots and use integer arithmetic. USD₮ returns a
 standard `ton://transfer` jetton link plus the unique owner address and manual
 amount fallback. The link pins the compiled official mainnet USDT master.
 
-The public widget submits the server-selected default (USD₮ on enabled mainnet)
-and immediately shows exact USD₮ and GRAM instructions for the same unique TON
-address. Opening either instruction changes only the QR/manual details shown in
-the browser; it does not mutate the invoice payment selection. API integrations
-may still switch an untouched attempt with
+The public widget submits the server-selected default (USD₮ on enabled mainnet),
+shows its QR/manual instruction, and describes the exact discounted GRAM amount
+as plain same-address alternative text. There is no asset selector in the public
+checkout. API integrations may still switch an untouched attempt with
 `POST /api/tonhub-payments/invoices/:id/payment-method`. The first valid movement
 freezes the accounting selection. Later top-up instructions are recalculated
 from the gross fiat remainder and stored rate, so a mixed payment never inherits

@@ -286,86 +286,12 @@
   font-size: 1.05rem;
 }
 
-.tonhub-payment-widget__rail-picker {
-  display: grid;
-  grid-template-columns: repeat(2, minmax(0, 1fr));
-  gap: 8px;
-}
-
-.tonhub-payment-widget__rail-picker button {
-  display: grid;
-  min-width: 0;
-  gap: 7px;
-  border: 1px solid var(--tonhub-line);
-  border-radius: 8px;
-  background: var(--tonhub-panel-muted);
-  color: var(--tonhub-muted-strong);
-  cursor: pointer;
-  padding: 12px;
-  text-align: left;
-  transition: background 160ms ease, border-color 160ms ease, color 160ms ease, transform 160ms ease;
-}
-
-.tonhub-payment-widget__rail-picker button > span {
-  display: flex;
-  min-width: 0;
-  align-items: center;
-  justify-content: space-between;
-  gap: 8px;
-}
-
-.tonhub-payment-widget__rail-picker strong {
-  color: inherit;
-  font-size: 0.92rem;
-}
-
-.tonhub-payment-widget__rail-picker em {
-  border-radius: 999px;
-  background: rgb(245 243 239 / 8%);
-  color: var(--tonhub-muted);
-  font-size: 0.68rem;
-  font-style: normal;
-  padding: 3px 7px;
-  white-space: nowrap;
-}
-
-.tonhub-payment-widget__rail-picker b {
-  color: var(--tonhub-ink);
-  font-size: 1rem;
-  overflow-wrap: anywhere;
-}
-
-.tonhub-payment-widget__rail-picker small {
-  color: var(--tonhub-muted);
-  font-size: 0.76rem;
-  line-height: 1.35;
-}
-
-.tonhub-payment-widget__rail-picker button.is-selected {
-  border-color: rgb(45 212 191 / 62%);
-  background: rgb(45 212 191 / 13%);
-  color: var(--tonhub-action-hover);
-}
-
-.tonhub-payment-widget__rail-picker button:not(:disabled):hover {
-  border-color: var(--tonhub-line-strong);
-  background: #24211f;
-  color: var(--tonhub-ink);
-}
-
-.tonhub-payment-widget__rail-picker button:not(:disabled):active {
-  transform: translateY(1px);
-}
-
-.tonhub-payment-widget__rail-note {
+.tonhub-payment-widget__payment-alternative {
   max-width: 70ch;
   margin: 0;
-  border-radius: 8px;
-  background: rgb(96 165 250 / 10%);
   color: var(--tonhub-muted-strong);
   font-size: 0.86rem;
   line-height: 1.5;
-  padding: 10px 12px;
 }
 
 .tonhub-payment-widget__ton-connect {
@@ -728,10 +654,6 @@
   }
 
   .tonhub-payment-widget__ton-connect {
-    grid-template-columns: 1fr;
-  }
-
-  .tonhub-payment-widget__rail-picker {
     grid-template-columns: 1fr;
   }
 
