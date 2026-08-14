@@ -281,9 +281,10 @@ of payment-asset identity and precision:
   9 atomic decimals and checkout amounts are rounded up to 2 displayed digits.
 - `USDT` is the machine code for official TON-network Tether, presented to users
   as `USD₮`. It is a TON jetton with 6 atomic decimals and a USD-peg pricing strategy.
-  Public mainnet checkout presents it first when the independent public flag
-  and all required settlement services are enabled; GRAM remains the alternate
-  choice. Public testnet and the internal arbitrary test jetton remain GRAM-only.
+  Public mainnet checkout presents one offer: pay in familiar USD₮ on TON, or
+  pay the complete order in GRAM for the snapshotted saving. It does not require
+  an asset choice before invoice creation. Public testnet and the internal
+  arbitrary test jetton remain GRAM-only.
 
 `POST /api/tonhub-payments/invoices` accepts optional `asset: "GRAM" | "USDT"`.
 When omitted, the server policy selects USD₮ on enabled mainnet checkout and
@@ -298,16 +299,17 @@ immutable rate snapshots and use integer arithmetic. USD₮ returns a
 standard `ton://transfer` jetton link plus the unique owner address and manual
 amount fallback. The link pins the compiled official mainnet USDT master.
 
-Before the first valid on-chain movement, the widget can switch the concrete
-instruction with `POST /api/tonhub-payments/invoices/:id/payment-method`; the
-server atomically replaces it from the other immutable quote without changing
-the order, invoice, or unique deposit address. The first valid movement freezes
-that selection. After it is frozen, the widget may still open the other TON
-asset as an additional top-up instruction on the same address. Its amount is
-recalculated from the gross fiat remainder and stored rate, so a USD₮-selected
-or mixed payment never inherits the GRAM-only discount. The summary continues
-to show the remaining amount in the originally selected asset while the ledger
-combines actual GRAM and official USD₮ credits.
+The public widget submits the server-selected default (USD₮ on enabled mainnet)
+and immediately shows exact USD₮ and GRAM instructions for the same unique TON
+address. Opening either instruction changes only the QR/manual details shown in
+the browser; it does not mutate the invoice payment selection. API integrations
+may still switch an untouched attempt with
+`POST /api/tonhub-payments/invoices/:id/payment-method`. The first valid movement
+freezes the accounting selection. Later top-up instructions are recalculated
+from the gross fiat remainder and stored rate, so a mixed payment never inherits
+the GRAM-only discount. The summary continues to show the remaining amount in
+the originally selected asset while the ledger combines actual GRAM and official
+USD₮ credits.
 
 The order minimum defaults to $10/€10 and the intermediate unswept-balance
 threshold defaults to $100/€100. Configure integer cents with

@@ -64,7 +64,7 @@
   grid-template-columns: minmax(170px, 1fr) 140px minmax(220px, 1fr) auto;
   grid-template-areas:
     "amount currency network primary"
-    "asset asset asset asset";
+    "offer offer offer offer";
   align-items: start;
 }
 
@@ -80,8 +80,23 @@
   grid-area: network;
 }
 
-.tonhub-payment-widget__asset-field {
-  grid-area: asset;
+.tonhub-payment-widget__payment-offer {
+  grid-area: offer;
+  display: flex;
+  min-width: 0;
+  align-items: baseline;
+  gap: 8px;
+  color: var(--tonhub-muted-strong);
+  font-size: 0.88rem;
+  line-height: 1.45;
+}
+
+.tonhub-payment-widget__payment-offer strong {
+  color: var(--tonhub-ink);
+}
+
+.tonhub-payment-widget__payment-offer span {
+  color: var(--tonhub-muted);
 }
 
 .tonhub-payment-widget__form > .tonhub-payment-widget__primary {
@@ -183,29 +198,6 @@
   background: rgb(45 212 191 / 13%);
   color: var(--tonhub-action-hover);
   box-shadow: inset 0 0 0 1px rgb(45 212 191 / 24%);
-}
-
-.tonhub-payment-widget__asset-field .tonhub-payment-widget__segments button {
-  display: grid;
-  min-height: 58px;
-  justify-items: start;
-  gap: 2px;
-  padding: 9px 12px;
-  text-align: left;
-}
-
-.tonhub-payment-widget__asset-field .tonhub-payment-widget__segments strong {
-  color: inherit;
-  font-size: 0.95rem;
-}
-
-.tonhub-payment-widget__asset-field .tonhub-payment-widget__segments small {
-  color: var(--tonhub-muted);
-  font-size: 0.78rem;
-}
-
-.tonhub-payment-widget__asset-field .tonhub-payment-widget__segments .is-selected small {
-  color: var(--tonhub-muted-strong);
 }
 
 .tonhub-payment-widget__segments button:not(:disabled):hover,
@@ -699,7 +691,7 @@
     grid-template-areas:
       "amount currency"
       "network network"
-      "asset asset"
+      "offer offer"
       "primary primary";
   }
 }
@@ -720,8 +712,14 @@
       "amount"
       "currency"
       "network"
-      "asset"
+      "offer"
       "primary";
+  }
+
+  .tonhub-payment-widget__payment-offer {
+    align-items: flex-start;
+    flex-direction: column;
+    gap: 2px;
   }
 
   .tonhub-payment-widget__paybox-header {

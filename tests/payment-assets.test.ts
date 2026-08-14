@@ -32,10 +32,10 @@ import { createElement } from "react";
 import { renderToStaticMarkup } from "react-dom/server";
 import {
   checkoutAssetForNetwork,
+  checkoutPaymentOffer,
   fiatPaymentProgress,
   formatFiatPolicyMicros,
   immutablePaymentOptionSaving,
-  paymentRailAction,
   PaymentStatusAnnouncement,
   refreshedPaymentInstructionAsset,
   TonhubPaymentWidget,
@@ -323,7 +323,7 @@ test("mainnet USDT canary configuration fails closed on ambiguous or oversized a
   }), /at most 20/i);
 });
 
-test("the widget waits for server policy and applies USDT as the mainnet default", () => {
+test("the widget presents USD₮ as the default payment and GRAM as the discounted alternative", () => {
   const available = {
     testnet: ["GRAM"],
     mainnet: ["USDT", "GRAM"],
@@ -356,16 +356,22 @@ test("the widget waits for server policy and applies USDT as the mainnet default
   });
   assert.equal(formatFiatPolicyMicros("1000000", "USD"), "$1");
   assert.equal(formatFiatPolicyMicros("1000000", "EUR"), "€1");
-  assert.equal(paymentRailAction({
-    invoiceAsset: "USDT",
-    requestedAsset: "GRAM",
-    selectionLocked: false,
-  }), "switch");
-  assert.equal(paymentRailAction({
-    invoiceAsset: "USDT",
-    requestedAsset: "GRAM",
-    selectionLocked: true,
-  }), "top-up");
+  assert.deepEqual(checkoutPaymentOffer({
+    network: "mainnet",
+    available: ["USDT", "GRAM"],
+    gramSaving: "€1",
+  }), {
+    primary: "Pay with USD₮ on TON.",
+    alternative: "Or pay the full order in GRAM and save up to €1.",
+  });
+  assert.deepEqual(checkoutPaymentOffer({
+    network: "testnet",
+    available: ["GRAM"],
+    gramSaving: "€1",
+  }), {
+    primary: "Pay with GRAM on TON testnet.",
+    alternative: null,
+  });
 
   const initialMarkup = renderToStaticMarkup(createElement(TonhubPaymentWidget, {
     initialNetwork: "mainnet",
