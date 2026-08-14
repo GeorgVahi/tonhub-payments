@@ -127,7 +127,7 @@ test("mainnet canary preflight rejects a database missing the latest operational
 
   assert.equal(report.ok, false);
   assert.ok(report.blockers.some((value) =>
-    value.includes("20260814105000_operational_payment_visibility")));
+    value.includes("20260814106000_actual_gram_discount")));
 });
 
 test("mainnet canary preflight blocks reviewed recovery and a recovery order until resolution", async () => {

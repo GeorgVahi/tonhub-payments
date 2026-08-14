@@ -793,9 +793,7 @@ async function applyEligibleGramOnlyDiscount(tx: PrismaLike, input: {
 }) {
   if (
     input.forceRecovery ||
-    input.hasOtherUnresolvedMovements ||
-    input.invoice.checkoutAsset !== "GRAM" ||
-    input.invoice.paymentSelectionLockedAsset !== "GRAM"
+    input.hasOtherUnresolvedMovements
   ) {
     return null;
   }
@@ -851,7 +849,9 @@ async function applyEligibleGramOnlyDiscount(tx: PrismaLike, input: {
     fiatCurrency: input.order.fiatCurrency,
     reason: "GRAM_ONLY_SETTLEMENT",
     evidence: {
-      selectedAsset: "GRAM",
+      selectedAsset: input.invoice.paymentSelectionLockedAsset,
+      checkoutAsset: input.invoice.checkoutAsset,
+      discountBasis: "ACTUAL_GRAM_ONLY_SETTLEMENT",
       observedAssets: ["GRAM"],
       creditedFiatMicros: allocationSummary.netCredit.toString(),
       grossFiatMicros: obligation.toString(),
@@ -1370,6 +1370,52 @@ export function createMovementLedger(db: PrismaLike) {
           throw new MovementAllocationConflictError("Credited movement has no CREDIT allocation.");
         }
         assertAllocationTarget(allocation, { orderId, invoiceId });
+        const allCreditsUseThisDeposit = baseline.activeCredits.every(
+          ({ movement: creditedMovement }) =>
+            creditedMovement.depositAddressId === movement.depositAddressId,
+        );
+        if (
+          invoiceStatusIsActive(order.status) &&
+          invoiceStatusIsActive(invoice.status) &&
+          unresolvedMovements.length === 0 &&
+          allCreditsUseThisDeposit &&
+          BigInt(order.discountFiatMicros ?? "0") === BigInt(0)
+        ) {
+          const closingMovement = baseline.activeCredits.at(-1)?.movement ?? movement;
+          const adjustment = await applyEligibleGramOnlyDiscount(tx, {
+            order,
+            invoice,
+            forceRecovery: false,
+            movement: closingMovement,
+            hasOtherUnresolvedMovements: false,
+          });
+          if (adjustment) {
+            const updatedOrder = await syncOrderAccounting(tx, {
+              order,
+              paidAt: closingMovement.blockchainAt,
+            });
+            const updatedInvoice = await syncInvoiceAccounting(tx, {
+              invoice,
+              order: updatedOrder,
+              movement: closingMovement,
+              forceRecovery: false,
+              partialPaymentTtlHours,
+            });
+            await reconcileAutomaticAssetSweeps({
+              tx,
+              orderId,
+              invoiceId,
+              triggeredAt: settlementAt,
+            });
+            return {
+              outcome: "credited" as const,
+              movement,
+              allocation,
+              order: updatedOrder,
+              invoice: updatedInvoice,
+            };
+          }
+        }
         return { outcome: "credited" as const, movement, allocation, order };
       }
       if (unresolvedMovements[0] && unresolvedMovements[0].id !== movement.id) {

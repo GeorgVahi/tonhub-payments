@@ -68,10 +68,10 @@ try {
       id: ids.invoice,
       orderId: ids.order,
       network: "testnet",
-      asset: "GRAM",
-      checkoutAsset: "GRAM",
-      assetKind: "NATIVE",
-      assetDecimals: 9,
+      asset: "USDT",
+      checkoutAsset: "USDT",
+      assetKind: "JETTON",
+      assetDecimals: 6,
       fiatAmountCents: 500,
       fiatAmountMicros: "5000000",
       remainingFiatMicros: "5000000",
@@ -84,8 +84,8 @@ try {
       walletContext: suffix === "clean" ? 814_101 : 814_102,
       walletNetworkGlobalId: -3,
       walletPublicKeyHash: `gram-discount-key-${suffix}`,
-      amountNano: "1600000000",
-      amountAtomic: "1600000000",
+      amountNano: "5000000",
+      amountAtomic: "5000000",
       reference: `gram-discount-reference-${suffix}`,
       expiresAt: at(59),
       priceLockedAt: issuedAt,
@@ -151,12 +151,12 @@ try {
   const observedInvoice = await prisma.tonhubPaymentInvoice.findUniqueOrThrow({
     where: { id: ids.invoice },
   });
-  assert.equal(observedInvoice.paymentSelectionLockedAsset, "GRAM");
+  assert.equal(observedInvoice.paymentSelectionLockedAsset, "USDT");
   assert.equal(observedInvoice.paymentSelectionLockedAt?.toISOString(), at(1).toISOString());
   await assert.rejects(
     prisma.tonhubPaymentInvoice.update({
       where: { id: ids.invoice },
-      data: { checkoutAsset: "USDT" },
+      data: { checkoutAsset: "GRAM" },
     }),
     /immutable after its first movement|payment_selection_lock_check/,
   );
@@ -171,7 +171,7 @@ try {
   assert.equal(paid.order.creditedFiatMicros, "4000000");
   assert.equal(paid.order.discountFiatMicros, "1000000");
   assert.equal(paid.invoice.remainingFiatMicros, "0");
-  assert.equal(paid.invoice.paymentSelectionLockedAsset, "GRAM");
+  assert.equal(paid.invoice.paymentSelectionLockedAsset, "USDT");
   assert.equal(paid.invoice.paymentSelectionLockedAt.toISOString(), at(1).toISOString());
   const discount = await prisma.tonhubOrderAdjustment.findFirstOrThrow({
     where: { orderId: ids.order, kind: "PAYMENT_METHOD_DISCOUNT" },

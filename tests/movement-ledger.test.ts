@@ -731,6 +731,9 @@ test("automatic official USDT sweep fails closed when credited asset-wallet owne
 
 test("automatic GRAM sweeps reserve sequence two for terminal payment", async () => {
   const memory = createMemoryLedgerDb();
+  const gramQuote = memory.quotes.find(({ asset }: any) => asset === "GRAM");
+  gramQuote.discountFiatMicros = "0";
+  gramQuote.netFiatMicros = gramQuote.grossFiatMicros;
   const owner = Address.parseRaw(`0:${"41".repeat(32)}`).toRawString();
   Object.assign(memory.deposits[0], {
     network: "testnet",
@@ -1073,7 +1076,7 @@ test("an exact all-GRAM shortfall applies the immutable quote discount and close
   assert.equal(memory.adjustments.length, 1);
 });
 
-test("a mixed payment or a non-GRAM selected rail never receives the GRAM-only discount", async () => {
+test("a mixed payment gets no discount, while an all-GRAM payment does regardless of the selected rail", async () => {
   const mixed = createMemoryLedgerDb();
   const mixedLedger = createMovementLedger(mixed.db);
   const gram = await mixedLedger.recordObserved(movement({ amountAtomic: "1200000000" }));
@@ -1107,22 +1110,72 @@ test("a mixed payment or a non-GRAM selected rail never receives the GRAM-only d
   assert.equal(mixedResult.order.discountFiatMicros, "0");
   assert.equal(mixed.adjustments.length, 0);
 
-  const wrongSelection = createMemoryLedgerDb();
-  wrongSelection.invoices[0].checkoutAsset = "USDT";
-  const wrongSelectionLedger = createMovementLedger(wrongSelection.db);
-  const wrongRailGram = await wrongSelectionLedger.recordObserved(
+  const usdtSelection = createMemoryLedgerDb();
+  usdtSelection.invoices[0].checkoutAsset = "USDT";
+  const usdtSelectionLedger = createMovementLedger(usdtSelection.db);
+  const allGram = await usdtSelectionLedger.recordObserved(
     movement({ amountAtomic: "1600000000" }),
   );
-  const wrongSelectionResult = await wrongSelectionLedger.creditMovement({
-    movementId: wrongRailGram.id,
+  const allGramResult = await usdtSelectionLedger.creditMovement({
+    movementId: allGram.id,
     orderId: "order-1",
     invoiceId: "invoice-1",
     validationCode: "NATIVE_INBOUND_V1",
   });
-  assert.equal(wrongSelectionResult.order.status, "PARTIAL");
-  assert.equal(wrongSelectionResult.order.discountFiatMicros, "0");
-  assert.equal(wrongSelection.invoices[0].paymentSelectionLockedAsset, "USDT");
-  assert.equal(wrongSelection.adjustments.length, 0);
+  assert.equal(allGramResult.order.status, "PAID");
+  assert.equal(allGramResult.order.discountFiatMicros, "1000000");
+  assert.equal(usdtSelection.invoices[0].paymentSelectionLockedAsset, "USDT");
+  assert.equal(usdtSelection.adjustments.length, 1);
+});
+
+test("replaying an already credited all-GRAM payment repairs a missing discount after rollout", async () => {
+  const memory = createMemoryLedgerDb();
+  memory.invoices[0].checkoutAsset = "USDT";
+  const ledger = createMovementLedger(memory.db);
+  const gram = await ledger.recordObserved(movement({ amountAtomic: "1600000000" }));
+  Object.assign(memory.movements[0], {
+    status: "CREDITED",
+    validationCode: "NATIVE_INBOUND_V1",
+    rateSnapshotId: "rate-gram-usd",
+    fiatCreditMicros: "4000000",
+  });
+  memory.allocations.push({
+    id: "allocation-rollout-1",
+    movementId: gram.id,
+    orderId: "order-1",
+    invoiceId: "invoice-1",
+    kind: "CREDIT",
+    reversesAllocationId: null,
+    fiatCreditMicros: "4000000",
+    allocatedBy: "system",
+    allocatedAt: new Date("2026-08-13T10:00:05.000Z"),
+    note: null,
+  });
+  Object.assign(memory.orders[0], {
+    status: "PARTIAL",
+    creditedFiatMicros: "4000000",
+  });
+  Object.assign(memory.invoices[0], {
+    status: "PARTIAL",
+    creditedFiatMicros: "4000000",
+    remainingFiatMicros: "1000000",
+    paymentSelectionLockedAsset: "USDT",
+    paymentSelectionLockedAt: gram.blockchainAt,
+    firstMovementAt: gram.blockchainAt,
+  });
+
+  const repaired = await ledger.creditMovement({
+    movementId: gram.id,
+    orderId: "order-1",
+    invoiceId: "invoice-1",
+    validationCode: "NATIVE_INBOUND_V1",
+  });
+
+  assert.equal(repaired.order.status, "PAID");
+  assert.equal(repaired.order.discountFiatMicros, "1000000");
+  assert.equal(memory.invoices[0].status, "PAID");
+  assert.equal(memory.invoices[0].remainingFiatMicros, "0");
+  assert.equal(memory.adjustments.length, 1);
 });
 
 test("known later USDT evidence on another attempt prevents a transient GRAM discount", async () => {
