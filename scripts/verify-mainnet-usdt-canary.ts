@@ -84,7 +84,7 @@ try {
     },
     now: new Date("2026-08-13T12:03:00.000Z"),
   });
-  assert.equal(ready.ok, true);
+  assert.equal(ready.ok, true, JSON.stringify(ready.blockers));
   assert.equal(ready.unresolvedRecoveries, 0);
 } finally {
   await prisma.$disconnect();

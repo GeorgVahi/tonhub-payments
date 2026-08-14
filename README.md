@@ -301,6 +301,21 @@ automatic-sweep cap with `TON_INTERMEDIATE_SWEEP_TRIGGER_BPS` and
 `TON_MAX_AUTOMATIC_SWEEPS_PER_ASSET` (1 or 2). These values are immutable snapshots on
 new orders, so an env change never rewrites an already issued obligation.
 
+Under-minimum partials remain journaled and valued but are not credited or
+swept one by one. A later movement atomically activates the whole held group
+when its cumulative fiat value reaches the attempt threshold; the 24-hour
+partial window starts at the earliest blockchain movement in that group.
+Automatic sweeps are allocation-backed and bounded per order and asset. With
+the default cap of two, sequence 1 may run when total credited fiat reaches 90%
+of gross or newly unswept credited value for that asset reaches $100/€100;
+sequence 2 is reserved for `PAID`. GRAM and official USD₮ use the same durable
+job history. A native job persists its balance, reserve, recipient, and wallet
+seqno before broadcast, then confirms only from an exact on-chain outgoing
+message match (owner, recipient, value, job-specific comment, hash, and LT).
+Failed automatic jobs stop consuming worker batches until an explicit admin
+retry; due jobs rotate by their last lifecycle update. The additive migration
+also queues already-credited partial orders that meet the new threshold.
+
 The React widget also supports TON Connect through the official
 `@tonconnect/ui-react` client. Pass an HTTPS manifest URL through the
 `tonConnectManifestUrl` prop (the demo reads `VITE_TONCONNECT_MANIFEST_URL`).

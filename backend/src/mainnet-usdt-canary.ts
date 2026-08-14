@@ -1,7 +1,7 @@
 import { resolveAllowedNetworks } from "./config";
 import { resolveCheckoutAssetPolicy } from "./checkout-assets";
 
-const requiredMigration = "20260814102000_cross_scanner_settlement_horizon";
+const requiredMigration = "20260814103000_cumulative_held_and_sweep_policy";
 
 type CanaryDb = {
   $queryRawUnsafe: (query: string, ...values: unknown[]) => Promise<any[]>;

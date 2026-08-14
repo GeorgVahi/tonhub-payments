@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { Buffer } from "node:buffer";
+import { Address } from "@ton/core";
 import {
   checkTonhubPaymentInvoice,
   settleTonhubInvoice
@@ -22,6 +23,7 @@ import type {
   TonhubPaymentInvoiceRecord
 } from "../backend/src/types";
 import {
+  findExactTonNativeSweepTransfer,
   sweepTonDepositAddress,
   type TonDepositSweepBlockchain,
   type TonDepositSweepConfig,
@@ -603,6 +605,389 @@ test("native GRAM sweep sends balance minus reserve and persists the broadcast m
   assert.equal(repository.sent()?.reserveNano, "50000000");
   assert.equal(repository.sent()?.seqno, 7);
   assert.equal(repository.failed(), null);
+});
+
+test("automatic GRAM sweep persists its seqno plan before broadcast and confirms without a second send", async () => {
+  const record: TonDepositSweepRecord = {
+    ...makeSweepRecord(),
+    assetSweepId: "asset-sweep-gram-1",
+    assetSweepStatus: "QUEUED",
+    assetSweepAmountAtomic: null,
+    assetSweepReserveAtomic: null,
+    assetSweepRecipientAddress: null,
+    assetSweepSeqno: null,
+    orderId: "order-gram-1",
+  };
+  const events: string[] = [];
+  const repository: TonDepositSweepRepository = {
+    listSweepCandidates: async () => [record],
+    claimSweepCandidate: async ({ leaseOwner }) => ({
+      ...record,
+      assetSweepStatus: "READY",
+      assetSweepLeaseOwner: leaseOwner ?? null,
+    }),
+    markSweepReady: async (input) => {
+      events.push(`ready:${input.seqno}:${input.amountNano}`);
+    },
+    markSweepSent: async (input) => {
+      events.push(`sent:${input.seqno}:${input.amountNano}`);
+    },
+    markSweepConfirmed: async () => {
+      events.push("confirmed");
+    },
+    deferAssetSweep: async () => {
+      events.push("deferred");
+    },
+    markSweepFailed: async (input) => {
+      assert.fail(input.error);
+    },
+  };
+  let broadcasts = 0;
+  const blockchain: TonDepositSweepBlockchain = {
+    getBalance: async () => 1_000_000_000n,
+    getWalletSeqno: async () => 7,
+    sendSweepTransfer: async (input) => {
+      broadcasts += 1;
+      assert.equal(input.seqno, 7);
+      return { seqno: 7 };
+    },
+    findSweepTransfer: async () => ({
+      transactionHash: "a1".repeat(32),
+      transactionLt: "7001",
+      blockchainAt: new Date("2026-05-11T10:15:01.000Z"),
+    }),
+    waitForWalletSeqno: async () => true,
+  };
+  const signingLease: TonWalletSigningLease = {
+    acquire: async () => true,
+    release: async () => {
+      events.push("released");
+    },
+  };
+
+  const outcome = await sweepTonDepositAddress({
+    record,
+    config: makeSweepConfig(),
+    repository,
+    blockchain,
+    signingLease,
+    now: () => new Date("2026-05-11T10:15:00.000Z"),
+  });
+
+  assert.equal(outcome.status, "confirmed");
+  assert.equal(broadcasts, 1);
+  assert.deepEqual(events, [
+    "ready:7:950000000",
+    "sent:7:950000000",
+    "confirmed",
+    "released",
+  ]);
+});
+
+test("automatic GRAM sweep defers normal deposit signing-lease contention without opening recovery", async () => {
+  const record: TonDepositSweepRecord = {
+    ...makeSweepRecord(),
+    assetSweepId: "asset-sweep-gram-signing-contention",
+    assetSweepStatus: "QUEUED",
+    orderId: "order-gram-signing-contention",
+  };
+  let deferred = 0;
+  const repository: TonDepositSweepRepository = {
+    listSweepCandidates: async () => [record],
+    claimSweepCandidate: async ({ leaseOwner }) => ({
+      ...record,
+      assetSweepStatus: "READY",
+      assetSweepLeaseOwner: leaseOwner ?? null,
+    }),
+    markSweepSent: async () => assert.fail("lease contention must not broadcast"),
+    markSweepFailed: async (input) => assert.fail(input.error),
+    deferAssetSweep: async () => {
+      deferred += 1;
+    },
+  };
+  const blockchain: TonDepositSweepBlockchain = {
+    getBalance: async () => assert.fail("lease contention must not read blockchain state"),
+    sendSweepTransfer: async () => assert.fail("lease contention must not broadcast"),
+    waitForWalletSeqno: async () => assert.fail("lease contention must not poll seqno"),
+  };
+  const outcome = await sweepTonDepositAddress({
+    record,
+    config: makeSweepConfig(),
+    repository,
+    blockchain,
+    signingLease: {
+      acquire: async () => false,
+      release: async () => assert.fail("an unowned signing lease must not be released"),
+    },
+    now: () => new Date("2026-05-11T10:15:00.000Z"),
+  });
+
+  assert.equal(outcome.status, "claimed-by-other");
+  assert.equal(deferred, 1);
+});
+
+test("automatic GRAM sweep fails closed when a READY plan has an ambiguously advanced seqno", async () => {
+  const record: TonDepositSweepRecord = {
+    ...makeSweepRecord(),
+    assetSweepId: "asset-sweep-gram-ambiguous",
+    assetSweepStatus: "READY",
+    assetSweepAmountAtomic: "950000000",
+    assetSweepReserveAtomic: "50000000",
+    assetSweepRecipientAddress: makeSweepConfig().recipientAddress,
+    assetSweepSeqno: 7,
+    assetSweepStartedAt: new Date("2026-05-11T10:13:00.000Z"),
+    orderId: "order-gram-ambiguous",
+  };
+  let broadcasts = 0;
+  let confirmations = 0;
+  let failure = "";
+  const repository: TonDepositSweepRepository = {
+    listSweepCandidates: async () => [record],
+    claimSweepCandidate: async ({ leaseOwner }) => ({
+      ...record,
+      assetSweepLeaseOwner: leaseOwner ?? null,
+    }),
+    markSweepSent: async () => assert.fail("ambiguous READY plan must not become SENT"),
+    markSweepConfirmed: async () => {
+      confirmations += 1;
+    },
+    markSweepFailed: async (input) => {
+      failure = input.error;
+    },
+  };
+  const blockchain: TonDepositSweepBlockchain = {
+    getBalance: async () => assert.fail("ambiguous READY plan must not read or spend the balance"),
+    sendSweepTransfer: async () => {
+      broadcasts += 1;
+      return { seqno: 7 };
+    },
+    findSweepTransfer: async () => null,
+    waitForWalletSeqno: async () => true,
+  };
+  const signingLease: TonWalletSigningLease = {
+    acquire: async () => true,
+    release: async () => undefined,
+  };
+
+  const outcome = await sweepTonDepositAddress({
+    record,
+    config: makeSweepConfig(),
+    repository,
+    blockchain,
+    signingLease,
+    now: () => new Date("2026-05-11T10:15:00.000Z"),
+  });
+
+  assert.equal(outcome.status, "failed");
+  assert.equal(broadcasts, 0);
+  assert.equal(confirmations, 0);
+  assert.match(failure, /ambiguous/i);
+});
+
+test("automatic GRAM sweep reconciles a READY crash window from exact chain evidence", async () => {
+  const record: TonDepositSweepRecord = {
+    ...makeSweepRecord(),
+    assetSweepId: "asset-sweep-gram-ready-recovery",
+    assetSweepStatus: "READY",
+    assetSweepAmountAtomic: "950000000",
+    assetSweepReserveAtomic: "50000000",
+    assetSweepRecipientAddress: makeSweepConfig().recipientAddress,
+    assetSweepSeqno: 7,
+    assetSweepStartedAt: new Date("2026-05-11T10:13:00.000Z"),
+    orderId: "order-gram-ready-recovery",
+  };
+  const events: string[] = [];
+  const repository: TonDepositSweepRepository = {
+    listSweepCandidates: async () => [record],
+    claimSweepCandidate: async ({ leaseOwner }) => ({
+      ...record,
+      assetSweepLeaseOwner: leaseOwner ?? null,
+    }),
+    markSweepSent: async (input) => {
+      events.push(`sent:${input.seqno}:${input.sentAt.toISOString()}`);
+    },
+    markSweepConfirmed: async (input) => {
+      events.push(`confirmed:${input.confirmation.transactionHash}`);
+    },
+    markSweepFailed: async (input) => assert.fail(input.error),
+  };
+  let broadcasts = 0;
+  let seqnoChecks = 0;
+  const blockchain: TonDepositSweepBlockchain = {
+    getBalance: async () => assert.fail("recovered READY plan must not read the balance"),
+    sendSweepTransfer: async () => {
+      broadcasts += 1;
+      return { seqno: 7 };
+    },
+    findSweepTransfer: async () => ({
+      transactionHash: "a3".repeat(32),
+      transactionLt: "7003",
+      blockchainAt: new Date("2026-05-11T10:14:00.000Z"),
+    }),
+    waitForWalletSeqno: async () => {
+      seqnoChecks += 1;
+      return true;
+    },
+  };
+  const signingLease: TonWalletSigningLease = {
+    acquire: async () => true,
+    release: async () => undefined,
+  };
+
+  const outcome = await sweepTonDepositAddress({
+    record,
+    config: makeSweepConfig(),
+    repository,
+    blockchain,
+    signingLease,
+    now: () => new Date("2026-05-11T10:15:00.000Z"),
+  });
+
+  assert.equal(outcome.status, "confirmed");
+  assert.equal(broadcasts, 0);
+  assert.equal(seqnoChecks, 0);
+  assert.deepEqual(events, [
+    "sent:7:2026-05-11T10:14:00.000Z",
+    `confirmed:${"a3".repeat(32)}`,
+  ]);
+});
+
+test("automatic GRAM sweep confirms a persisted SENT plan without rebroadcast", async () => {
+  const record: TonDepositSweepRecord = {
+    ...makeSweepRecord(),
+    assetSweepId: "asset-sweep-gram-sent",
+    assetSweepStatus: "SENT",
+    assetSweepAmountAtomic: "950000000",
+    assetSweepReserveAtomic: "50000000",
+    assetSweepRecipientAddress: makeSweepConfig().recipientAddress,
+    assetSweepSeqno: 7,
+    assetSweepSentAt: new Date("2026-05-11T10:14:00.000Z"),
+    orderId: "order-gram-sent",
+  };
+  let broadcasts = 0;
+  let confirmations = 0;
+  const repository: TonDepositSweepRepository = {
+    listSweepCandidates: async () => [record],
+    claimSweepCandidate: async ({ leaseOwner }) => ({
+      ...record,
+      assetSweepLeaseOwner: leaseOwner ?? null,
+    }),
+    markSweepSent: async () => assert.fail("persisted SENT plan must not be sent twice"),
+    markSweepConfirmed: async () => {
+      confirmations += 1;
+    },
+    markSweepFailed: async (input) => assert.fail(input.error),
+  };
+  const blockchain: TonDepositSweepBlockchain = {
+    getBalance: async () => assert.fail("persisted SENT plan must not read or spend the balance"),
+    sendSweepTransfer: async () => {
+      broadcasts += 1;
+      return { seqno: 7 };
+    },
+    findSweepTransfer: async () => ({
+      transactionHash: "a2".repeat(32),
+      transactionLt: "7002",
+      blockchainAt: new Date("2026-05-11T10:15:00.000Z"),
+    }),
+    waitForWalletSeqno: async () => true,
+  };
+  const signingLease: TonWalletSigningLease = {
+    acquire: async () => true,
+    release: async () => undefined,
+  };
+
+  const outcome = await sweepTonDepositAddress({
+    record,
+    config: makeSweepConfig(),
+    repository,
+    blockchain,
+    signingLease,
+    now: () => new Date("2026-05-11T10:15:00.000Z"),
+  });
+
+  assert.equal(outcome.status, "confirmed");
+  if (outcome.status === "confirmed") {
+    assert.equal(outcome.amountNano, "950000000");
+    assert.equal(outcome.reserveNano, "50000000");
+  }
+  assert.equal(broadcasts, 0);
+  assert.equal(confirmations, 1);
+});
+
+test("a different outgoing operation cannot confirm a persisted SENT GRAM job", async () => {
+  const record: TonDepositSweepRecord = {
+    ...makeSweepRecord(),
+    assetSweepId: "asset-sweep-gram-cross-operation",
+    assetSweepStatus: "SENT",
+    assetSweepAmountAtomic: "950000000",
+    assetSweepReserveAtomic: "50000000",
+    assetSweepRecipientAddress: makeSweepConfig().recipientAddress,
+    assetSweepSeqno: 7,
+    assetSweepStartedAt: new Date("2026-05-11T10:13:00.000Z"),
+    assetSweepSentAt: new Date("2026-05-11T10:14:00.000Z"),
+    orderId: "order-gram-cross-operation",
+  };
+  let confirmations = 0;
+  let deferred = 0;
+  const repository: TonDepositSweepRepository = {
+    listSweepCandidates: async () => [record],
+    claimSweepCandidate: async ({ leaseOwner }) => ({ ...record, assetSweepLeaseOwner: leaseOwner }),
+    markSweepSent: async () => assert.fail("persisted SENT plan must not send again"),
+    markSweepConfirmed: async () => {
+      confirmations += 1;
+    },
+    deferAssetSweep: async () => {
+      deferred += 1;
+    },
+    markSweepFailed: async (input) => assert.fail(input.error),
+  };
+  const blockchain: TonDepositSweepBlockchain = {
+    getBalance: async () => assert.fail("persisted SENT plan must not read the balance"),
+    sendSweepTransfer: async () => assert.fail("persisted SENT plan must not send again"),
+    findSweepTransfer: async () => null,
+    waitForWalletSeqno: async () => true,
+  };
+  const signingLease: TonWalletSigningLease = {
+    acquire: async () => true,
+    release: async () => undefined,
+  };
+
+  const outcome = await sweepTonDepositAddress({
+    record,
+    config: makeSweepConfig(),
+    repository,
+    blockchain,
+    signingLease,
+    now: () => new Date("2026-05-11T10:15:00.000Z"),
+  });
+
+  assert.equal(outcome.status, "sent");
+  assert.equal(confirmations, 0);
+  assert.equal(deferred, 1);
+});
+
+test("native confirmation lookup fails closed when pagination cannot reach the send boundary", async () => {
+  let pages = 0;
+  await assert.rejects(findExactTonNativeSweepTransfer({
+    fetchPage: async (_cursor, limit) => {
+      pages += 1;
+      return Array.from({ length: limit }, (_, index) => ({
+        now: 1_800_000_000,
+        lt: BigInt(pages * 100 + index),
+        hash: () => Buffer.alloc(32, pages * 10 + index),
+        description: { type: "generic", aborted: false, actionPhase: { success: false } },
+        outMessages: { values: () => [] },
+      }));
+    },
+    walletAddress: Address.parse(makeSweepRecord().addressRaw),
+    recipientAddress: Address.parse(makeSweepConfig().recipientAddress),
+    amountNano: 950000000n,
+    comment: "Tonhub automatic GRAM sweep pagination",
+    notBefore: new Date("2026-05-11T10:00:00.000Z"),
+    pageSize: 2,
+    maxPages: 2,
+  }), /pagination cap was exhausted/i);
+  assert.equal(pages, 2);
 });
 
 test("native GRAM sweep below reserve is retained and recorded as a retryable failure", async () => {

@@ -7,8 +7,7 @@ import {
   rateSnapshotMaxAgeMs,
 } from "./rate-snapshots";
 import { parseTonNetwork, type TonNetwork } from "./ton/direct-payments";
-import { canonicalTonAddress } from "./ton/gram-shadow-scanner";
-import { officialMainnetUsdtMasterAddress } from "./ton/jetton-identities";
+import { reconcileAutomaticAssetSweeps } from "./automatic-sweeps";
 import {
   assertPaymentAssetSnapshot,
   formatAssetAmount,
@@ -329,133 +328,6 @@ function movementFactsIdentity(value: PaymentMovementDraft) {
     blockchainAt: value.blockchainAt.toISOString(),
     rawPayload: JSON.parse(jsonIdentity(value.rawPayload)),
   });
-}
-
-function officialUsdtPayload(value: unknown) {
-  return value !== null &&
-    typeof value === "object" &&
-    !Array.isArray(value) &&
-    (value as Record<string, unknown>).officialUsdt === true &&
-    (value as Record<string, unknown>).internalTestAsset !== true;
-}
-
-async function enqueueOfficialUsdtSweep(tx: PrismaLike, movement: PaymentMovementRecord) {
-  if (
-    movement.network !== "mainnet" ||
-    movement.direction !== "INCOMING" ||
-    movement.asset !== "USDT" ||
-    movement.assetKind !== "JETTON" ||
-    movement.assetDecimals !== 6 ||
-    movement.status === "REJECTED" ||
-    canonicalTonAddress(movement.jettonMasterAddress) !== officialMainnetUsdtMasterAddress ||
-    !officialUsdtPayload(movement.rawPayload) ||
-    !movement.depositAddressId
-  ) {
-    return null;
-  }
-  const deposit = await tx.tonhubDepositAddress.findUnique({
-    where: { id: movement.depositAddressId },
-    include: {
-      invoice: true,
-      assetAccounts: { where: { asset: "USDT" } },
-    },
-  });
-  const invoice = deposit?.invoice;
-  const account = deposit?.assetAccounts?.[0];
-  const accountWalletAddress = canonicalTonAddress(account?.assetWalletAddress);
-  const movementWalletAddress = canonicalTonAddress(movement.jettonWalletAddress);
-  const ownerAddresses = [
-    deposit?.address,
-    deposit?.addressRaw,
-    invoice?.address,
-    invoice?.addressRaw,
-    movement.toAddress,
-    movement.ownerAddress,
-  ].map(canonicalTonAddress);
-  if (
-    !deposit || !invoice || !account ||
-    deposit.network !== "mainnet" ||
-    invoice.network !== "mainnet" ||
-    ownerAddresses.some((address) => !address || address !== ownerAddresses[0]) ||
-    account.network !== "mainnet" ||
-    account.asset !== "USDT" ||
-    account.assetKind !== "JETTON" ||
-    account.assetDecimals !== 6 ||
-    account.status !== "VERIFIED" ||
-    canonicalTonAddress(account.jettonMasterAddress) !== officialMainnetUsdtMasterAddress ||
-    !accountWalletAddress ||
-    !movementWalletAddress ||
-    accountWalletAddress !== movementWalletAddress
-  ) {
-    throw new MovementAllocationConflictError(
-      `Official USDT movement ${movement.id} cannot queue a sweep because ownership evidence is inconsistent.`,
-    );
-  }
-  const idempotencyKey = `official-usdt-movement:${movement.id}`;
-  await tx.$queryRawUnsafe(
-    `SELECT "id" FROM "TonhubAssetSweep"
-     WHERE "depositAddressId" = $1 AND "asset" = 'USDT'
-       AND "status" IN ('QUEUED', 'GAS_CHECK', 'GAS_TOPUP_REQUIRED', 'GAS_TOPUP_SENT', 'READY', 'SENT', 'FAILED')
-     FOR UPDATE`,
-    deposit.id,
-  );
-  const ledgerMovements = await tx.tonhubPaymentMovement.findMany({
-    where: {
-      depositAddressId: deposit.id,
-      network: "mainnet",
-      asset: "USDT",
-      assetKind: "JETTON",
-      status: { not: "REJECTED" },
-    },
-    select: { direction: true, amountAtomic: true },
-  });
-  const unsweptAtomic = ledgerMovements.reduce(
-    (balance: bigint, candidate: { direction: string; amountAtomic: string }) =>
-      balance + (candidate.direction === "INCOMING" ? 1n : -1n) * BigInt(candidate.amountAtomic),
-    0n,
-  );
-  if (unsweptAtomic <= 0n) {
-    return null;
-  }
-  await tx.tonhubAssetSweep.createMany({
-    data: {
-      idempotencyKey,
-      depositAddressId: deposit.id,
-      orderId: invoice.orderId,
-      invoiceId: invoice.id,
-      asset: "USDT",
-      assetKind: "JETTON",
-      status: "QUEUED",
-    },
-    skipDuplicates: true,
-  });
-  const sweep = await tx.tonhubAssetSweep.findFirst({
-    where: {
-      depositAddressId: deposit.id,
-      asset: "USDT",
-      OR: [
-        { idempotencyKey },
-        {
-          status: {
-            in: [
-              "QUEUED",
-              "GAS_CHECK",
-              "GAS_TOPUP_REQUIRED",
-              "GAS_TOPUP_SENT",
-              "READY",
-              "SENT",
-              "FAILED",
-            ],
-          },
-        },
-      ],
-    },
-    orderBy: { createdAt: "desc" },
-  });
-  if (!sweep) {
-    throw new Error(`Official USDT movement ${movement.id} did not create or join an active sweep.`);
-  }
-  return sweep;
 }
 
 function compareMovementChronology(left: PaymentMovementRecord, right: PaymentMovementRecord) {
@@ -1319,7 +1191,6 @@ export function createMovementLedger(db: PrismaLike) {
           );
         }
         await lockObservedMovementSelection(tx, movement);
-        await enqueueOfficialUsdtSweep(tx, movement);
         return movement;
       });
     },
@@ -1492,10 +1363,6 @@ export function createMovementLedger(db: PrismaLike) {
           selectionMovement?.blockchainAt ?? movement.blockchainAt,
         );
       };
-      if (movement.status === "HELD_UNDER_MINIMUM") {
-        await lockSelection();
-        throw new MovementAllocationConflictError(`Movement ${movement.id} is ${movement.status}.`);
-      }
       if (movement.status === "CREDITED") {
         await lockSelection();
         const allocation = await findCreditAllocation(tx, movement.id);
@@ -1505,7 +1372,7 @@ export function createMovementLedger(db: PrismaLike) {
         assertAllocationTarget(allocation, { orderId, invoiceId });
         return { outcome: "credited" as const, movement, allocation, order };
       }
-      if (unresolvedMovements[0]?.id !== movement.id) {
+      if (unresolvedMovements[0] && unresolvedMovements[0].id !== movement.id) {
         await lockSelection();
         return {
           outcome: "blocked-earlier-movement" as const,
@@ -1562,15 +1429,22 @@ export function createMovementLedger(db: PrismaLike) {
             },
           })
         : null;
+      const multipleFundedDeposits = baseline.activeCredits.some(
+        ({ movement: creditedMovement }) =>
+          creditedMovement.depositAddressId !== movement.depositAddressId,
+      );
       const hardTerminal = ["CANCELLED", "FAILED", "RECOVERY"].includes(order.status);
-      const forceRecovery = late || postPaid || outOfOrder || hardTerminal || Boolean(conflictingAttempt);
+      const forceRecovery = late || postPaid || outOfOrder || hardTerminal ||
+        Boolean(conflictingAttempt) || multipleFundedDeposits;
       const settlementReason = outOfOrder
         ? "OUT_OF_ORDER_MOVEMENT_RECOVERY"
         : postPaid
           ? "POST_PAID_MOVEMENT_RECOVERY"
           : late
             ? "LATE_MOVEMENT_RECOVERY"
-            : forceRecovery
+            : multipleFundedDeposits
+              ? "MULTIPLE_FUNDED_DEPOSITS_RECOVERY"
+              : forceRecovery
               ? "TERMINAL_OR_CONFLICTING_ATTEMPT_RECOVERY"
               : undefined;
       const lockedRate = movement.asset === "GRAM"
@@ -1599,30 +1473,58 @@ export function createMovementLedger(db: PrismaLike) {
         });
         return { outcome: "recovery" as const, movement, allocation: null, order };
       }
-      const rateValue = lockedRate ?? await tx.tonhubRateSnapshot.findFirst({
-          where: {
-            asset: movement.asset,
-            baseCurrency: movement.asset,
-            quoteCurrency: order.fiatCurrency,
-            source: expectedRateSource(movement.asset),
-            observedAt: { lte: movement.blockchainAt },
-          },
-          orderBy: [{ observedAt: "desc" }, { fetchedAt: "desc" }, { createdAt: "desc" }],
+      let rate: ReturnType<typeof normalizeRateSnapshotRecord>;
+      let fiatCreditMicros: string;
+      if (movement.status === "HELD_UNDER_MINIMUM") {
+        const storedRate = movement.rateSnapshotId
+          ? await tx.tonhubRateSnapshot.findUnique({ where: { id: movement.rateSnapshotId } })
+          : null;
+        if (!storedRate || movement.fiatCreditMicros === null) {
+          throw new MovementAllocationConflictError(
+            `Held movement ${movement.id} lacks immutable valuation evidence.`,
+          );
+        }
+        rate = normalizeRateSnapshotRecord(storedRate);
+        if (
+          rate.asset !== movement.asset ||
+          rate.baseCurrency !== movement.asset ||
+          rate.quoteCurrency !== order.fiatCurrency ||
+          rate.source !== expectedRateSource(movement.asset)
+        ) {
+          throw new MovementAllocationConflictError(
+            `Held movement ${movement.id} has inconsistent rate evidence.`,
+          );
+        }
+        fiatCreditMicros = nonNegativeInteger(
+          movement.fiatCreditMicros,
+          "Held movement fiatCreditMicros",
+        );
+      } else {
+        const rateValue = lockedRate ?? await tx.tonhubRateSnapshot.findFirst({
+            where: {
+              asset: movement.asset,
+              baseCurrency: movement.asset,
+              quoteCurrency: order.fiatCurrency,
+              source: expectedRateSource(movement.asset),
+              observedAt: { lte: movement.blockchainAt },
+            },
+            orderBy: [{ observedAt: "desc" }, { fetchedAt: "desc" }, { createdAt: "desc" }],
+          });
+        if (!rateValue) {
+          movement = await markRatePending(tx, movement, validationCode);
+          return { outcome: "rate-pending" as const, movement, allocation: null, order };
+        }
+        rate = lockedRate ?? normalizeRateSnapshotRecord(rateValue);
+        if (!lockedRate && movement.blockchainAt.getTime() - rate.observedAt.getTime() > maxRateAgeMs) {
+          movement = await markRatePending(tx, movement, validationCode);
+          return { outcome: "rate-pending" as const, movement, allocation: null, order };
+        }
+        fiatCreditMicros = calculateMovementFiatMicros({
+          amountAtomic: movement.amountAtomic,
+          assetDecimals: movement.assetDecimals,
+          price: rate.price,
         });
-      if (!rateValue) {
-        movement = await markRatePending(tx, movement, validationCode);
-        return { outcome: "rate-pending" as const, movement, allocation: null, order };
       }
-      const rate = lockedRate ?? normalizeRateSnapshotRecord(rateValue);
-      if (!lockedRate && movement.blockchainAt.getTime() - rate.observedAt.getTime() > maxRateAgeMs) {
-        movement = await markRatePending(tx, movement, validationCode);
-        return { outcome: "rate-pending" as const, movement, allocation: null, order };
-      }
-      const fiatCreditMicros = calculateMovementFiatMicros({
-        amountAtomic: movement.amountAtomic,
-        assetDecimals: movement.assetDecimals,
-        price: rate.price,
-      });
       if (fiatCreditMicros === "0") {
         await tx.tonhubPaymentMovement.updateMany({
           where: { id: movement.id, status: movement.status },
@@ -1653,11 +1555,78 @@ export function createMovementLedger(db: PrismaLike) {
       }
       const obligation = BigInt(order.fiatAmountMicros);
       const activationThreshold = BigInt(activationThresholdValue);
+      const heldMovements = (await tx.tonhubPaymentMovement.findMany({
+        where: {
+          depositAddressId: movement.depositAddressId,
+          direction: "INCOMING",
+          status: "HELD_UNDER_MINIMUM",
+        },
+      }))
+        .map((value: unknown) => requireMovement(value, "unknown"))
+        .filter((candidate: PaymentMovementRecord) =>
+          candidate.id !== movement.id &&
+          candidate.rateSnapshotId !== null &&
+          candidate.fiatCreditMicros !== null &&
+          BigInt(candidate.fiatCreditMicros) > BigInt(0))
+        .sort(compareMovementChronology);
+      const candidateFiatMicros = new Map<string, string>([
+        [movement.id, fiatCreditMicros],
+        ...heldMovements.map((candidate: PaymentMovementRecord) => [
+          candidate.id,
+          candidate.fiatCreditMicros!,
+        ] as const),
+      ]);
+      const candidateRateSnapshotIds = new Map<string, string>([
+        [movement.id, rate.id],
+        ...heldMovements.map((candidate: PaymentMovementRecord) => [
+          candidate.id,
+          candidate.rateSnapshotId!,
+        ] as const),
+      ]);
+      const earliestGramCandidate = [...heldMovements, movement]
+        .filter((candidate) => candidate.asset === "GRAM")
+        .sort(compareMovementChronology)[0];
+      if (earliestGramCandidate) {
+        const gramRateValue = earliestGramCandidate.id === movement.id
+          ? rate
+          : normalizeRateSnapshotRecord(await tx.tonhubRateSnapshot.findUnique({
+              where: { id: earliestGramCandidate.rateSnapshotId },
+            }));
+        if (
+          gramRateValue.asset !== "GRAM" ||
+          gramRateValue.baseCurrency !== "GRAM" ||
+          gramRateValue.quoteCurrency !== order.fiatCurrency ||
+          gramRateValue.source !== "coingecko"
+        ) {
+          throw new MovementAllocationConflictError(
+            "The cumulative held GRAM rate snapshot has inconsistent identity.",
+          );
+        }
+        for (const candidate of [...heldMovements, movement]) {
+          if (candidate.asset !== "GRAM") continue;
+          candidateFiatMicros.set(candidate.id, calculateMovementFiatMicros({
+            amountAtomic: candidate.amountAtomic,
+            assetDecimals: candidate.assetDecimals,
+            price: gramRateValue.price,
+          }));
+          candidateRateSnapshotIds.set(candidate.id, gramRateValue.id);
+        }
+        if (movement.asset === "GRAM") {
+          fiatCreditMicros = candidateFiatMicros.get(movement.id)!;
+          rate = gramRateValue;
+        }
+      }
+      const heldFiatMicros = heldMovements.reduce(
+        (sum: bigint, candidate: PaymentMovementRecord) =>
+          sum + BigInt(candidateFiatMicros.get(candidate.id) ?? "0"),
+        BigInt(0),
+      );
+      const activatingFiatMicros = heldFiatMicros + BigInt(fiatCreditMicros);
       if (
         !forceRecovery &&
         baseline.netCredit === BigInt(0) &&
-        BigInt(fiatCreditMicros) < obligation &&
-        BigInt(fiatCreditMicros) < activationThreshold
+        activatingFiatMicros < obligation &&
+        activatingFiatMicros < activationThreshold
       ) {
         await tx.tonhubPaymentMovement.updateMany({
           where: { id: movement.id, status: movement.status },
@@ -1682,71 +1651,76 @@ export function createMovementLedger(db: PrismaLike) {
             asset: movement.asset,
             amountAtomic: movement.amountAtomic,
             fiatCreditMicros,
+            cumulativeHeldFiatMicros: activatingFiatMicros.toString(),
             activationThresholdFiatMicros: activationThreshold.toString(),
           },
         });
         return { outcome: "held-under-minimum" as const, movement, allocation: null, order };
       }
 
-      const claimed = await tx.tonhubPaymentMovement.updateMany({
-        where: {
-          id: movement.id,
-          status: { in: ["OBSERVED", "VALIDATED", "RATE_PENDING", "RECOVERY"] },
-        },
-        data: {
-          status: "CREDITED",
-          validationCode,
-          rateSnapshotId: rate.id,
-          fiatCreditMicros,
-        },
-      });
-      if (!claimed.count) {
-        movement = requireMovement(
-          await tx.tonhubPaymentMovement.findUnique({ where: { id: movement.id } }),
-          movement.id,
-        );
-        const allocation = await findCreditAllocation(tx, movement.id);
-        if (movement.status !== "CREDITED" || !allocation) {
-          throw new MovementAllocationConflictError(`Movement ${movement.id} changed concurrently.`);
-        }
-        assertAllocationTarget(allocation, { orderId, invoiceId });
-        return { outcome: "credited" as const, movement, allocation, order };
-      }
-
-      if (movement.asset === "USDT") {
+      const creditCandidates = [...heldMovements, movement]
+        .filter((candidate, index, values) =>
+          values.findIndex(({ id }) => id === candidate.id) === index)
+        .sort(compareMovementChronology);
+      if (creditCandidates.some((candidate) => candidate.asset === "USDT")) {
         await reverseActivePaymentMethodDiscounts(tx, {
           orderId,
           cause: "USDT_CREDIT_REMOVES_GRAM_ONLY_DISCOUNT",
           evidence: {
-            movementId: movement.id,
+            movementIds: creditCandidates.map(({ id }) => id),
             movementBlockchainAt: movement.blockchainAt.toISOString(),
-            asset: movement.asset,
+            asset: "USDT",
           },
         });
       }
-
-      let allocation: MovementAllocationRecord;
-      try {
-        allocation = normalizeAllocation(await tx.tonhubMovementAllocation.create({
-          data: {
-            movementId: movement.id,
-            orderId,
-            invoiceId,
-            kind: "CREDIT",
-            fiatCreditMicros,
-            allocatedBy,
+      let allocation: MovementAllocationRecord | null = null;
+      for (const candidate of creditCandidates) {
+        const candidateFiat = candidate.id === movement.id
+          ? fiatCreditMicros
+          : nonNegativeInteger(
+              candidateFiatMicros.get(candidate.id) ?? "",
+              "Held movement fiatCreditMicros",
+            );
+        const claimed = await tx.tonhubPaymentMovement.updateMany({
+          where: {
+            id: candidate.id,
+            status: { in: ["OBSERVED", "VALIDATED", "RATE_PENDING", "RECOVERY", "HELD_UNDER_MINIMUM"] },
           },
-        }));
-      } catch (error) {
-        if (!isP2002(error)) {
-          throw error;
+          data: {
+            status: "CREDITED",
+            validationCode: candidate.validationCode ?? validationCode,
+            rateSnapshotId: candidateRateSnapshotIds.get(candidate.id),
+            fiatCreditMicros: candidateFiat,
+          },
+        });
+        let candidateAllocation: MovementAllocationRecord | null = null;
+        if (claimed.count) {
+          try {
+            candidateAllocation = normalizeAllocation(await tx.tonhubMovementAllocation.create({
+              data: {
+                movementId: candidate.id,
+                orderId,
+                invoiceId,
+                kind: "CREDIT",
+                fiatCreditMicros: candidateFiat,
+                allocatedBy,
+              },
+            }));
+          } catch (error) {
+            if (!isP2002(error)) throw error;
+          }
         }
-        const existing = await findCreditAllocation(tx, movement.id);
-        if (!existing) {
-          throw error;
+        candidateAllocation ??= await findCreditAllocation(tx, candidate.id);
+        if (!candidateAllocation) {
+          throw new MovementAllocationConflictError(
+            `Credited movement ${candidate.id} has no CREDIT allocation.`,
+          );
         }
-        assertAllocationTarget(existing, { orderId, invoiceId });
-        allocation = existing;
+        assertAllocationTarget(candidateAllocation, { orderId, invoiceId });
+        if (candidate.id === movement.id) allocation = candidateAllocation;
+      }
+      if (!allocation) {
+        throw new MovementAllocationConflictError(`Movement ${movement.id} was not allocated.`);
       }
       movement = requireMovement(
         await tx.tonhubPaymentMovement.findUnique({ where: { id: movement.id } }),
@@ -1761,24 +1735,53 @@ export function createMovementLedger(db: PrismaLike) {
           (candidate: PaymentMovementRecord) => candidate.id !== movement.id,
         ),
       });
+      const accountingMovement = creditCandidates[0] ?? movement;
+      const creditedBatchFiatMicros = creditCandidates.reduce(
+        (sum, candidate) => sum + BigInt(
+          candidateFiatMicros.get(candidate.id) ?? "0"
+        ),
+        BigInt(0),
+      );
       const updatedOrder = await syncOrderAccounting(tx, {
         order,
-        paidAt: movement.blockchainAt,
+        paidAt: accountingMovement.blockchainAt,
         forceRecovery,
         allowExpiredRevival: order.status === "EXPIRED" && !late && !conflictingAttempt,
         expiresAt: !forceRecovery && baseline.netCredit === BigInt(0) &&
-          baseline.netCredit + BigInt(fiatCreditMicros) < BigInt(order.fiatAmountMicros)
-          ? partialWindowEnd(movement.blockchainAt, partialPaymentTtlHours)
+          baseline.netCredit + creditedBatchFiatMicros < BigInt(order.fiatAmountMicros)
+          ? partialWindowEnd(accountingMovement.blockchainAt, partialPaymentTtlHours)
           : order.expiresAt,
       });
       const updatedInvoice = await syncInvoiceAccounting(tx, {
         invoice,
         order: updatedOrder,
-        movement,
+        movement: accountingMovement,
         forceRecovery,
         partialPaymentTtlHours,
         settlementReason,
       });
+      if (heldMovements.length > 0) {
+        await tx.tonhubRecoveryCase.updateMany({
+          where: {
+            movementId: { in: heldMovements.map((candidate: PaymentMovementRecord) => candidate.id) },
+            reason: "INITIAL_PAYMENT_UNDER_MINIMUM",
+            status: { in: ["OPEN", "REVIEWED"] },
+          },
+          data: {
+            status: "RESOLVED",
+            resolvedBy: "system:cumulative-threshold",
+            resolvedAt: settlementAt,
+          },
+        });
+      }
+      if (!forceRecovery) {
+        await reconcileAutomaticAssetSweeps({
+          tx,
+          orderId,
+          invoiceId,
+          triggeredAt: settlementAt,
+        });
+      }
       if (forceRecovery) {
         const reason = outOfOrder
           ? "OUT_OF_ORDER_MOVEMENT"
@@ -1786,7 +1789,9 @@ export function createMovementLedger(db: PrismaLike) {
             ? "POST_PAID_MOVEMENT"
             : late
               ? "LATE_MOVEMENT"
-              : "TERMINAL_OR_CONFLICTING_ATTEMPT_MOVEMENT";
+              : multipleFundedDeposits
+                ? "MULTIPLE_FUNDED_DEPOSIT_MOVEMENT"
+                : "TERMINAL_OR_CONFLICTING_ATTEMPT_MOVEMENT";
         await createRecoveryCase(tx, {
           movementId,
           orderId,
@@ -1798,7 +1803,9 @@ export function createMovementLedger(db: PrismaLike) {
               ? "Payment arrived after the order was fully paid"
               : late
                 ? "Payment arrived after the active payment window"
-                : "Payment belongs to a terminal or superseded attempt",
+                : multipleFundedDeposits
+                  ? "Payment funds another deposit wallet for the same order"
+                  : "Payment belongs to a terminal or superseded attempt",
           details: {
             asset: movement.asset,
             amountAtomic: movement.amountAtomic,

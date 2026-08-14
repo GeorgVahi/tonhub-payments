@@ -403,6 +403,11 @@ model TonhubAssetSweep {
   invoiceId               String?
   asset                   String
   assetKind               String
+  automaticSequence       Int?
+  triggerReason           String?
+  triggerFiatMicros       String?
+  triggerCreditedFiatMicros String?
+  triggeredAt             DateTime?
   status                  TonhubAssetSweepStatus @default(QUEUED)
   amountAtomic            String?
   reserveAtomic           String?
@@ -433,6 +438,7 @@ model TonhubAssetSweep {
   @@index([status, leaseExpiresAt])
   @@index([depositAddressId, asset, createdAt])
   @@index([orderId, createdAt])
+  @@index([orderId, asset, automaticSequence])
   @@index([invoiceId, createdAt])
 }
 

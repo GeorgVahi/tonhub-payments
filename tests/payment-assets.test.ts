@@ -5,6 +5,11 @@ import { getTonhubPaymentInvoice } from "../backend/src/payments";
 import type { TonhubPaymentRepository } from "../backend/src/repository";
 import type { TonhubPaymentInvoiceRecord } from "../backend/src/types";
 import { createTonhubPaymentRoutes } from "../backend/src/routes/payments";
+
+process.env.TON_USDT_MAINNET_CHECKOUT_ENABLED = "false";
+process.env.TON_USDT_MAINNET_ADAPTER_ENABLED = "false";
+process.env.TON_MOVEMENT_SETTLEMENT_ENABLED = "false";
+delete process.env.TON_USDT_MAINNET_CANARY_EXTERNAL_IDS;
 import {
   ceilAtomicToPaymentUnit,
   formatAssetAmount,

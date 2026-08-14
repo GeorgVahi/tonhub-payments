@@ -83,6 +83,12 @@ covering invoices created by an old process near the migration boundary.
   wallet seqno across initial top-ups and post-transfer reserve repairs, even
   after a process lease expires. The step-13 migration queues any positive
   official-USDT ledger balance journaled by the earlier observer.
+- Automatic sweep rows retain immutable order/invoice/deposit ownership and
+  allocation-backed trigger evidence. Their per-order/asset sequence is capped
+  by the snapshotted policy, an intermediate row must reserve the final slot,
+  and the terminal row requires a materialized `PAID` order. Automatic
+  provenance cannot be updated, deleted, or truncated; operational lifecycle
+  fields remain mutable through the worker state machine.
 - Movement blockchain facts cannot be updated and movement rows cannot be
   deleted or truncated. Evidence fields may be attached once. Status follows
   explicit forward transitions; `RECOVERY` may re-enter validation, while
@@ -115,6 +121,9 @@ covering invoices created by an old process near the migration boundary.
   order at the database boundary, and recovery cases are idempotent per
   movement/reason. Deposit addresses carry a dedicated settlement retry time so
   worker backoff and queue fairness do not reuse scanner or sweep timestamps.
+  Positive held movements on one attempt accumulate below that threshold and
+  are promoted to `CREDITED` with one append-only allocation each in the same
+  order-locked transaction once their cumulative fiat value qualifies.
 - Each scanner cursor records a separate monotonic `scannedThroughAt` proof.
   Mainnet automatic credit waits for both the native-GRAM and official-USDT
   streams to cross the configured post-movement horizon and for their active

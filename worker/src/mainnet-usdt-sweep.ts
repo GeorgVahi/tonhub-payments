@@ -9,6 +9,7 @@ import {
 } from "@ton/core";
 import { TonClient, WalletContractV5R1 } from "@ton/ton";
 import { prisma } from "../../backend/src/db";
+import { reconcileAutomaticAssetSweeps } from "../../backend/src/automatic-sweeps";
 import {
   officialMainnetUsdtMasterAddress,
   resolveMainnetUsdtAdapterConfig,
@@ -648,6 +649,12 @@ export function createPrismaMainnetUsdtSweepRepository(db: PrismaLike): MainnetU
     },
     confirm: async ({ record, leaseOwner, confirmation, confirmedAt }) => {
       await db.$transaction(async (tx) => {
+        if (record.orderId) {
+          await tx.$queryRawUnsafe(
+            `SELECT "id" FROM "TonhubPaymentOrder" WHERE "id" = $1 FOR UPDATE`,
+            record.orderId,
+          );
+        }
         const confirmed = await tx.tonhubAssetSweep.updateMany({
           where: { id: record.id, leaseOwner, status: "SENT" },
           data: {
@@ -692,33 +699,12 @@ export function createPrismaMainnetUsdtSweepRepository(db: PrismaLike): MainnetU
           }],
           skipDuplicates: true,
         });
-        const ledgerMovements = await tx.tonhubPaymentMovement.findMany({
-          where: {
-            depositAddressId: record.depositAddressId,
-            network: "mainnet",
-            asset: "USDT",
-            assetKind: "JETTON",
-            status: { not: "REJECTED" },
-          },
-          select: { direction: true, amountAtomic: true },
-        });
-        const ledgerBalance = ledgerMovements.reduce(
-          (balance: bigint, movement: { direction: string; amountAtomic: string }) =>
-            balance + (movement.direction === "INCOMING" ? 1n : -1n) * BigInt(movement.amountAtomic),
-          0n,
-        );
-        if (ledgerBalance > 0n) {
-          await tx.tonhubAssetSweep.createMany({
-            data: {
-              idempotencyKey: `followup-usdt:${record.id}:${confirmation.transactionHash}`,
-              depositAddressId: record.depositAddressId,
-              orderId: record.orderId,
-              invoiceId: record.invoiceId,
-              asset: "USDT",
-              assetKind: "JETTON",
-              status: "QUEUED",
-            },
-            skipDuplicates: true,
+        if (record.orderId && record.invoiceId) {
+          await reconcileAutomaticAssetSweeps({
+            tx: tx as any,
+            orderId: record.orderId,
+            invoiceId: record.invoiceId,
+            triggeredAt: confirmedAt,
           });
         }
         await tx.tonhubRecoveryCase.updateMany({

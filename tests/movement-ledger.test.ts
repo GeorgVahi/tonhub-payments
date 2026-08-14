@@ -49,6 +49,9 @@ function createMemoryLedgerDb() {
     discountFiatMicros: "0",
     overpaymentFiatMicros: "0",
     gramDiscountMaxFiatMicros: "1000000",
+    intermediateSweepTriggerBps: 9000,
+    intermediateSweepMinFiatMicros: "100000000",
+    maxAutomaticSweepsPerAsset: 0,
     status: "PENDING",
     paidAt: null,
     expiresAt: new Date("2026-08-13T11:00:00.000Z"),
@@ -77,7 +80,7 @@ function createMemoryLedgerDb() {
     version: 0,
     depositAddress: { id: "deposit-1" },
   }];
-  const deposits: any[] = [{ id: "deposit-1", status: "ACTIVE" }];
+  const deposits: any[] = [{ id: "deposit-1", invoiceId: "invoice-1", status: "ACTIVE" }];
   const recoveryCases: any[] = [];
   const assetAccounts: any[] = [];
   const sweeps: any[] = [];
@@ -349,8 +352,9 @@ function createMemoryLedgerDb() {
         sweeps.push({ id: `sweep-${sweeps.length + 1}`, createdAt: now(), ...data });
         return { count: 1 };
       },
-      findFirst: async ({ where }: any) => sweeps.find((row) =>
-        row.depositAddressId === where.depositAddressId && row.asset === where.asset) ?? null,
+      findUnique: async ({ where }: any) => sweeps.find((row) => matches(row, where)) ?? null,
+      findMany: async ({ where }: any) => sweeps.filter((row) => matches(row, where)),
+      findFirst: async ({ where }: any) => sweeps.find((row) => matches(row, where)) ?? null,
     },
     tonhubScanCursor: {
       findMany: async ({ where }: any) => scanCursors.filter((row) => matches(row, where)),
@@ -366,6 +370,11 @@ function createMemoryLedgerDb() {
         }
         recoveryCases.push({ id: `recovery-${recoveryCases.length + 1}`, status: "OPEN", ...data });
         return { count: 1 };
+      },
+      updateMany: async ({ where, data }: any) => {
+        const rows = recoveryCases.filter((row) => matches(row, where));
+        rows.forEach((row) => Object.assign(row, data));
+        return { count: rows.length };
       },
     },
     tonhubRateSnapshot: {
@@ -562,7 +571,7 @@ test("observed movement replay is idempotent and conflicting facts are rejected"
   assert.equal(memory.movements.length, 1);
 });
 
-test("a new official mainnet USDT movement atomically queues one asset sweep, while replay does not", async () => {
+test("official mainnet USDT observation queues nothing until credited policy reaches a sweep trigger", async () => {
   const memory = createMemoryLedgerDb();
   const owner = Address.parseRaw(`0:${"11".repeat(32)}`).toRawString();
   const assetWallet = Address.parseRaw(`0:${"22".repeat(32)}`).toRawString();
@@ -575,6 +584,11 @@ test("a new official mainnet USDT movement atomically queues one asset sweep, wh
     network: "mainnet",
     address: owner,
     addressRaw: owner,
+  });
+  Object.assign(memory.orders[0], {
+    maxAutomaticSweepsPerAsset: 2,
+    intermediateSweepTriggerBps: 9000,
+    intermediateSweepMinFiatMicros: "100000000",
   });
   memory.assetAccounts.push({
     depositAddressId: "deposit-1",
@@ -604,17 +618,30 @@ test("a new official mainnet USDT movement atomically queues one asset sweep, wh
   });
   const first = await ledger.recordObserved(draft);
   await ledger.recordObserved(draft);
+  assert.equal(memory.sweeps.length, 0);
+  await ledger.creditMovement({
+    movementId: first.id,
+    orderId: "order-1",
+    invoiceId: "invoice-1",
+    validationCode: "JETTON_INBOUND_V1",
+    maxRateAgeMs: 300_000,
+  });
   assert.equal(memory.sweeps.length, 1);
-  assert.equal(memory.sweeps[0]?.idempotencyKey, `official-usdt-movement:${first.id}`);
+  assert.equal(memory.sweeps[0]?.idempotencyKey, "automatic:order-1:USDT:1");
   assert.equal(memory.sweeps[0]?.asset, "USDT");
   assert.equal(memory.sweeps[0]?.status, "QUEUED");
-  memory.sweeps.splice(0, memory.sweeps.length);
-  await ledger.recordObserved(draft);
+  assert.equal(memory.sweeps[0]?.triggerReason, "TERMINAL_PAID");
+  await ledger.creditMovement({
+    movementId: first.id,
+    orderId: "order-1",
+    invoiceId: "invoice-1",
+    validationCode: "JETTON_INBOUND_V1",
+    maxRateAgeMs: 300_000,
+  });
   assert.equal(memory.sweeps.length, 1);
-  assert.equal(memory.sweeps[0]?.idempotencyKey, `official-usdt-movement:${first.id}`);
 });
 
-test("a late-observed inbound already covered by a confirmed full-balance sweep does not queue a false retry", async () => {
+test("uncredited and outgoing USDT observations never create sweep jobs", async () => {
   const memory = createMemoryLedgerDb();
   const owner = Address.parseRaw(`0:${"21".repeat(32)}`).toRawString();
   const assetWallet = Address.parseRaw(`0:${"22".repeat(32)}`).toRawString();
@@ -648,21 +675,20 @@ test("a late-observed inbound already covered by a confirmed full-balance sweep 
     rawPayload: { officialUsdt: true },
   });
   await ledger.recordObserved(official("1", "5000000", "INCOMING"));
-  assert.equal(memory.sweeps.length, 1);
-  memory.sweeps[0].status = "CONFIRMED";
+  assert.equal(memory.sweeps.length, 0);
   await ledger.recordObserved(official("2", "10000000", "OUTGOING"));
   await ledger.recordObserved(official("3", "5000000", "INCOMING"));
-  assert.equal(memory.sweeps.length, 1);
-  assert.equal(memory.sweeps[0]?.status, "CONFIRMED");
+  assert.equal(memory.sweeps.length, 0);
 });
 
-test("official USDT sweep enqueue fails closed with the movement when asset-wallet ownership drifts", async () => {
+test("automatic official USDT sweep fails closed when credited asset-wallet ownership drifts", async () => {
   const memory = createMemoryLedgerDb();
   const owner = Address.parseRaw(`0:${"31".repeat(32)}`).toRawString();
   const observedWallet = Address.parseRaw(`0:${"32".repeat(32)}`).toRawString();
   const storedWallet = Address.parseRaw(`0:${"33".repeat(32)}`).toRawString();
   Object.assign(memory.deposits[0], { network: "mainnet", address: owner, addressRaw: owner });
   Object.assign(memory.invoices[0], { network: "mainnet", address: owner, addressRaw: owner });
+  Object.assign(memory.orders[0], { maxAutomaticSweepsPerAsset: 2 });
   memory.assetAccounts.push({
     depositAddressId: "deposit-1",
     network: "mainnet",
@@ -674,8 +700,7 @@ test("official USDT sweep enqueue fails closed with the movement when asset-wall
     status: "VERIFIED",
   });
   const ledger = createMovementLedger(memory.db);
-  await assert.rejects(
-    ledger.recordObserved(movement({
+  const observed = await ledger.recordObserved(movement({
       fingerprint: "ton:mainnet:jetton-in:ownership-drift",
       network: "mainnet",
       asset: "USDT",
@@ -687,11 +712,251 @@ test("official USDT sweep enqueue fails closed with the movement when asset-wall
       jettonMasterAddress: officialMainnetUsdtMasterAddress,
       jettonWalletAddress: observedWallet,
       rawPayload: { officialUsdt: true },
-    })),
-    /ownership evidence is inconsistent/,
+    }));
+  await assert.rejects(
+    ledger.creditMovement({
+      movementId: observed.id,
+      orderId: "order-1",
+      invoiceId: "invoice-1",
+      validationCode: "JETTON_INBOUND_V1",
+      maxRateAgeMs: 300_000,
+    }),
+    /movement ownership evidence is inconsistent/,
   );
-  assert.equal(memory.movements.length, 0);
+  assert.equal(memory.movements.length, 1);
+  assert.equal(memory.movements[0]?.status, "OBSERVED");
+  assert.equal(memory.allocations.length, 0);
   assert.equal(memory.sweeps.length, 0);
+});
+
+test("automatic GRAM sweeps reserve sequence two for terminal payment", async () => {
+  const memory = createMemoryLedgerDb();
+  const owner = Address.parseRaw(`0:${"41".repeat(32)}`).toRawString();
+  Object.assign(memory.deposits[0], {
+    network: "testnet",
+    address: owner,
+    addressRaw: owner,
+  });
+  Object.assign(memory.invoices[0], {
+    network: "testnet",
+    checkoutAsset: "USDT",
+    address: owner,
+    addressRaw: owner,
+  });
+  Object.assign(memory.orders[0], {
+    maxAutomaticSweepsPerAsset: 2,
+    intermediateSweepTriggerBps: 9000,
+    intermediateSweepMinFiatMicros: "100000000",
+  });
+  const ledger = createMovementLedger(memory.db);
+  const first = await ledger.recordObserved(movement({
+    fingerprint: "testnet:gram:auto-sweep:1",
+    amountAtomic: "1800000000",
+    toAddress: owner,
+    transactionHash: "auto-sweep-1",
+  }));
+  await ledger.creditMovement({
+    movementId: first.id,
+    orderId: "order-1",
+    invoiceId: "invoice-1",
+    validationCode: "NATIVE_INBOUND_V1",
+    maxRateAgeMs: 300_000,
+  });
+  assert.equal(memory.orders[0]?.status, "PARTIAL");
+  assert.equal(memory.sweeps.length, 1);
+  assert.equal(memory.sweeps[0]?.automaticSequence, 1);
+  assert.equal(memory.sweeps[0]?.triggerReason, "INTERMEDIATE_RATIO");
+  assert.equal(memory.sweeps[0]?.triggerFiatMicros, "4500000");
+  memory.sweeps[0].status = "CONFIRMED";
+
+  const final = await ledger.recordObserved(movement({
+    fingerprint: "testnet:gram:auto-sweep:2",
+    amountAtomic: "200000000",
+    toAddress: owner,
+    transactionHash: "auto-sweep-2",
+    transactionLt: "12346",
+    blockchainAt: new Date("2026-08-13T10:01:00.000Z"),
+  }));
+  await ledger.creditMovement({
+    movementId: final.id,
+    orderId: "order-1",
+    invoiceId: "invoice-1",
+    validationCode: "NATIVE_INBOUND_V1",
+    maxRateAgeMs: 300_000,
+  });
+  assert.equal(memory.orders[0]?.status, "PAID");
+  assert.equal(memory.sweeps.length, 2);
+  assert.equal(memory.sweeps[1]?.automaticSequence, 2);
+  assert.equal(memory.sweeps[1]?.triggerReason, "TERMINAL_PAID");
+  assert.equal(memory.sweeps[1]?.triggerFiatMicros, "500000");
+});
+
+test("automatic sweep reconciliation rejects a conflicting canonical idempotency row", async () => {
+  const memory = createMemoryLedgerDb();
+  const owner = Address.parseRaw(`0:${"44".repeat(32)}`).toRawString();
+  Object.assign(memory.deposits[0], {
+    network: "testnet",
+    address: owner,
+    addressRaw: owner,
+  });
+  Object.assign(memory.invoices[0], {
+    network: "testnet",
+    checkoutAsset: "USDT",
+    address: owner,
+    addressRaw: owner,
+  });
+  Object.assign(memory.orders[0], {
+    maxAutomaticSweepsPerAsset: 2,
+    intermediateSweepTriggerBps: 9000,
+    intermediateSweepMinFiatMicros: "100000000",
+  });
+  memory.sweeps.push({
+    id: "conflicting-automatic-row",
+    idempotencyKey: "automatic:order-1:GRAM:1",
+    depositAddressId: "foreign-deposit",
+    orderId: "foreign-order",
+    invoiceId: "foreign-invoice",
+    asset: "GRAM",
+    assetKind: "NATIVE",
+    automaticSequence: 1,
+    triggerReason: "INTERMEDIATE_RATIO",
+    triggerFiatMicros: "4500000",
+    triggerCreditedFiatMicros: "4500000",
+    triggeredAt: new Date("2026-08-13T10:00:00.000Z"),
+    status: "QUEUED",
+  });
+  const ledger = createMovementLedger(memory.db);
+  const observed = await ledger.recordObserved(movement({
+    fingerprint: "testnet:gram:auto-idempotency-conflict",
+    amountAtomic: "1800000000",
+    toAddress: owner,
+    transactionHash: "auto-idempotency-conflict",
+  }));
+
+  await assert.rejects(ledger.creditMovement({
+    movementId: observed.id,
+    orderId: "order-1",
+    invoiceId: "invoice-1",
+    validationCode: "NATIVE_INBOUND_V1",
+    maxRateAgeMs: 300_000,
+  }), /idempotency conflict/i);
+  assert.equal(memory.allocations.length, 0);
+  assert.equal(memory.sweeps.length, 1);
+});
+
+test("a confirmed legacy sweep is the fiat baseline for later automatic thresholds", async () => {
+  const memory = createMemoryLedgerDb();
+  const owner = Address.parseRaw(`0:${"42".repeat(32)}`).toRawString();
+  Object.assign(memory.deposits[0], {
+    network: "testnet",
+    address: owner,
+    addressRaw: owner,
+  });
+  Object.assign(memory.invoices[0], {
+    network: "testnet",
+    address: owner,
+    addressRaw: owner,
+    fiatAmountMicros: "1000000000",
+    creditedFiatMicros: "150000000",
+    remainingFiatMicros: "850000000",
+    paidNano: "60000000000",
+    paidAmountAtomic: "60000000000",
+    status: "PARTIAL",
+  });
+  Object.assign(memory.orders[0], {
+    fiatAmountMicros: "1000000000",
+    creditedFiatMicros: "150000000",
+    status: "PARTIAL",
+    maxAutomaticSweepsPerAsset: 2,
+    intermediateSweepTriggerBps: 9000,
+    intermediateSweepMinFiatMicros: "100000000",
+  });
+  Object.assign(memory.quotes[0], {
+    grossFiatMicros: "1000000000",
+    discountFiatMicros: "1000000",
+    netFiatMicros: "999000000",
+  });
+  memory.movements.push({
+    id: "legacy-credit-movement",
+    ...movement({
+      fingerprint: "testnet:legacy-credit:incoming:0",
+      amountAtomic: "60000000000",
+      toAddress: owner,
+      transactionHash: "legacy-credit",
+      transactionLt: "12000",
+      blockchainAt: new Date("2026-08-13T09:55:00.000Z"),
+    }),
+    status: "CREDITED",
+    validationCode: "NATIVE_INBOUND_V1",
+    rateSnapshotId: "rate-gram-usd",
+    fiatCreditMicros: "150000000",
+    createdAt: new Date("2026-08-13T09:55:01.000Z"),
+    updatedAt: new Date("2026-08-13T09:55:10.000Z"),
+  });
+  memory.allocations.push({
+    id: "legacy-credit-allocation",
+    movementId: "legacy-credit-movement",
+    orderId: "order-1",
+    invoiceId: "invoice-1",
+    kind: "CREDIT",
+    fiatCreditMicros: "150000000",
+    reversesAllocationId: null,
+    allocatedBy: "system",
+    allocatedAt: new Date("2026-08-13T09:55:10.000Z"),
+  });
+  memory.movements.push({
+    id: "legacy-outgoing-movement",
+    ...movement({
+      fingerprint: "testnet:legacy-sweep:outgoing:0",
+      direction: "OUTGOING",
+      amountAtomic: "60000000000",
+      fromAddress: owner,
+      toAddress: Address.parseRaw(`0:${"43".repeat(32)}`).toRawString(),
+      transactionHash: "legacy-sweep",
+      transactionLt: "12001",
+      blockchainAt: new Date("2026-08-13T09:56:00.000Z"),
+    }),
+    status: "OBSERVED",
+    validationCode: null,
+    rateSnapshotId: null,
+    fiatCreditMicros: null,
+    createdAt: new Date("2026-08-13T09:56:01.000Z"),
+    updatedAt: new Date("2026-08-13T09:56:01.000Z"),
+  });
+  memory.sweeps.push({
+    id: "legacy-confirmed-sweep",
+    idempotencyKey: "legacy-confirmed-sweep",
+    depositAddressId: "deposit-1",
+    orderId: "order-1",
+    invoiceId: "invoice-1",
+    asset: "GRAM",
+    assetKind: "NATIVE",
+    automaticSequence: null,
+    status: "CONFIRMED",
+    confirmedAt: new Date("2026-08-13T09:56:00.000Z"),
+    createdAt: new Date("2026-08-13T09:55:30.000Z"),
+  });
+
+  const ledger = createMovementLedger(memory.db);
+  const tiny = await ledger.recordObserved(movement({
+    fingerprint: "testnet:post-legacy-tiny:incoming:0",
+    amountAtomic: "400000000",
+    toAddress: owner,
+    transactionHash: "post-legacy-tiny",
+    transactionLt: "12002",
+    blockchainAt: new Date("2026-08-13T10:01:00.000Z"),
+  }));
+  const credited = await ledger.creditMovement({
+    movementId: tiny.id,
+    orderId: "order-1",
+    invoiceId: "invoice-1",
+    validationCode: "NATIVE_INBOUND_V1",
+    maxRateAgeMs: 300_000,
+  });
+
+  assert.equal(credited.order.status, "PARTIAL");
+  assert.equal(credited.order.creditedFiatMicros, "151000000");
+  assert.deepEqual(memory.sweeps.map(({ id }) => id), ["legacy-confirmed-sweep"]);
 });
 
 test("credits aggregate exactly, retain overpayment, and remain idempotent", async () => {
@@ -899,6 +1164,75 @@ test("known later USDT evidence on another attempt prevents a transient GRAM dis
   assert.equal(partial.order.discountFiatMicros, "0");
   assert.equal(memory.adjustments.length, 0);
   assert.equal(memory.recoveryCases.length, 0);
+});
+
+test("credits on multiple deposit wallets fail into recovery without consuming automatic sweep slots", async () => {
+  const memory = createMemoryLedgerDb();
+  memory.orders[0].maxAutomaticSweepsPerAsset = 2;
+  const firstOwner = Address.parseRaw(`0:${"51".repeat(32)}`).toRawString();
+  const secondOwner = Address.parseRaw(`0:${"52".repeat(32)}`).toRawString();
+  Object.assign(memory.invoices[0], {
+    network: "testnet",
+    address: firstOwner,
+    addressRaw: firstOwner,
+  });
+  Object.assign(memory.deposits[0], {
+    network: "testnet",
+    address: firstOwner,
+    addressRaw: firstOwner,
+  });
+  const secondInvoice = {
+    ...structuredClone(memory.invoices[0]),
+    id: "invoice-2",
+    status: "PENDING",
+    paymentSelectionLockedAsset: null,
+    paymentSelectionLockedAt: null,
+    depositAddress: { id: "deposit-2" },
+    address: secondOwner,
+    addressRaw: secondOwner,
+  };
+  memory.invoices.push(secondInvoice);
+  memory.deposits.push({
+    id: "deposit-2",
+    invoiceId: "invoice-2",
+    network: "testnet",
+    address: secondOwner,
+    addressRaw: secondOwner,
+    status: "ACTIVE",
+  });
+  const ledger = createMovementLedger(memory.db);
+  const first = await ledger.recordObserved(movement({ toAddress: firstOwner }));
+  await ledger.creditMovement({
+    movementId: first.id,
+    orderId: "order-1",
+    invoiceId: "invoice-1",
+    validationCode: "NATIVE_INBOUND_V1",
+    maxRateAgeMs: 300_000,
+  });
+  memory.invoices[0].status = "EXPIRED";
+
+  const second = await ledger.recordObserved(movement({
+    fingerprint: "testnet:second-funded-deposit:incoming:0",
+    depositAddressId: "deposit-2",
+    amountAtomic: "500000000",
+    toAddress: secondOwner,
+    transactionHash: "second-funded-deposit",
+    transactionLt: "12346",
+    blockchainAt: new Date("2026-08-13T10:01:00.000Z"),
+  }));
+  const recovered = await ledger.creditMovement({
+    movementId: second.id,
+    orderId: "order-1",
+    invoiceId: "invoice-2",
+    validationCode: "NATIVE_INBOUND_V1",
+    maxRateAgeMs: 300_000,
+  });
+
+  assert.equal(recovered.outcome, "credited");
+  assert.equal(recovered.order.status, "RECOVERY");
+  assert.equal(recovered.order.creditedFiatMicros, "5000000");
+  assert.equal(memory.recoveryCases.at(-1)?.reason, "MULTIPLE_FUNDED_DEPOSIT_MOVEMENT");
+  assert.equal(memory.sweeps.length, 0);
 });
 
 test("a later USDT credit reverses an active GRAM-only discount before entering recovery", async () => {
@@ -1228,7 +1562,7 @@ test("an incoming movement after the blockchain payment point is accounted only 
   assert.equal(memory.recoveryCases[0]?.reason, "POST_PAID_MOVEMENT");
 });
 
-test("an undersized first partial is held for recovery while later partials bypass the initial threshold", async () => {
+test("undersized partials accumulate, activate together, and then bypass the initial threshold", async () => {
   const memory = createMemoryLedgerDb();
   memory.invoices[0].activationThresholdFiatMicros = "2500000";
   const ledger = createMovementLedger(memory.db);
@@ -1279,9 +1613,73 @@ test("an undersized first partial is held for recovery while later partials bypa
 
   assert.equal(followed.outcome, "credited");
   assert.equal(followed.movement.fiatCreditMicros, "250000");
-  assert.equal(memory.orders[0].creditedFiatMicros, "2750000");
-  assert.equal(memory.invoices[0].partialPaymentStartedAt.toISOString(), "2026-08-13T10:01:00.000Z");
-  assert.equal(memory.invoices[0].partialPaymentExpiresAt.toISOString(), "2026-08-14T10:01:00.000Z");
+  assert.equal(memory.orders[0].creditedFiatMicros, "4000000");
+  assert.equal(memory.allocations.length, 3);
+  assert.equal(memory.movements[0]?.status, "CREDITED");
+  assert.equal(memory.recoveryCases[0]?.status, "RESOLVED");
+  assert.equal(memory.invoices[0].partialPaymentStartedAt.toISOString(), "2026-08-13T10:00:00.000Z");
+  assert.equal(memory.invoices[0].partialPaymentExpiresAt.toISOString(), "2026-08-14T10:00:00.000Z");
+});
+
+test("mixed held movements retain their own asset rates until cumulative activation", async () => {
+  const memory = createMemoryLedgerDb();
+  memory.invoices[0].activationThresholdFiatMicros = "4000000";
+  const ledger = createMovementLedger(memory.db);
+  const gram = await ledger.recordObserved(movement({ amountAtomic: "500000000" }));
+  assert.equal((await ledger.creditMovement({
+    movementId: gram.id,
+    orderId: "order-1",
+    invoiceId: "invoice-1",
+    validationCode: "NATIVE_INBOUND_V1",
+    maxRateAgeMs: 300_000,
+  })).outcome, "held-under-minimum");
+
+  const usdt = await ledger.recordObserved(movement({
+    fingerprint: "testnet:held-usdt:incoming:0",
+    asset: "USDT",
+    assetKind: "JETTON",
+    assetDecimals: 6,
+    amountAtomic: "1000000",
+    jettonMasterAddress: "EQ_USDT_MASTER",
+    jettonWalletAddress: "EQ_DEPOSIT_USDT_WALLET",
+    transactionHash: "held-usdt",
+    transactionLt: "12346",
+    blockchainAt: new Date("2026-08-13T10:01:00.000Z"),
+  }));
+  const heldUsdt = await ledger.creditMovement({
+    movementId: usdt.id,
+    orderId: "order-1",
+    invoiceId: "invoice-1",
+    validationCode: "JETTON_INBOUND_V1",
+    maxRateAgeMs: 300_000,
+  });
+  assert.equal(heldUsdt.outcome, "held-under-minimum");
+  assert.equal(heldUsdt.movement.rateSnapshotId, "rate-usdt-usd");
+  assert.equal(heldUsdt.movement.fiatCreditMicros, "1000000");
+  assert.equal(memory.allocations.length, 0);
+
+  const finalGram = await ledger.recordObserved(movement({
+    fingerprint: "testnet:held-final-gram:incoming:0",
+    amountAtomic: "700000000",
+    transactionHash: "held-final-gram",
+    transactionLt: "12347",
+    blockchainAt: new Date("2026-08-13T10:02:00.000Z"),
+  }));
+  const activated = await ledger.creditMovement({
+    movementId: finalGram.id,
+    orderId: "order-1",
+    invoiceId: "invoice-1",
+    validationCode: "NATIVE_INBOUND_V1",
+    maxRateAgeMs: 300_000,
+  });
+
+  assert.equal(activated.outcome, "credited");
+  assert.equal(activated.order.status, "PARTIAL");
+  assert.equal(activated.order.creditedFiatMicros, "4000000");
+  assert.equal(memory.allocations.length, 3);
+  assert.equal(memory.movements.find(({ id }) => id === usdt.id)?.status, "CREDITED");
+  assert.equal(memory.movements.find(({ id }) => id === usdt.id)?.rateSnapshotId, "rate-usdt-usd");
+  assert.equal(memory.movements.find(({ id }) => id === usdt.id)?.fiatCreditMicros, "1000000");
 });
 
 test("mainnet credit waits for both scanner horizons and any active scanner lease", async () => {

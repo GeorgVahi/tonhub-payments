@@ -45,7 +45,7 @@ function docker(...args) {
 }
 
 function psql(database, sql) {
-  return docker(
+  const args = [
     "exec",
     "-i",
     containerName,
@@ -58,9 +58,11 @@ function psql(database, sql) {
     database,
     "--tuples-only",
     "--no-align",
-    "--command",
-    sql,
-  );
+  ];
+  if (sql.includes("ON COMMIT DROP")) {
+    args.push("--single-transaction");
+  }
+  return run("docker", args, { input: sql });
 }
 
 function prisma(databaseUrl, ...args) {
@@ -123,6 +125,7 @@ try {
   psql("postgres", 'CREATE DATABASE "clean_migration";');
   psql("postgres", 'CREATE DATABASE "legacy_migration";');
   psql("postgres", 'CREATE DATABASE "usdt_sweep_rollout";');
+  psql("postgres", 'CREATE DATABASE "held_gram_rollout";');
 
   const databaseUrl = (database) =>
     `postgresql://postgres:${postgresPassword}@127.0.0.1:${publishedPort}/${database}?schema=public`;
@@ -201,6 +204,103 @@ try {
     "pre-step-13 official USDT movement sweep backfill",
   );
 
+  const cumulativeSweepMigration = "20260814103000_cumulative_held_and_sweep_policy";
+  const cumulativeSweepMigrationIndex = migrationDirectories.indexOf(cumulativeSweepMigration);
+  if (cumulativeSweepMigrationIndex < 0) {
+    throw new Error(`missing required cumulative sweep migration: ${cumulativeSweepMigration}`);
+  }
+  for (const migrationName of migrationDirectories.slice(0, cumulativeSweepMigrationIndex)) {
+    psql(
+      "held_gram_rollout",
+      readFileSync(resolve(projectRoot, "prisma", "migrations", migrationName, "migration.sql"), "utf8"),
+    );
+  }
+  const heldOwner = `0:${"c1".repeat(32)}`;
+  psql(
+    "held_gram_rollout",
+    `INSERT INTO "TonhubPaymentOrder" (
+       "id", "fiatAmountMicros", "fiatCurrency", "minimumOrderFiatMicros",
+       "gramDiscountMaxFiatMicros", "intermediateSweepTriggerBps",
+       "intermediateSweepMinFiatMicros", "maxAutomaticSweepsPerAsset",
+       "expiresAt", "createdAt", "updatedAt"
+     ) VALUES (
+       'held-rollout-order', '10000000', 'USD', '10000000', '1000000', 9000,
+       '100000000', 2, '2026-08-13T11:00:00Z', '2026-08-13T10:00:00Z',
+       '2026-08-13T10:00:00Z'
+     );
+     INSERT INTO "TonhubPaymentInvoice" (
+       "id", "orderId", "network", "asset", "checkoutAsset", "assetKind",
+       "assetDecimals", "fiatAmountCents", "fiatAmountMicros", "remainingFiatMicros",
+       "activationThresholdFiatMicros", "fiatCurrency", "address", "addressRaw",
+       "addressStrategy", "walletVersion", "walletWorkchain", "walletContext",
+       "walletNetworkGlobalId", "walletPublicKeyHash", "amountNano", "amountAtomic",
+       "reference", "expiresAt", "priceLockedAt", "priceLockedUntil", "createdAt", "updatedAt"
+     ) VALUES (
+       'held-rollout-invoice', 'held-rollout-order', 'testnet', 'GRAM', 'GRAM', 'NATIVE',
+       9, 1000, '10000000', '10000000', '5000000', 'USD', '${heldOwner}', '${heldOwner}',
+       'unique-address', 'v5r1', 0, 920001, -3, 'held-rollout-key', '10000000000',
+       '10000000000', 'held-rollout-reference', '2026-08-13T11:00:00Z',
+       '2026-08-13T10:00:00Z', '2026-08-13T11:00:00Z',
+       '2026-08-13T10:00:00Z', '2026-08-13T10:00:00Z'
+     );
+     INSERT INTO "TonhubDepositAddress" (
+       "id", "invoiceId", "network", "address", "addressRaw", "walletVersion",
+       "walletWorkchain", "walletContext", "walletNetworkGlobalId", "walletPublicKeyHash",
+       "status", "assignedAt", "createdAt", "updatedAt"
+     ) VALUES (
+       'held-rollout-deposit', 'held-rollout-invoice', 'testnet', '${heldOwner}', '${heldOwner}',
+       'v5r1', 0, 920001, -3, 'held-rollout-key', 'ACTIVE', '2026-08-13T10:00:00Z',
+       '2026-08-13T10:00:00Z', '2026-08-13T10:00:00Z'
+     );
+     INSERT INTO "TonhubRateSnapshot" (
+       "id", "asset", "baseCurrency", "quoteCurrency", "price", "source",
+       "observedAt", "fetchedAt", "createdAt", "payload"
+     ) VALUES
+       ('held-rollout-rate-first', 'GRAM', 'GRAM', 'USD', 2.5, 'coingecko',
+        '2026-08-13T09:59:00Z', '2026-08-13T09:59:05Z', '2026-08-13T09:59:06Z', '{}'),
+       ('held-rollout-rate-later', 'GRAM', 'GRAM', 'USD', 3, 'coingecko',
+        '2026-08-13T10:00:30Z', '2026-08-13T10:00:35Z', '2026-08-13T10:00:36Z', '{}');
+     INSERT INTO "TonhubPaymentMovement" (
+       "id", "fingerprint", "depositAddressId", "network", "direction", "asset",
+       "assetKind", "assetDecimals", "amountAtomic", "toAddress", "transactionHash",
+       "transactionLt", "blockchainAt", "status", "validationCode", "rateSnapshotId",
+       "fiatCreditMicros", "createdAt", "updatedAt"
+     ) VALUES
+       ('held-rollout-first', 'held-rollout-first', 'held-rollout-deposit', 'testnet',
+        'INCOMING', 'GRAM', 'NATIVE', 9, '500000000', '${heldOwner}', '${"c2".repeat(64)}',
+        '920001', '2026-08-13T10:00:10Z', 'HELD_UNDER_MINIMUM', 'NATIVE_INBOUND_V1',
+        'held-rollout-rate-first', '1250000', '2026-08-13T10:00:11Z', '2026-08-13T10:00:11Z'),
+       ('held-rollout-later', 'held-rollout-later', 'held-rollout-deposit', 'testnet',
+        'INCOMING', 'GRAM', 'NATIVE', 9, '400000000', '${heldOwner}', '${"c3".repeat(64)}',
+        '920002', '2026-08-13T10:01:00Z', 'HELD_UNDER_MINIMUM', 'NATIVE_INBOUND_V1',
+        'held-rollout-rate-later', '1200000', '2026-08-13T10:01:01Z', '2026-08-13T10:01:01Z');`,
+  );
+  psql(
+    "held_gram_rollout",
+    readFileSync(
+      resolve(projectRoot, "prisma", "migrations", cumulativeSweepMigration, "migration.sql"),
+      "utf8",
+    ),
+  );
+  assertEqual(
+    psql(
+      "held_gram_rollout",
+      `SELECT "rateSnapshotId" || ':' || "fiatCreditMicros"
+       FROM "TonhubPaymentMovement" WHERE "id" = 'held-rollout-later';`,
+    ),
+    "held-rollout-rate-first:1000000",
+    "pre-cumulative HELD GRAM rate normalization",
+  );
+  assertEqual(
+    psql(
+      "held_gram_rollout",
+      `SELECT "status"::TEXT || ':' || ("details"->>'oldRateSnapshotId')
+       FROM "TonhubRecoveryCase" WHERE "id" = 'held-rate-normalization:held-rollout-later';`,
+    ),
+    "RESOLVED:held-rollout-rate-later",
+    "pre-cumulative HELD GRAM normalization audit",
+  );
+
   const legacyFixtureSql = prisma(
     databaseUrl("legacy_migration"),
     "migrate",
@@ -231,6 +331,13 @@ try {
       ...process.env,
       DATABASE_URL: databaseUrl("clean_migration"),
       TONHUB_LEDGER_VERIFY_SUFFIX: "clean",
+    },
+  });
+  run(process.execPath, [tsxCli, "scripts/verify-cumulative-sweep-policy.ts"], {
+    env: {
+      ...process.env,
+      DATABASE_URL: databaseUrl("clean_migration"),
+      TONHUB_CUMULATIVE_SWEEP_VERIFY_SUFFIX: "clean",
     },
   });
   run(process.execPath, [tsxCli, "scripts/verify-mainnet-usdt-sweep.ts"], {
@@ -383,6 +490,13 @@ try {
       ...process.env,
       DATABASE_URL: databaseUrl("legacy_migration"),
       TONHUB_LEDGER_VERIFY_SUFFIX: "legacy",
+    },
+  });
+  run(process.execPath, [tsxCli, "scripts/verify-cumulative-sweep-policy.ts"], {
+    env: {
+      ...process.env,
+      DATABASE_URL: databaseUrl("legacy_migration"),
+      TONHUB_CUMULATIVE_SWEEP_VERIFY_SUFFIX: "legacy",
     },
   });
   run(process.execPath, [tsxCli, "scripts/verify-mainnet-usdt-sweep.ts"], {

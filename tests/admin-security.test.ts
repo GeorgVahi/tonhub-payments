@@ -19,6 +19,7 @@ import {
   type AdminRepository,
 } from "../backend/src/admin/repository";
 import { resumableFailedUsdtSweepStatus } from "../shared/mainnet-usdt-sweep-state";
+import { resumableFailedNativeGramSweepStatus } from "../shared/native-gram-sweep-state";
 
 async function adminConfig() {
   return {
@@ -477,6 +478,33 @@ test("failed USDT sweep retries resume from immutable persisted chain plans", ()
   assert.throws(() => resumableFailedUsdtSweepStatus({
     gasTopupAmountNano: "1",
   }), /incomplete persisted gas top-up plan/i);
+});
+
+test("failed automatic GRAM sweep retries preserve or reject its durable transfer plan", () => {
+  assert.equal(resumableFailedNativeGramSweepStatus({}), "READY");
+  assert.equal(resumableFailedNativeGramSweepStatus({
+    amountAtomic: "950000000",
+    reserveAtomic: "50000000",
+    recipientAddress: "0:treasury",
+    seqno: 7,
+  }), "READY");
+  assert.equal(resumableFailedNativeGramSweepStatus({
+    amountAtomic: "950000000",
+    reserveAtomic: "50000000",
+    recipientAddress: "0:treasury",
+    seqno: 7,
+    sentAt: new Date("2026-08-13T10:00:00.000Z"),
+  }), "SENT");
+  assert.throws(() => resumableFailedNativeGramSweepStatus({
+    amountAtomic: "950000000",
+    seqno: 7,
+  }), /incomplete persisted transfer plan/i);
+  assert.throws(() => resumableFailedNativeGramSweepStatus({
+    sentAt: new Date("2026-08-13T10:00:00.000Z"),
+  }), /incomplete persisted transfer plan/i);
+  assert.throws(() => resumableFailedNativeGramSweepStatus({
+    transactionHash: "ab".repeat(32),
+  }), /contradictory confirmation evidence/i);
 });
 
 test("admin webhook view keeps failed delivery retry and full attempt pagination visible", () => {

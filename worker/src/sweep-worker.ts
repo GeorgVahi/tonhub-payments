@@ -79,6 +79,11 @@ function printOutcome(network: TonNetwork, outcome: TonDepositSweepOutcome) {
     return;
   }
 
+  if (outcome.status === "confirmed") {
+    console.log(`[tonhub-sweep] ${network}: confirmed ${outcome.addressMasked}`);
+    return;
+  }
+
   console.log(`[tonhub-sweep] ${network}: failed ${outcome.addressMasked} - ${outcome.error}`);
 }
 

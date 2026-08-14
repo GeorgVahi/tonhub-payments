@@ -7,6 +7,7 @@ import { officialMainnetUsdtMasterAddress } from "../ton/jetton-identities";
 import { parseTonNetwork } from "../ton/direct-payments";
 import { assertPaymentAssetSnapshot, parsePaymentAsset } from "../../../shared/payment-assets";
 import { resumableFailedUsdtSweepStatus } from "../../../shared/mainnet-usdt-sweep-state";
+import { resumableFailedNativeGramSweepStatus } from "../../../shared/native-gram-sweep-state";
 import { adminLoginThrottleRetentionMs } from "./security";
 
 export const adminPageSize = 50;
@@ -762,13 +763,20 @@ export function createPrismaAdminRepository(db: any = prisma): AdminRepository {
         }
       } else {
         const stored = await tx.tonhubAssetSweep.findUnique({ where: { id: sweepId } });
-        if (!stored || stored.asset !== "USDT" || stored.status !== "FAILED") {
+        if (!stored || !["USDT", "GRAM"].includes(stored.asset) || stored.status !== "FAILED") {
           throw new Error("Asset sweep is missing or no longer failed.");
         }
+        if (stored.asset === "GRAM" &&
+          (stored.assetKind !== "NATIVE" || stored.automaticSequence === null)) {
+          throw new Error("Failed GRAM asset sweep is not an automatic native job.");
+        }
+        const resumedStatus = stored.asset === "USDT"
+          ? resumableFailedUsdtSweepStatus(stored)
+          : resumableFailedNativeGramSweepStatus(stored);
         const updated = await tx.tonhubAssetSweep.updateMany({
           where: { id: sweepId, status: "FAILED" },
           data: {
-            status: resumableFailedUsdtSweepStatus(stored),
+            status: resumedStatus,
             attempts: 0,
             leaseOwner: null,
             leaseExpiresAt: new Date(),

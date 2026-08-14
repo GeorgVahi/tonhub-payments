@@ -1,6 +1,6 @@
 import { Buffer } from "node:buffer";
 import { randomUUID } from "node:crypto";
-import { Address, SendMode, internal } from "@ton/core";
+import { Address, SendMode, comment, internal } from "@ton/core";
 import { TonClient, WalletContractV5R1 } from "@ton/ton";
 import { prisma } from "../../backend/src/db";
 import {
@@ -9,6 +9,8 @@ import {
   type TonNetwork
 } from "../../backend/src/ton/direct-payments";
 import { tonPublicKeyHash } from "../../backend/src/ton/deposit-addresses";
+import { reconcileAutomaticAssetSweeps } from "../../backend/src/automatic-sweeps";
+import { resumableFailedNativeGramSweepStatus } from "../../shared/native-gram-sweep-state";
 
 export type TonDepositSweepStatus =
   | "NOT_STARTED"
@@ -74,6 +76,18 @@ export type TonDepositSweepRecord = {
   sweepConfirmedAt: Date | null;
   sweepLastError: string | null;
   sweepAttempts: number;
+  assetSweepId?: string | null;
+  assetSweepStatus?: string | null;
+  assetSweepAmountAtomic?: string | null;
+  assetSweepReserveAtomic?: string | null;
+  assetSweepRecipientAddress?: string | null;
+  assetSweepSeqno?: number | null;
+  assetSweepStartedAt?: Date | null;
+  assetSweepSentAt?: Date | null;
+  assetSweepTransactionHash?: string | null;
+  assetSweepConfirmedAt?: Date | null;
+  assetSweepLeaseOwner?: string | null;
+  orderId?: string | null;
 };
 
 export type TonDepositSweepConfig = {
@@ -96,14 +110,29 @@ export type TonDepositSweepRepository = {
   listSweepCandidates: (input: {
     network: TonNetwork;
     limit: number;
+    now: Date;
     retryBefore: Date;
   }) => Promise<TonDepositSweepRecord[]>;
   claimSweepCandidate: (input: {
     id: string;
     now: Date;
+    assetSweepId?: string | null;
+    leaseOwner?: string;
   }) => Promise<TonDepositSweepRecord | null>;
+  markSweepReady?: (input: {
+    id: string;
+    assetSweepId: string;
+    leaseOwner: string;
+    amountNano: string;
+    reserveNano: string;
+    recipientAddress: string;
+    seqno: number;
+    startedAt: Date;
+  }) => Promise<void>;
   markSweepSent: (input: {
     id: string;
+    assetSweepId?: string | null;
+    leaseOwner?: string;
     amountNano: string;
     reserveNano: string;
     recipientAddress: string;
@@ -112,8 +141,22 @@ export type TonDepositSweepRepository = {
   }) => Promise<void>;
   markSweepFailed: (input: {
     id: string;
+    assetSweepId?: string | null;
+    leaseOwner?: string;
     error: string;
     failedAt: Date;
+  }) => Promise<void>;
+  markSweepConfirmed?: (input: {
+    id: string;
+    assetSweepId: string;
+    leaseOwner: string;
+    confirmedAt: Date;
+    confirmation: TonNativeSweepConfirmation;
+  }) => Promise<void>;
+  deferAssetSweep?: (input: {
+    assetSweepId: string;
+    leaseOwner: string;
+    retryAt: Date;
   }) => Promise<void>;
 };
 
@@ -125,11 +168,120 @@ export type TonDepositSweepBlockchain = {
     recipientAddress: Address;
     amountNano: bigint;
     comment: string;
+    seqno?: number;
   }) => Promise<{
     seqno: number | null;
   }>;
+  getWalletSeqno?: (wallet: WalletContractV5R1) => Promise<number>;
+  findSweepTransfer?: (input: {
+    wallet: WalletContractV5R1;
+    recipientAddress: Address;
+    amountNano: bigint;
+    comment: string;
+    notBefore: Date;
+  }) => Promise<TonNativeSweepConfirmation | null>;
   waitForWalletSeqno: (wallet: WalletContractV5R1, previousSeqno: number) => Promise<boolean>;
 };
+
+export type TonNativeSweepConfirmation = {
+  transactionHash: string;
+  transactionLt: string;
+  blockchainAt: Date;
+};
+
+function matchingNativeSweepConfirmations(input: {
+  transactions: any[];
+  walletAddress: Address;
+  recipientAddress: Address;
+  amountNano: bigint;
+  comment: string;
+  notBefore: Date;
+}) {
+  const expectedBodyHash = comment(input.comment).hash().toString("hex");
+  const notBeforeSeconds = Math.floor(input.notBefore.getTime() / 1000);
+  return input.transactions.flatMap((transaction) => {
+    if (
+      transaction.now < notBeforeSeconds ||
+      transaction.description.type !== "generic" ||
+      transaction.description.aborted !== false ||
+      transaction.description.actionPhase?.success !== true ||
+      !transaction.outMessages.values().some((message: any) =>
+        message.info.type === "internal" &&
+        message.info.src.equals(input.walletAddress) &&
+        message.info.dest.equals(input.recipientAddress) &&
+        message.info.value.coins === input.amountNano &&
+        message.body.hash().toString("hex") === expectedBodyHash
+      )
+    ) {
+      return [];
+    }
+    return [{
+      transactionHash: transaction.hash().toString("hex"),
+      transactionLt: transaction.lt.toString(),
+      blockchainAt: new Date(transaction.now * 1000)
+    } satisfies TonNativeSweepConfirmation];
+  });
+}
+
+export async function findExactTonNativeSweepTransfer(input: {
+  fetchPage: (cursor: { lt: string; hash: string } | null, limit: number) => Promise<any[]>;
+  walletAddress: Address;
+  recipientAddress: Address;
+  amountNano: bigint;
+  comment: string;
+  notBefore: Date;
+  pageSize?: number;
+  maxPages?: number;
+}) {
+  const pageSize = input.pageSize ?? 100;
+  const maxPages = input.maxPages ?? 20;
+  const notBeforeSeconds = Math.floor(input.notBefore.getTime() / 1000);
+  const matches: TonNativeSweepConfirmation[] = [];
+  const seen = new Set<string>();
+  let cursor: { lt: string; hash: string } | null = null;
+  let reachedBoundary = false;
+  for (let page = 0; page < maxPages; page += 1) {
+    const transactions = await input.fetchPage(cursor, pageSize);
+    if (transactions.length === 0) {
+      reachedBoundary = true;
+      break;
+    }
+    const fresh = transactions.filter((transaction) => {
+      const hash = transaction.hash().toString("hex");
+      if (seen.has(hash)) return false;
+      seen.add(hash);
+      return true;
+    });
+    matches.push(...matchingNativeSweepConfirmations({
+      transactions: fresh,
+      walletAddress: input.walletAddress,
+      recipientAddress: input.recipientAddress,
+      amountNano: input.amountNano,
+      comment: input.comment,
+      notBefore: input.notBefore
+    }));
+    const oldest = transactions.at(-1)!;
+    if (oldest.now < notBeforeSeconds || transactions.length < pageSize) {
+      reachedBoundary = true;
+      break;
+    }
+    const next = {
+      lt: oldest.lt.toString(),
+      hash: oldest.hash().toString("base64")
+    };
+    if (cursor && cursor.lt === next.lt && cursor.hash === next.hash) {
+      throw new Error("TON provider native sweep pagination cursor did not advance.");
+    }
+    cursor = next;
+  }
+  if (!reachedBoundary) {
+    throw new Error("TON provider native sweep confirmation pagination cap was exhausted.");
+  }
+  if (matches.length > 1) {
+    throw new Error("TON provider returned ambiguous native sweep confirmation evidence.");
+  }
+  return matches[0] ?? null;
+}
 
 export type TonWalletSigningLease = {
   acquire: (input: {
@@ -229,6 +381,13 @@ export type TonDepositSweepOutcome =
       status: "claimed-by-other";
       depositAddressId: string;
       addressMasked: string;
+    }
+  | {
+      status: "confirmed";
+      depositAddressId: string;
+      addressMasked: string;
+      amountNano: string;
+      reserveNano: string;
     };
 
 function envValue(env: NodeJS.ProcessEnv, names: string[]) {
@@ -376,9 +535,10 @@ export function createTonSweepBlockchainClient(
 
   return {
     getBalance: (address) => client.getBalance(address),
+    getWalletSeqno: (wallet) => client.open(wallet).getSeqno(),
     sendSweepTransfer: async (input) => {
       const opened = client.open(input.wallet);
-      const seqno = await opened.getSeqno();
+      const seqno = input.seqno ?? await opened.getSeqno();
 
       await opened.sendTransfer({
         seqno,
@@ -398,6 +558,20 @@ export function createTonSweepBlockchainClient(
         seqno
       };
     },
+    findSweepTransfer: async (input) => {
+      return findExactTonNativeSweepTransfer({
+        fetchPage: (cursor, limit) => client.getTransactions(input.wallet.address, {
+          limit,
+          archival: true,
+          ...(cursor ? { lt: cursor.lt, hash: cursor.hash, inclusive: false } : {})
+        }),
+        walletAddress: input.wallet.address,
+        recipientAddress: input.recipientAddress,
+        amountNano: input.amountNano,
+        comment: input.comment,
+        notBefore: input.notBefore
+      });
+    },
     waitForWalletSeqno: async (wallet, previousSeqno) => {
       for (let attempt = 0; attempt < 10; attempt += 1) {
         if (await client.open(wallet).getSeqno() > previousSeqno) {
@@ -410,16 +584,56 @@ export function createTonSweepBlockchainClient(
   };
 }
 
+function assetSweepDepositRecord(sweep: any): TonDepositSweepRecord {
+  if (!sweep?.depositAddress) {
+    throw new Error("GRAM asset sweep has no deposit address.");
+  }
+  return {
+    ...sweep.depositAddress,
+    assetSweepId: sweep.id,
+    assetSweepStatus: sweep.status,
+    assetSweepAmountAtomic: sweep.amountAtomic,
+    assetSweepReserveAtomic: sweep.reserveAtomic,
+    assetSweepRecipientAddress: sweep.recipientAddress,
+    assetSweepSeqno: sweep.seqno,
+    assetSweepStartedAt: sweep.startedAt,
+    assetSweepSentAt: sweep.sentAt,
+    assetSweepTransactionHash: sweep.transactionHash,
+    assetSweepConfirmedAt: sweep.confirmedAt,
+    assetSweepLeaseOwner: sweep.leaseOwner,
+    orderId: sweep.orderId
+  };
+}
+
 export const prismaTonDepositSweepRepository: TonDepositSweepRepository = {
-  listSweepCandidates: (input) =>
-    (prisma as any).tonhubDepositAddress.findMany({
+  listSweepCandidates: async (input) => {
+    const automaticSweeps = await (prisma as any).tonhubAssetSweep.findMany({
+      where: {
+        asset: "GRAM",
+        assetKind: "NATIVE",
+        automaticSequence: { not: null },
+        status: { in: ["QUEUED", "READY", "SENT"] },
+        depositAddress: { network: input.network, walletVersion: "v5r1" },
+        OR: [
+          { leaseExpiresAt: null },
+          { leaseExpiresAt: { lte: input.now } }
+        ]
+      },
+      orderBy: [{ updatedAt: "asc" }, { createdAt: "asc" }, { id: "asc" }],
+      take: input.limit,
+      include: { depositAddress: { select: tonDepositSweepRecordSelect } }
+    });
+    if (automaticSweeps.length >= input.limit) {
+      return automaticSweeps.map(assetSweepDepositRecord);
+    }
+    const legacy = await (prisma as any).tonhubDepositAddress.findMany({
       where: {
         network: input.network,
         status: "PAID",
         walletVersion: "v5r1",
         sweeps: {
           none: {
-            asset: "USDT",
+            asset: { in: ["GRAM", "USDT"] },
             status: { in: activeAssetSweepStatuses }
           }
         },
@@ -450,10 +664,48 @@ export const prismaTonDepositSweepRepository: TonDepositSweepRepository = {
           createdAt: "asc"
         }
       ],
-      take: input.limit,
+      take: input.limit - automaticSweeps.length,
       select: tonDepositSweepRecordSelect
-    }),
+    });
+    return [...automaticSweeps.map(assetSweepDepositRecord), ...legacy];
+  },
   claimSweepCandidate: async (input) => {
+    if (input.assetSweepId) {
+      const current = await (prisma as any).tonhubAssetSweep.findUnique({
+        where: { id: input.assetSweepId },
+        include: { depositAddress: { select: tonDepositSweepRecordSelect } }
+      });
+      if (!current || !["QUEUED", "READY", "SENT", "FAILED"].includes(current.status)) {
+        return null;
+      }
+      const leaseOwner = input.leaseOwner ?? `native-asset-sweep:${input.assetSweepId}`;
+      const resumedStatus = current.status === "FAILED"
+        ? resumableFailedNativeGramSweepStatus(current)
+        : current.status === "QUEUED" ? "READY" : current.status;
+      const claimed = await (prisma as any).tonhubAssetSweep.updateMany({
+        where: {
+          id: current.id,
+          status: current.status,
+          OR: [
+            { leaseExpiresAt: null },
+            { leaseExpiresAt: { lte: input.now } }
+          ]
+        },
+        data: {
+          status: resumedStatus,
+          leaseOwner,
+          leaseExpiresAt: new Date(input.now.getTime() + 60_000),
+          startedAt: current.startedAt ?? input.now,
+          lastError: null,
+          attempts: { increment: 1 }
+        }
+      });
+      if (claimed.count !== 1) return null;
+      return assetSweepDepositRecord(await (prisma as any).tonhubAssetSweep.findUnique({
+        where: { id: current.id },
+        include: { depositAddress: { select: tonDepositSweepRecordSelect } }
+      }));
+    }
     const result = await (prisma as any).tonhubDepositAddress.updateMany({
       where: {
         id: input.id,
@@ -463,7 +715,7 @@ export const prismaTonDepositSweepRepository: TonDepositSweepRepository = {
         },
         sweeps: {
           none: {
-            asset: "USDT",
+            asset: { in: ["GRAM", "USDT"] },
             status: { in: activeAssetSweepStatuses }
           }
         }
@@ -489,7 +741,36 @@ export const prismaTonDepositSweepRepository: TonDepositSweepRepository = {
       select: tonDepositSweepRecordSelect
     });
   },
+  markSweepReady: async (input) => {
+    const updated = await (prisma as any).tonhubAssetSweep.updateMany({
+      where: { id: input.assetSweepId, status: "READY", leaseOwner: input.leaseOwner },
+      data: {
+        amountAtomic: input.amountNano,
+        reserveAtomic: input.reserveNano,
+        recipientAddress: input.recipientAddress,
+        seqno: input.seqno,
+        startedAt: input.startedAt
+      }
+    });
+    if (updated.count !== 1) throw new Error("GRAM asset sweep lost its READY lease.");
+  },
   markSweepSent: async (input) => {
+    if (input.assetSweepId) {
+      const updated = await (prisma as any).tonhubAssetSweep.updateMany({
+        where: { id: input.assetSweepId, status: "READY", leaseOwner: input.leaseOwner },
+        data: {
+          status: "SENT",
+          amountAtomic: input.amountNano,
+          reserveAtomic: input.reserveNano,
+          recipientAddress: input.recipientAddress,
+          seqno: input.seqno,
+          sentAt: input.sentAt,
+          lastError: null
+        }
+      });
+      if (updated.count !== 1) throw new Error("GRAM asset sweep lost its broadcast lease.");
+      return;
+    }
     await (prisma as any).tonhubDepositAddress.update({
       where: {
         id: input.id
@@ -506,6 +787,55 @@ export const prismaTonDepositSweepRepository: TonDepositSweepRepository = {
     });
   },
   markSweepFailed: async (input) => {
+    if (input.assetSweepId) {
+      await (prisma as any).$transaction(async (tx: any) => {
+        const sweep = await tx.tonhubAssetSweep.findUnique({ where: { id: input.assetSweepId } });
+        const failed = await tx.tonhubAssetSweep.updateMany({
+          where: {
+            id: input.assetSweepId,
+            leaseOwner: input.leaseOwner,
+            status: { in: ["READY", "SENT"] }
+          },
+          data: {
+            status: "FAILED",
+            leaseOwner: null,
+            leaseExpiresAt: new Date(input.failedAt.getTime() + defaultSweepRetryMs),
+            lastError: truncateError(input.error)
+          }
+        });
+        if (failed.count !== 1 || !sweep?.orderId || !sweep.invoiceId) return;
+        await tx.tonhubRecoveryCase.upsert({
+          where: { id: `asset-sweep:${sweep.id}` },
+          create: {
+            id: `asset-sweep:${sweep.id}`,
+            orderId: sweep.orderId,
+            invoiceId: sweep.invoiceId,
+            reason: "GRAM_SWEEP_FAILED",
+            title: "GRAM sweep requires recovery",
+            details: {
+              sweepId: sweep.id,
+              depositAddressId: sweep.depositAddressId,
+              error: truncateError(input.error),
+              failedAt: input.failedAt.toISOString()
+            }
+          },
+          update: {
+            status: "OPEN",
+            reason: "GRAM_SWEEP_FAILED",
+            title: "GRAM sweep requires recovery",
+            details: {
+              sweepId: sweep.id,
+              depositAddressId: sweep.depositAddressId,
+              error: truncateError(input.error),
+              failedAt: input.failedAt.toISOString()
+            },
+            resolvedBy: null,
+            resolvedAt: null
+          }
+        });
+      });
+      return;
+    }
     await (prisma as any).tonhubDepositAddress.update({
       where: {
         id: input.id
@@ -515,6 +845,102 @@ export const prismaTonDepositSweepRepository: TonDepositSweepRepository = {
         sweepLastError: truncateError(input.error),
         updatedAt: input.failedAt
       }
+    });
+  },
+  markSweepConfirmed: async (input) => {
+    await (prisma as any).$transaction(async (tx: any) => {
+      const sweep = await tx.tonhubAssetSweep.findUnique({ where: { id: input.assetSweepId } });
+      if (!sweep?.orderId || !sweep.invoiceId) {
+        throw new Error("Automatic GRAM sweep lost order ownership.");
+      }
+      await tx.$queryRawUnsafe(
+        `SELECT "id" FROM "TonhubPaymentOrder" WHERE "id" = $1 FOR UPDATE`,
+        sweep.orderId
+      );
+      const updated = await tx.tonhubAssetSweep.updateMany({
+        where: {
+          id: sweep.id,
+          status: "SENT",
+          leaseOwner: input.leaseOwner
+        },
+        data: {
+          status: "CONFIRMED",
+          transactionHash: input.confirmation.transactionHash,
+          confirmedAt: input.confirmedAt,
+          leaseOwner: null,
+          leaseExpiresAt: null,
+          lastError: null
+        }
+      });
+      if (updated.count !== 1) throw new Error("GRAM sweep confirmation lost its lease.");
+      const deposit = await tx.tonhubDepositAddress.findUnique({ where: { id: sweep.depositAddressId } });
+      if (
+        !deposit || !sweep.amountAtomic || !sweep.recipientAddress ||
+        !/^\d+$/.test(input.confirmation.transactionLt)
+      ) {
+        throw new Error("Confirmed GRAM sweep has incomplete immutable chain evidence.");
+      }
+      await tx.tonhubPaymentMovement.createMany({
+        data: [{
+          fingerprint: `ton:${deposit.network}:native-out:${input.confirmation.transactionHash}:0`,
+          depositAddressId: deposit.id,
+          network: deposit.network,
+          direction: "OUTGOING",
+          asset: "GRAM",
+          assetKind: "NATIVE",
+          assetDecimals: 9,
+          amountAtomic: sweep.amountAtomic,
+          fromAddress: deposit.addressRaw,
+          toAddress: sweep.recipientAddress,
+          transactionHash: input.confirmation.transactionHash,
+          transactionLt: input.confirmation.transactionLt,
+          blockchainAt: input.confirmation.blockchainAt,
+          rawPayload: {
+            evidenceVersion: 1,
+            provider: "ton-json-rpc-transactions",
+            sweepId: sweep.id,
+            exactNativeTransfer: true
+          }
+        }],
+        skipDuplicates: true
+      });
+      const outgoingFingerprint = `ton:${deposit.network}:native-out:${input.confirmation.transactionHash}:0`;
+      const outgoing = await tx.tonhubPaymentMovement.findUnique({
+        where: { fingerprint: outgoingFingerprint }
+      });
+      const rawPayload = outgoing?.rawPayload;
+      if (
+        !outgoing || outgoing.depositAddressId !== deposit.id ||
+        outgoing.network !== deposit.network || outgoing.direction !== "OUTGOING" ||
+        outgoing.asset !== "GRAM" || outgoing.assetKind !== "NATIVE" ||
+        outgoing.assetDecimals !== 9 || outgoing.amountAtomic !== sweep.amountAtomic ||
+        Address.parse(outgoing.fromAddress).toRawString() !== Address.parse(deposit.addressRaw).toRawString() ||
+        Address.parse(outgoing.toAddress).toRawString() !== Address.parse(sweep.recipientAddress).toRawString() ||
+        outgoing.transactionHash !== input.confirmation.transactionHash ||
+        outgoing.transactionLt !== input.confirmation.transactionLt ||
+        outgoing.blockchainAt.getTime() !== input.confirmation.blockchainAt.getTime() ||
+        outgoing.status !== "OBSERVED" ||
+        !rawPayload || typeof rawPayload !== "object" || Array.isArray(rawPayload) ||
+        rawPayload.exactNativeTransfer !== true || rawPayload.sweepId !== sweep.id
+      ) {
+        throw new Error("Confirmed GRAM sweep conflicts with immutable outgoing ledger evidence.");
+      }
+      await tx.tonhubRecoveryCase.updateMany({
+        where: { id: `asset-sweep:${sweep.id}`, status: { in: ["OPEN", "REVIEWED"] } },
+        data: { status: "RESOLVED", resolvedBy: "system:gram-sweep", resolvedAt: input.confirmedAt }
+      });
+      await reconcileAutomaticAssetSweeps({
+        tx,
+        orderId: sweep.orderId,
+        invoiceId: sweep.invoiceId,
+        triggeredAt: input.confirmedAt
+      });
+    });
+  },
+  deferAssetSweep: async (input) => {
+    await (prisma as any).tonhubAssetSweep.updateMany({
+      where: { id: input.assetSweepId, leaseOwner: input.leaseOwner },
+      data: { leaseOwner: null, leaseExpiresAt: input.retryAt }
     });
   }
 };
@@ -570,7 +996,9 @@ export async function sweepTonDepositAddress(input: {
   const signingOwner = `native-sweep:${input.record.id}:${randomUUID()}`;
   const claimed = await repository.claimSweepCandidate({
     id: input.record.id,
-    now: now()
+    now: now(),
+    assetSweepId: input.record.assetSweepId,
+    leaseOwner: signingOwner
   });
 
   if (!claimed) {
@@ -593,16 +1021,147 @@ export async function sweepTonDepositAddress(input: {
       now: now(),
       leaseMs: input.signingLeaseMs ?? 60_000
     })) {
+      if (claimed.assetSweepId && repository.deferAssetSweep) {
+        await repository.deferAssetSweep({
+          assetSweepId: claimed.assetSweepId,
+          leaseOwner: signingOwner,
+          retryAt: new Date(now().getTime() + defaultSweepRetryMs)
+        });
+        return {
+          status: "claimed-by-other",
+          depositAddressId: claimed.id,
+          addressMasked
+        };
+      }
       throw new Error("TON deposit wallet is busy with another outgoing transfer.");
     }
-    const recipientAddress = Address.parse(input.config.recipientAddress);
+    const isAutomaticAssetSweep = Boolean(claimed.assetSweepId);
+    let confirmedAmountNano = claimed.assetSweepAmountAtomic ?? "0";
+    let confirmedReserveNano = claimed.assetSweepReserveAtomic ?? input.config.reserveNano.toString();
+    const confirmAutomaticSweep = async (confirmation: TonNativeSweepConfirmation) => {
+      if (!claimed.assetSweepId || !repository.markSweepConfirmed) {
+        throw new Error("GRAM asset sweep repository cannot persist confirmation.");
+      }
+      await repository.markSweepConfirmed({
+        id: claimed.id,
+        assetSweepId: claimed.assetSweepId,
+        leaseOwner: signingOwner,
+        confirmedAt: now(),
+        confirmation
+      });
+      if (input.signingLease) {
+        await input.signingLease.release({
+          network: input.config.network,
+          addressRaw: claimed.addressRaw,
+          owner: signingOwner
+        });
+      }
+      return {
+        status: "confirmed" as const,
+        depositAddressId: claimed.id,
+        addressMasked,
+        amountNano: confirmedAmountNano,
+        reserveNano: confirmedReserveNano
+      };
+    };
+    const hasPersistedPlanEvidence = isAutomaticAssetSweep && [
+      claimed.assetSweepAmountAtomic,
+      claimed.assetSweepReserveAtomic,
+      claimed.assetSweepRecipientAddress,
+      claimed.assetSweepSeqno,
+    ].some((value) => value !== null && value !== undefined);
+    const hasCompletePersistedPlan = isAutomaticAssetSweep &&
+      Boolean(claimed.assetSweepAmountAtomic) &&
+      claimed.assetSweepReserveAtomic !== null &&
+      claimed.assetSweepReserveAtomic !== undefined &&
+      Boolean(claimed.assetSweepRecipientAddress) &&
+      claimed.assetSweepSeqno !== null &&
+      claimed.assetSweepSeqno !== undefined;
+    if (hasPersistedPlanEvidence && !hasCompletePersistedPlan) {
+      throw new Error("Persisted GRAM sweep plan is incomplete.");
+    }
+    if (isAutomaticAssetSweep && hasCompletePersistedPlan) {
+      if (
+        claimed.assetSweepSeqno === null || claimed.assetSweepSeqno === undefined ||
+        !claimed.assetSweepAmountAtomic || !claimed.assetSweepRecipientAddress
+      ) {
+        throw new Error("Persisted GRAM sweep plan is incomplete.");
+      }
+      const confirmationNotBefore = claimed.assetSweepStatus === "SENT"
+        ? claimed.assetSweepSentAt
+        : claimed.assetSweepStartedAt;
+      if (!blockchain.findSweepTransfer || !confirmationNotBefore) {
+        throw new Error("Persisted GRAM sweep plan lacks exact confirmation support.");
+      }
+      const confirmation = await blockchain.findSweepTransfer({
+        wallet,
+        recipientAddress: Address.parse(claimed.assetSweepRecipientAddress),
+        amountNano: BigInt(claimed.assetSweepAmountAtomic),
+        comment: `Tonhub automatic GRAM sweep ${claimed.assetSweepId}`,
+        notBefore: confirmationNotBefore
+      });
+      if (confirmation) {
+        if (claimed.assetSweepStatus === "READY") {
+          await repository.markSweepSent({
+            id: claimed.id,
+            assetSweepId: claimed.assetSweepId,
+            leaseOwner: signingOwner,
+            amountNano: claimed.assetSweepAmountAtomic,
+            reserveNano: claimed.assetSweepReserveAtomic!,
+            recipientAddress: claimed.assetSweepRecipientAddress,
+            seqno: claimed.assetSweepSeqno,
+            sentAt: confirmation.blockchainAt
+          });
+        }
+        return await confirmAutomaticSweep(confirmation);
+      }
+      if (claimed.assetSweepStatus === "READY" &&
+        await blockchain.waitForWalletSeqno(wallet, claimed.assetSweepSeqno)) {
+        throw new Error("Persisted READY GRAM sweep plan is ambiguous after wallet seqno advancement.");
+      }
+      if (claimed.assetSweepStatus === "SENT") {
+        if (repository.deferAssetSweep && claimed.assetSweepId) {
+          await repository.deferAssetSweep({
+            assetSweepId: claimed.assetSweepId,
+            leaseOwner: signingOwner,
+            retryAt: new Date(now().getTime() + defaultSweepRetryMs)
+          });
+        }
+        return {
+          status: "sent",
+          depositAddressId: claimed.id,
+          addressMasked,
+          amountNano: claimed.assetSweepAmountAtomic,
+          amountTon: formatNanoTon(claimed.assetSweepAmountAtomic),
+          balanceNano: claimed.assetSweepAmountAtomic,
+          reserveNano: claimed.assetSweepReserveAtomic ?? input.config.reserveNano.toString(),
+          recipientAddressMasked: maskValue(claimed.assetSweepRecipientAddress),
+          seqno: claimed.assetSweepSeqno
+        };
+      }
+    }
+    const recipientAddressValue = claimed.assetSweepRecipientAddress ?? input.config.recipientAddress;
+    const reserveNano = claimed.assetSweepReserveAtomic !== null && claimed.assetSweepReserveAtomic !== undefined
+      ? BigInt(claimed.assetSweepReserveAtomic)
+      : input.config.reserveNano;
+    const recipientAddress = Address.parse(recipientAddressValue);
     const balanceNano = await blockchain.getBalance(wallet.address);
-    const amountNano = balanceNano - input.config.reserveNano;
+    const amountNano = claimed.assetSweepAmountAtomic
+      ? BigInt(claimed.assetSweepAmountAtomic)
+      : balanceNano - reserveNano;
+    confirmedAmountNano = amountNano.toString();
+    confirmedReserveNano = reserveNano.toString();
+
+    if (claimed.assetSweepAmountAtomic && balanceNano < amountNano + reserveNano) {
+      throw new Error("Persisted GRAM sweep plan exceeds the current wallet balance and reserve.");
+    }
 
     if (amountNano <= BigInt(0) || amountNano < input.config.minSweepNano) {
       const error = `GRAM (ex TON) deposit balance ${formatNanoTon(balanceNano.toString())} does not exceed sweep reserve ${formatNanoTon(input.config.reserveNano.toString())}.`;
       await repository.markSweepFailed({
         id: claimed.id,
+        assetSweepId: claimed.assetSweepId,
+        leaseOwner: signingOwner,
         error,
         failedAt: now()
       });
@@ -619,37 +1178,81 @@ export async function sweepTonDepositAddress(input: {
         depositAddressId: claimed.id,
         addressMasked,
         balanceNano: balanceNano.toString(),
-        reserveNano: input.config.reserveNano.toString(),
+        reserveNano: reserveNano.toString(),
         minSweepNano: input.config.minSweepNano.toString(),
         error
       };
     }
 
+    let plannedSeqno = claimed.assetSweepSeqno ?? null;
+    if (isAutomaticAssetSweep && plannedSeqno === null) {
+      if (!blockchain.getWalletSeqno || !repository.markSweepReady || !claimed.assetSweepId) {
+        throw new Error("GRAM asset sweep requires durable seqno planning support.");
+      }
+      plannedSeqno = await blockchain.getWalletSeqno(wallet);
+      await repository.markSweepReady({
+        id: claimed.id,
+        assetSweepId: claimed.assetSweepId,
+        leaseOwner: signingOwner,
+        amountNano: amountNano.toString(),
+        reserveNano: reserveNano.toString(),
+        recipientAddress: recipientAddressValue,
+        seqno: plannedSeqno,
+        startedAt: now()
+      });
+    }
+    const sweepComment = isAutomaticAssetSweep
+      ? `Tonhub automatic GRAM sweep ${claimed.assetSweepId}`
+      : `Tonhub payment sweep ${claimed.id}`;
     const sent = await blockchain.sendSweepTransfer({
       wallet,
       secretKey: input.config.secretKey,
       recipientAddress,
       amountNano,
-      comment: `Tonhub payment sweep ${claimed.id}`
+      comment: sweepComment,
+      ...(plannedSeqno !== null ? { seqno: plannedSeqno } : {})
     });
+    if (isAutomaticAssetSweep && sent.seqno !== plannedSeqno) {
+      throw new Error("GRAM sweep broadcast did not preserve the persisted wallet seqno plan.");
+    }
     const sentAt = now();
 
     await repository.markSweepSent({
       id: claimed.id,
+      assetSweepId: claimed.assetSweepId,
+      leaseOwner: signingOwner,
       amountNano: amountNano.toString(),
-      reserveNano: input.config.reserveNano.toString(),
-      recipientAddress: input.config.recipientAddress,
+      reserveNano: reserveNano.toString(),
+      recipientAddress: recipientAddressValue,
       seqno: sent.seqno,
       sentAt
     });
-    const broadcastAccepted = input.signingLease && sent.seqno !== null
+    const confirmation = isAutomaticAssetSweep && blockchain.findSweepTransfer
+      ? await blockchain.findSweepTransfer({
+          wallet,
+          recipientAddress,
+          amountNano,
+          comment: sweepComment,
+          notBefore: sentAt
+        })
+      : null;
+    const broadcastAccepted = !isAutomaticAssetSweep && input.signingLease && sent.seqno !== null
       ? await blockchain.waitForWalletSeqno(wallet, sent.seqno).catch(() => false)
       : false;
+    if (isAutomaticAssetSweep && confirmation) {
+      return await confirmAutomaticSweep(confirmation);
+    }
     if (input.signingLease && broadcastAccepted) {
       await input.signingLease.release({
-        network: input.config.network,
-        addressRaw: claimed.addressRaw,
-        owner: signingOwner
+          network: input.config.network,
+          addressRaw: claimed.addressRaw,
+          owner: signingOwner
+        });
+    } else if (isAutomaticAssetSweep && repository.deferAssetSweep && claimed.assetSweepId) {
+      await repository.deferAssetSweep({
+        assetSweepId: claimed.assetSweepId,
+        leaseOwner: signingOwner,
+        retryAt: new Date(now().getTime() + defaultSweepRetryMs)
       });
     }
 
@@ -660,14 +1263,16 @@ export async function sweepTonDepositAddress(input: {
       amountNano: amountNano.toString(),
       amountTon: formatNanoTon(amountNano.toString()),
       balanceNano: balanceNano.toString(),
-      reserveNano: input.config.reserveNano.toString(),
-      recipientAddressMasked: maskValue(input.config.recipientAddress),
+      reserveNano: reserveNano.toString(),
+      recipientAddressMasked: maskValue(recipientAddressValue),
       seqno: sent.seqno
     };
   } catch (error) {
     const message = errorMessage(error);
     await repository.markSweepFailed({
       id: claimed.id,
+      assetSweepId: claimed.assetSweepId,
+      leaseOwner: signingOwner,
       error: message,
       failedAt: now()
     });
@@ -697,10 +1302,12 @@ export async function runTonDepositSweepBatch(input: {
   const repository = input.repository ?? prismaTonDepositSweepRepository;
   const blockchain = input.blockchain ?? createTonSweepBlockchainClient(config);
   const signingLease = input.signingLease ?? prismaTonWalletSigningLease;
-  const retryBefore = new Date(now().getTime() - (input.retryAfterMs ?? defaultSweepRetryMs));
+  const batchNow = now();
+  const retryBefore = new Date(batchNow.getTime() - (input.retryAfterMs ?? defaultSweepRetryMs));
   const candidates = await repository.listSweepCandidates({
     network: input.network,
     limit: input.limit ?? 10,
+    now: batchNow,
     retryBefore
   });
   const outcomes: TonDepositSweepOutcome[] = [];

@@ -180,6 +180,7 @@ const dependencies = {
   }),
   fetchTonTransactions: async () => ({ transactions: currentTransactions }),
   gramSettlementMode: () => "legacy" as const,
+  movementSettlementEnabled: () => false,
   defaultCheckoutAsset: () => "GRAM" as const,
   checkoutOrderPolicy: () => ({
     minimumOrderFiatMicros: "0",

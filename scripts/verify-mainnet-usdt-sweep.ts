@@ -125,13 +125,24 @@ async function main() {
     blockchainAt: new Date("2026-08-13T10:00:00.000Z"),
     rawPayload: { officialUsdt: true, evidenceVersion: 1 },
   });
+  await prisma.tonhubAssetSweep.create({
+    data: {
+      idempotencyKey: `verifier-usdt-movement:${incoming.id}`,
+      depositAddressId: depositId,
+      orderId,
+      invoiceId,
+      asset: "USDT",
+      assetKind: "JETTON",
+      status: "QUEUED",
+    },
+  });
   const repository = createPrismaMainnetUsdtSweepRepository(prisma as any);
   let sweep = (await repository.listCandidates({
     now: new Date("2026-08-13T10:00:01.000Z"),
     limit: 200,
   })).find((candidate) => candidate.depositAddressId === depositId);
   assert.ok(sweep);
-  assert.equal(sweep.idempotencyKey, `official-usdt-movement:${incoming.id}`);
+  assert.equal(sweep.idempotencyKey, `verifier-usdt-movement:${incoming.id}`);
   let depositTon = 40_000_000n;
   let jettonBalance = 5_000_000n;
   let depositSeqno = 8;
