@@ -35,6 +35,9 @@ import {
   TonhubOrderNotRetryableError,
   TonhubOrderPolicyMismatchError,
   TonhubOrderTermsMismatchError,
+  TonhubPaymentSelectionLockedError,
+  TonhubPaymentSelectionExpiredError,
+  TonhubPaymentSelectionUnavailableError,
   prismaTonhubPaymentRepository,
   type TonhubPaymentRepository
 } from "./repository";
@@ -139,6 +142,13 @@ const createInvoiceSchema = z.object({
   ),
   externalId: z.string().trim().min(1).max(120).optional(),
   metadata: z.unknown().optional()
+});
+
+const selectPaymentMethodSchema = z.object({
+  asset: z.preprocess(
+    (value) => typeof value === "string" ? value.trim().toUpperCase() : value,
+    z.enum(["GRAM", "USDT"]),
+  ),
 });
 
 const transactionLimit = 1000;
@@ -734,12 +744,32 @@ function serializeInvoice(
   const remainingFiatMicros = invoice.remainingFiatMicros && /^\d+$/.test(invoice.remainingFiatMicros)
     ? BigInt(invoice.remainingFiatMicros)
     : null;
-  const remainingExactNano = fiatLedger && fiatAmountMicros && remainingFiatMicros !== null
-    ? (
+  const selectedStoredQuote = invoice.quotes?.find((value) => value.asset === asset.symbol);
+  const requiresGrossGramRemainder = asset.symbol === paymentAssets.GRAM.symbol &&
+    invoice.creditedAssets?.includes(paymentAssets.USDT.symbol) === true;
+  let remainingExactNano: string;
+  if (fiatLedger && fiatAmountMicros && remainingFiatMicros !== null) {
+    if (requiresGrossGramRemainder) {
+      if (
+        selectedStoredQuote?.rateSnapshot?.price === undefined ||
+        selectedStoredQuote.rateSnapshot.price === null
+      ) {
+        throw new Error("Mixed GRAM remainder requires its immutable rate snapshot.");
+      }
+      remainingExactNano = ceilAssetAtomicFromFiat({
+        fiatAmountMicros: remainingFiatMicros.toString(),
+        fiatPerAsset: String(selectedStoredQuote.rateSnapshot.price),
+        asset,
+      });
+    } else {
+      remainingExactNano = (
         (BigInt(expectedAmountNano) * remainingFiatMicros + fiatAmountMicros - BigInt(1)) /
         fiatAmountMicros
-      ).toString()
-    : subtractNano(expectedAmountNano, paidNano);
+      ).toString();
+    }
+  } else {
+    remainingExactNano = subtractNano(expectedAmountNano, paidNano);
+  }
   const remainingNano = remainingExactNano === "0"
     ? "0"
     : ceilAtomicToPaymentUnit(remainingExactNano, asset);
@@ -753,8 +783,16 @@ function serializeInvoice(
   const paidGram = asset.symbol === paymentAssets.GRAM.symbol ? paidAmountFormatted : null;
   const remainingGram = asset.symbol === paymentAssets.GRAM.symbol ? remainingAmountFormatted : null;
   const fiatCurrency = parseFiatCurrency(invoice.fiatCurrency);
+  const paymentSelectionLocked = Boolean(
+    invoice.paymentSelectionLockedAt ||
+    invoice.paymentSelectionLockedAsset ||
+    invoice.firstMovementAt ||
+    invoice.status !== "PENDING" ||
+    BigInt(invoice.creditedFiatMicros ?? "0") > BigInt(0) ||
+    BigInt(invoice.paidAmountAtomic ?? invoice.paidNano ?? "0") > BigInt(0)
+  );
   const storedPaymentOptions = (invoice.quotes ?? []).map((value) => serializeStoredQuote(value, invoice));
-  const paymentOptions = (storedPaymentOptions.length > 0
+  const basePaymentOptions = (storedPaymentOptions.length > 0
     ? storedPaymentOptions
     : (checkoutQuotes ?? []).map((value) => serializeQuote(value)))
     .sort((left, right) => {
@@ -762,7 +800,55 @@ function serializeInvoice(
       if (right?.asset === asset.symbol) return 1;
       return String(left?.asset).localeCompare(String(right?.asset));
     });
-  const selectedQuote = paymentOptions.find((value) => value?.asset === asset.symbol) ??
+  const paymentOptions = basePaymentOptions.map((option) => {
+    if (!option) return option;
+    const optionAsset = parsePaymentAsset(option.asset);
+    const storedQuote = invoice.quotes?.find((value) => value.asset === optionAsset.symbol);
+    const topUpFiatMicros = remainingFiatMicros?.toString() ?? invoice.fiatAmountMicros ?? null;
+    const alternateTopUpAtomic = paymentSelectionLocked && topUpFiatMicros && BigInt(topUpFiatMicros) > BigInt(0)
+      ? storedQuote?.rateSnapshot?.price !== undefined && storedQuote.rateSnapshot.price !== null
+        ? ceilAssetAtomicFromFiat({
+            fiatAmountMicros: topUpFiatMicros,
+            fiatPerAsset: String(storedQuote.rateSnapshot.price),
+            asset: optionAsset,
+          })
+        : null
+      : option.amountAtomic;
+    const optionPayableAtomic = optionAsset.symbol === asset.symbol
+      ? payableNano
+      : alternateTopUpAtomic;
+    const optionPayableFormatted = optionPayableAtomic === null
+      ? null
+      : formatCheckoutAssetAmount(optionPayableAtomic, optionAsset);
+    const optionDeeplink = optionPayableAtomic && BigInt(optionPayableAtomic) > BigInt(0) &&
+      (invoice.status === "PENDING" || invoice.status === "PARTIAL")
+      ? optionAsset.kind === "NATIVE"
+        ? buildTonTransferLink({
+            address: invoice.address,
+            amountNano: optionPayableAtomic,
+            comment: invoice.addressStrategy === "unique-address" ? undefined : invoice.reference,
+          })
+        : optionAsset.symbol === paymentAssets.USDT.symbol &&
+            invoice.network === "mainnet" &&
+            invoice.addressStrategy === "unique-address"
+          ? buildTonJettonTransferLink({
+              address: invoice.address,
+              amountAtomic: optionPayableAtomic,
+              jettonMasterAddress: officialMainnetUsdtMasterFriendlyAddress,
+            })
+          : null
+      : null;
+    return {
+      ...option,
+      selected: optionAsset.symbol === asset.symbol,
+      selectionLocked: paymentSelectionLocked,
+      payableAmountAtomic: optionPayableAtomic,
+      payableAmountFormatted: optionPayableFormatted,
+      discountFiatFormatted: formatFiatMicros(option.discountFiatMicros, fiatCurrency),
+      deeplink: optionDeeplink,
+    };
+  });
+  const selectedQuote = basePaymentOptions.find((value) => value?.asset === asset.symbol) ??
     serializeQuote(quote) ??
     null;
 
@@ -833,6 +919,9 @@ function serializeInvoice(
     observedPayments: storedObservedPayments(invoice),
     quote: selectedQuote,
     paymentOptions,
+    paymentSelectionLockedAsset: invoice.paymentSelectionLockedAsset ?? null,
+    paymentSelectionLockedAt: invoice.paymentSelectionLockedAt?.toISOString() ?? null,
+    paymentSelectionLocked,
     order: invoice.order
       ? {
           id: invoice.order.id,
@@ -1623,6 +1712,79 @@ export async function getTonhubPaymentInvoice(
       invoice: serializeInvoice(invoice)
     }
   };
+}
+
+export async function selectTonhubPaymentInvoicePaymentMethod(
+  id: string,
+  body: unknown,
+  dependencies: Partial<TonhubPaymentDependencies> = {},
+): Promise<PaymentResponse> {
+  const parsed = selectPaymentMethodSchema.safeParse(body);
+  if (!parsed.success) {
+    return {
+      status: 400,
+      body: {
+        errorCode: "INVALID_INVOICE_REQUEST",
+        error: "Payment asset must be GRAM or USDT.",
+      },
+    };
+  }
+  const deps = resolveDependencies(dependencies);
+  if (!deps.repository.selectInvoicePaymentAsset) {
+    return {
+      status: 503,
+      body: {
+        errorCode: "TON_INVOICE_PAYMENT_METHOD_UNAVAILABLE",
+        error: "Payment-method selection is unavailable.",
+      },
+    };
+  }
+  try {
+    const invoice = await deps.repository.selectInvoicePaymentAsset({
+      invoiceId: id,
+      asset: parsed.data.asset,
+    });
+    if (!invoice) {
+      return {
+        status: 404,
+        body: { errorCode: "TON_INVOICE_NOT_FOUND" },
+      };
+    }
+    return {
+      status: 200,
+      body: {
+        ok: true,
+        invoice: serializeInvoice(invoice),
+      },
+    };
+  } catch (error) {
+    if (error instanceof TonhubPaymentSelectionExpiredError) {
+      return {
+        status: 410,
+        body: {
+          errorCode: error.code,
+          error: error.message,
+        },
+      };
+    }
+    if (error instanceof TonhubPaymentSelectionLockedError ||
+        error instanceof TonhubPaymentSelectionUnavailableError) {
+      return {
+        status: 409,
+        body: {
+          errorCode: error.code,
+          error: error.message,
+        },
+      };
+    }
+    return {
+      status: 503,
+      body: {
+        errorCode: "TON_INVOICE_PAYMENT_METHOD_CHANGE_FAILED",
+        error: error instanceof Error ? error.message : "Unable to change the payment method.",
+      },
+    };
+  }
 }
 
 export async function checkTonhubPaymentInvoice(

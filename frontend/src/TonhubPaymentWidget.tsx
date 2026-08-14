@@ -53,6 +53,22 @@ type WidgetNotice = {
   code?: string;
 };
 
+type PaymentOption = {
+  asset: PaymentAsset;
+  label: string;
+  assetDecimals: number;
+  amountAtomic: string;
+  amountFormatted: string;
+  payableAmountAtomic: string | null;
+  payableAmountFormatted: string | null;
+  fiatPerAsset: number | null;
+  discountFiatMicros: string | null;
+  discountFiatFormatted: string | null;
+  selected: boolean;
+  selectionLocked: boolean;
+  deeplink: string | null;
+};
+
 type TonhubInvoice = {
   id: string;
   externalId: string | null;
@@ -93,6 +109,10 @@ type TonhubInvoice = {
   expiresAt: string | null;
   priceLockedUntil: string | null;
   partialPaymentExpiresAt: string | null;
+  paymentSelectionLockedAsset: PaymentAsset | null;
+  paymentSelectionLockedAt: string | null;
+  paymentSelectionLocked: boolean;
+  paymentOptions: PaymentOption[];
   quote: {
     asset: PaymentAsset;
     assetDecimals: number;
@@ -122,6 +142,10 @@ type ApiConfig = {
     checkoutFractionDigits: number;
     pricingStrategy: "MARKET" | "USD_PEG";
   }>;
+  orderPolicyByCurrency: Record<FiatCurrency, {
+    minimumOrderFiatMicros: string;
+    gramDiscountMaxFiatMicros: string;
+  }>;
 };
 
 export type TonhubPaymentWidgetProps = {
@@ -149,6 +173,8 @@ const errorMessages: Record<string, string> = {
   INVALID_INVOICE_REQUEST: "Check the amount, currency, and network, then try again.",
   TON_INVOICE_CREATE_FAILED: "We could not create this payment invoice right now. Check the payment configuration and try again.",
   TON_INVOICE_ASSET_UNAVAILABLE: "That payment asset is not available on the selected network.",
+  TON_INVOICE_PAYMENT_METHOD_LOCKED: "The original payment method is locked because a transfer has already been detected. You can still open the other method for the remaining balance.",
+  TON_INVOICE_PAYMENT_METHOD_UNAVAILABLE: "That payment method is not available for this invoice.",
   TON_INVOICE_NOT_FOUND: "This invoice could not be found. Create a new invoice and try again.",
   TON_INVOICE_NOT_PAYABLE: "This invoice is no longer payable. Create a new invoice to continue.",
   TON_INVOICE_EXPIRED: "The payment window has expired. Create a new invoice to get a fresh rate.",
@@ -180,6 +206,31 @@ export function fiatPaymentProgress(input: {
     paid: input.creditedFiatFormatted,
     remaining: input.remainingFiatFormatted ?? `0.00 ${input.fiatCurrency}`,
   };
+}
+
+export function formatFiatPolicyMicros(value: string | undefined, currency: FiatCurrency) {
+  if (!value || !/^\d+$/.test(value)) return null;
+  const micros = BigInt(value);
+  const whole = micros / BigInt(1_000_000);
+  const cents = ((micros % BigInt(1_000_000)) / BigInt(10_000)).toString().padStart(2, "0");
+  const symbol = currency === "USD" ? "$" : "€";
+  return `${symbol}${whole}${cents === "00" ? "" : `.${cents}`}`;
+}
+
+export function paymentRailAction(input: {
+  invoiceAsset: PaymentAsset;
+  requestedAsset: PaymentAsset;
+  selectionLocked: boolean;
+}) {
+  if (input.invoiceAsset === input.requestedAsset) return "selected" as const;
+  return input.selectionLocked ? "top-up" as const : "switch" as const;
+}
+
+export function immutablePaymentOptionSaving(
+  options: Array<{ asset: PaymentAsset; discountFiatFormatted: string | null }>,
+  asset: PaymentAsset,
+) {
+  return options.find((option) => option.asset === asset)?.discountFiatFormatted ?? null;
 }
 
 export function PaymentStatusAnnouncement({ message }: { message: string }) {
@@ -323,7 +374,12 @@ export function TonhubPaymentWidget({
     GRAM: "GRAM (ex TON)",
     USDT: "USD₮"
   });
+  const [orderPolicyByCurrency, setOrderPolicyByCurrency] = useState<ApiConfig["orderPolicyByCurrency"]>({
+    USD: { minimumOrderFiatMicros: "10000000", gramDiscountMaxFiatMicros: "1000000" },
+    EUR: { minimumOrderFiatMicros: "10000000", gramDiscountMaxFiatMicros: "1000000" },
+  });
   const [invoice, setInvoice] = useState<TonhubInvoice | null>(null);
+  const [instructionAsset, setInstructionAsset] = useState<PaymentAsset | null>(null);
   const [notice, setNotice] = useState<WidgetNotice | null>(null);
   const [busy, setBusy] = useState(false);
   const [configReady, setConfigReady] = useState(false);
@@ -356,6 +412,9 @@ export function TonhubPaymentWidget({
         setCheckoutAssetsByNetwork(assetsByNetwork);
         setDefaultAssetByNetwork(defaultsByNetwork);
         setAssetLabels(Object.fromEntries(data.config.assets.map((item) => [item.symbol, item.label])) as Record<PaymentAsset, string>);
+        if (data.config.orderPolicyByCurrency) {
+          setOrderPolicyByCurrency(data.config.orderPolicyByCurrency);
+        }
         setAsset(checkoutAssetForNetwork({
           network: nextNetwork,
           requested: initialAsset,
@@ -428,6 +487,7 @@ export function TonhubPaymentWidget({
       }
 
       setInvoice(body.invoice);
+      setInstructionAsset(body.invoice.asset);
       setAsset(body.invoice.asset);
       setNetwork(body.invoice.network);
       if (body.finalized || body.invoice.status === "PAID") {
@@ -478,6 +538,9 @@ export function TonhubPaymentWidget({
       }
 
       setInvoice(body.invoice);
+      setInstructionAsset((current) => body.invoice?.paymentOptions.some((option) => option.asset === current)
+        ? current
+        : body.invoice?.asset ?? null);
       setAsset(body.invoice.asset);
       setNetwork(body.invoice.network);
       if (!response.ok) {
@@ -519,7 +582,66 @@ export function TonhubPaymentWidget({
 
   function resetInvoice() {
     setInvoice(null);
+    setInstructionAsset(null);
     setNotice(null);
+  }
+
+  async function selectInvoicePaymentMethod(nextAsset: PaymentAsset) {
+    if (!invoice || nextAsset === invoice.asset) {
+      setInstructionAsset(nextAsset);
+      return;
+    }
+    if (invoice.paymentSelectionLocked || invoice.status !== "PENDING") {
+      setInstructionAsset(nextAsset);
+      setNotice({
+        tone: "info",
+        title: `${assetLabels[nextAsset]} opened for the remaining balance`,
+        message: "Your original payment choice stays locked. The server will combine verified TON-network transfers by their fiat value.",
+      });
+      return;
+    }
+    setBusy(true);
+    setNotice(null);
+    try {
+      const response = await fetch(`${base}/invoices/${encodeURIComponent(invoice.id)}/payment-method`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ asset: nextAsset }),
+      });
+      const body = (await response.json().catch(() => ({}))) as {
+        invoice?: TonhubInvoice;
+        error?: string;
+        errorCode?: string;
+      };
+      if (!response.ok || !body.invoice) {
+        setNotice(errorNotice({
+          title: "Payment method was not changed",
+          fallback: "Unable to change the payment method.",
+          error: body.error,
+          errorCode: body.errorCode,
+        }));
+        if (body.errorCode === "TON_INVOICE_PAYMENT_METHOD_LOCKED") {
+          await checkInvoice({ quiet: true });
+        }
+        return;
+      }
+      setInvoice(body.invoice);
+      setAsset(body.invoice.asset);
+      setInstructionAsset(body.invoice.asset);
+      setNotice({
+        tone: "success",
+        title: `Payment method changed to ${assetLabels[body.invoice.asset]}`,
+        message: "Use the updated exact amount below. The fiat order total has not changed.",
+      });
+    } catch {
+      setNotice({
+        tone: "error",
+        title: "Payment method was not changed",
+        message: "The payment service did not respond. Check your connection and try again.",
+      });
+    } finally {
+      setBusy(false);
+    }
   }
 
   function selectNetwork(nextNetwork: TonNetwork) {
@@ -531,13 +653,43 @@ export function TonhubPaymentWidget({
     }));
   }
 
-  const qrSvg = invoice?.deeplink
-    ? createTonQrSvg(invoice.deeplink, "light-on-dark", `${invoice.asset} payment QR`)
+  const activePaymentOption = invoice?.paymentOptions.find((option) =>
+    option.asset === (instructionAsset ?? invoice.asset)
+  ) ?? null;
+  const paymentInstruction = invoice && activePaymentOption?.payableAmountAtomic &&
+    activePaymentOption.payableAmountFormatted
+    ? {
+        ...invoice,
+        asset: activePaymentOption.asset,
+        assetKind: activePaymentOption.asset === "GRAM" ? "NATIVE" as const : "JETTON" as const,
+        assetDecimals: activePaymentOption.assetDecimals,
+        amountAtomic: activePaymentOption.payableAmountAtomic,
+        amountFormatted: activePaymentOption.payableAmountFormatted,
+        deeplink: activePaymentOption.deeplink,
+      }
+    : null;
+  const qrSvg = paymentInstruction?.deeplink
+    ? createTonQrSvg(
+        paymentInstruction.deeplink,
+        "light-on-dark",
+        `${assetLabels[paymentInstruction.asset]} payment QR`,
+      )
     : null;
   const terminal = invoice ? !isPayable(invoice.status) : false;
   const result = invoice && terminal ? terminalState(invoice) : null;
   const ResultIcon = result?.icon;
   const fiatProgress = invoice ? fiatPaymentProgress(invoice) : null;
+  const minimumOrder = formatFiatPolicyMicros(
+    orderPolicyByCurrency[currency]?.minimumOrderFiatMicros,
+    currency,
+  );
+  const configuredGramSaving = formatFiatPolicyMicros(
+    orderPolicyByCurrency[currency]?.gramDiscountMaxFiatMicros,
+    currency,
+  );
+  const invoiceGramSaving = invoice
+    ? immutablePaymentOptionSaving(invoice.paymentOptions, "GRAM")
+    : null;
 
   return (
     <section className="tonhub-payment-widget" data-tonhub-payment-widget>
@@ -546,13 +698,14 @@ export function TonhubPaymentWidget({
           <span>Amount</span>
           <input
             inputMode="decimal"
-            min="0.01"
+            min={minimumOrder?.replace(/[^\d.]/g, "") || "0.01"}
             step="0.01"
             type="number"
             value={amount}
             disabled={Boolean(invoice)}
             onChange={(event) => setAmount(event.target.value)}
           />
+          {minimumOrder ? <small>Minimum order: {minimumOrder}</small> : null}
         </label>
         <label className="tonhub-payment-widget__field">
           <span>Currency</span>
@@ -601,8 +754,10 @@ export function TonhubPaymentWidget({
                   disabled={!configReady || busy || Boolean(invoice)}
                   onClick={() => setAsset(item)}
                 >
-                  <strong>{item}</strong>
-                  <small>{item === "USDT" ? "Stablecoin on TON" : "Native TON coin"}</small>
+                  <strong>{assetLabels[item]}</strong>
+                  <small>{item === "USDT"
+                    ? "Familiar Tether, issued on TON"
+                    : `${configuredGramSaving ? `Save up to ${configuredGramSaving}` : "Native TON coin"} when paid fully in GRAM`}</small>
                 </button>
               );
             })}
@@ -614,7 +769,11 @@ export function TonhubPaymentWidget({
           disabled={!configReady || busy || Boolean(invoice)}
           onClick={() => void createInvoice()}
         >
-          {!configReady ? "Loading payment options..." : busy ? "Creating..." : `Continue with ${asset}`}
+          {!configReady
+            ? "Loading payment options..."
+            : busy
+              ? "Creating..."
+              : `Continue with ${assetLabels[asset]}`}
         </button>
       </div>
 
@@ -639,7 +798,7 @@ export function TonhubPaymentWidget({
               <strong>{invoice.fiatAmountFormatted}</strong>
             </div>
             <div>
-              <span>{invoice.asset} amount</span>
+              <span>{assetLabels[invoice.asset]} remaining</span>
               <strong>{invoice.amountFormatted}</strong>
             </div>
             {invoice.status === "PARTIAL" ? (
@@ -670,17 +829,59 @@ export function TonhubPaymentWidget({
             <div className="tonhub-payment-widget__paybox">
               <div className="tonhub-payment-widget__paybox-header">
                 <div>
-                  <span>Wallet checkout</span>
-                  <strong>{invoice.status === "PARTIAL" ? "Finish the remaining payment" : "Scan to pay"}</strong>
+                  <span>Pay on TON</span>
+                  <strong>{invoice.status === "PARTIAL"
+                    ? `Finish with ${paymentInstruction ? assetLabels[paymentInstruction.asset] : assetLabels[invoice.asset]}`
+                    : `Send ${paymentInstruction ? assetLabels[paymentInstruction.asset] : assetLabels[invoice.asset]}`}</strong>
                 </div>
                 <span className="tonhub-payment-widget__status-pill">{statusLabels[invoice.status]}</span>
               </div>
-              {tonConnectManifest ? (
-                <TonConnectFallbackBoundary key={`${invoice.id}:${invoice.amountAtomic}`}>
+              {invoice.paymentOptions.length > 1 ? (
+                <div className="tonhub-payment-widget__rail-picker" role="group" aria-label="Payment instruction">
+                  {invoice.paymentOptions.map((option) => {
+                    const action = paymentRailAction({
+                      invoiceAsset: invoice.asset,
+                      requestedAsset: option.asset,
+                      selectionLocked: invoice.paymentSelectionLocked,
+                    });
+                    const active = paymentInstruction?.asset === option.asset;
+                    return (
+                      <button
+                        className={active ? "is-selected" : ""}
+                        key={option.asset}
+                        type="button"
+                        aria-pressed={active}
+                        disabled={busy || !option.payableAmountAtomic}
+                        onClick={() => void selectInvoicePaymentMethod(option.asset)}
+                      >
+                        <span>
+                          <strong>{option.label}</strong>
+                          {option.asset === invoice.asset ? <em>Original choice</em> : null}
+                        </span>
+                        <b>{option.payableAmountFormatted ?? "Unavailable"}</b>
+                        <small>{action === "selected"
+                          ? invoice.paymentSelectionLocked ? "Locked after first transfer" : "Selected payment method"
+                          : action === "switch" ? "Switch before sending" : "Open for the remaining balance"}</small>
+                      </button>
+                    );
+                  })}
+                </div>
+              ) : null}
+              {invoice.paymentSelectionLocked && paymentInstruction?.asset !== invoice.asset ? (
+                <p className="tonhub-payment-widget__rail-note" role="status">
+                  The original {assetLabels[invoice.asset]} choice stays locked. This additional transfer will be combined by fiat value; a mixed payment does not receive the GRAM-only saving.
+                </p>
+              ) : invoice.asset === "GRAM" && invoiceGramSaving ? (
+                <p className="tonhub-payment-widget__rail-note">
+                  Save up to {invoiceGramSaving} only when the complete payment is received in GRAM. Sending USD₮ makes the payment mixed and keeps the original fiat total.
+                </p>
+              ) : null}
+              {tonConnectManifest && paymentInstruction ? (
+                <TonConnectFallbackBoundary key={`${invoice.id}:${paymentInstruction.asset}:${paymentInstruction.amountAtomic}`}>
                   <Suspense fallback={<div className="tonhub-payment-widget__ton-connect-loading">Loading wallet connection...</div>}>
                     <TonConnectPayment
                       manifestUrl={tonConnectManifest}
-                      invoice={invoice}
+                      invoice={paymentInstruction}
                       onSubmitted={() => setNotice({
                         tone: "info",
                         title: "Transaction submitted",
@@ -709,23 +910,31 @@ export function TonhubPaymentWidget({
                   />
                 </div>
               ) : null}
-              <TonManualTransferFields
-                address={invoice.address}
-                amount={invoice.amountFormatted}
-                amountCopyValue={copyableAssetAmount(invoice.amountFormatted)}
-                addressLabel="Address"
-                amountLabel="Amount"
-                copyLabel="Copy"
-                copiedLabel="Copied"
-              />
-              <p className="tonhub-payment-widget__wallet-note">
-                Open with Tonhub, Tonkeeper, or Wallet in Telegram. Send only {assetLabels[invoice.asset]} on {invoice.network}.
-              </p>
-              {invoice.deeplink ? (
-                <a className="tonhub-payment-widget__primary" href={invoice.deeplink}>
-                  Open wallet
-                </a>
-              ) : null}
+              {paymentInstruction ? (
+                <>
+                  <TonManualTransferFields
+                    address={invoice.address}
+                    amount={paymentInstruction.amountFormatted}
+                    amountCopyValue={copyableAssetAmount(paymentInstruction.amountFormatted)}
+                    addressLabel="Unique TON address"
+                    amountLabel="Exact amount"
+                    copyLabel="Copy"
+                    copiedLabel="Copied"
+                  />
+                  <p className="tonhub-payment-widget__wallet-note">
+                    Open with Tonhub, Tonkeeper, Trust Wallet, or Wallet in Telegram. Send only {assetLabels[paymentInstruction.asset]} on TON {invoice.network}.
+                  </p>
+                  {paymentInstruction.deeplink ? (
+                    <a className="tonhub-payment-widget__primary" href={paymentInstruction.deeplink}>
+                      Open wallet
+                    </a>
+                  ) : null}
+                </>
+              ) : (
+                <p className="tonhub-payment-widget__rail-note" role="alert">
+                  This payment instruction is unavailable. Return to the original method or check the invoice again.
+                </p>
+              )}
               <button
                 className="tonhub-payment-widget__secondary"
                 type="button"

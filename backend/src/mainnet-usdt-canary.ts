@@ -67,7 +67,7 @@ export async function inspectMainnetUsdtCanary(input: {
     asset,
     quoteCurrency,
     row: await input.db.tonhubRateSnapshot.findFirst({
-      where: { asset, baseCurrency: asset, quoteCurrency },
+      where: { asset, baseCurrency: asset, quoteCurrency, observedAt: { lte: now } },
       orderBy: [{ observedAt: "desc" }, { id: "desc" }],
     }),
   }))));

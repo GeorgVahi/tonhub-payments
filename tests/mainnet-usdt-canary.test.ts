@@ -30,8 +30,15 @@ function db(input: { orders?: any[]; rates?: Record<string, any>; migration?: bo
 }
 
 test("mainnet canary preflight is read-only and ready before allowlisted orders are issued", async () => {
+  const database = db() as any;
+  const rateQueries: any[] = [];
+  const findRate = database.tonhubRateSnapshot.findFirst;
+  database.tonhubRateSnapshot.findFirst = async (query: any) => {
+    rateQueries.push(query);
+    return findRate(query);
+  };
   const report = await inspectMainnetUsdtCanary({
-    db: db() as any,
+    db: database,
     env,
     now: new Date("2026-08-13T12:00:00.000Z"),
   });
@@ -39,6 +46,9 @@ test("mainnet canary preflight is read-only and ready before allowlisted orders 
   assert.equal(report.configuredOrders, 2);
   assert.equal(report.materializedOrders, 0);
   assert.deepEqual(report.blockers, []);
+  assert.equal(rateQueries.length, 4);
+  assert.ok(rateQueries.every((query) =>
+    query.where.observedAt.lte.toISOString() === "2026-08-13T12:00:00.000Z"));
 });
 
 test("mainnet canary preflight stops on public exposure, stale rates, recovery, or sweep failure", async () => {

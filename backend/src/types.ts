@@ -143,6 +143,7 @@ export type TonhubPaymentInvoiceRecord = {
   metadata: unknown;
   payload: unknown;
   quotes?: TonhubPaymentQuoteRecord[];
+  creditedAssets?: PaymentAssetSymbol[];
 };
 
 export type TonhubCreateInvoiceInput = {

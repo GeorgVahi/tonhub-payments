@@ -33,7 +33,12 @@ try {
   assert.equal((await repository.recordMany([{ ...first, price: "9.9" }]))[0]?.price, "2.5");
   assert.equal(
     await prisma.tonhubRateSnapshot.count({
-      where: { asset: "GRAM", quoteCurrency: "USD", source: "coingecko" },
+      where: {
+        asset: "GRAM",
+        quoteCurrency: "USD",
+        source: "coingecko",
+        observedAt: { in: [firstObservedAt, secondObservedAt] },
+      },
     }),
     2,
   );

@@ -9,10 +9,15 @@ import type {
 } from "./types";
 import type { TonhubCheckoutOrderPolicy } from "./checkout-order-policy";
 import { gramAsset, type TonNetwork } from "./ton/direct-payments";
-import { assertPaymentAssetSnapshot, parsePaymentAsset } from "../../shared/payment-assets";
+import {
+  assertPaymentAssetSnapshot,
+  parsePaymentAsset,
+  type PaymentAssetSymbol,
+} from "../../shared/payment-assets";
 
 type PrismaLike = {
   $transaction: <T>(handler: (tx: PrismaLike) => Promise<T>) => Promise<T>;
+  $queryRawUnsafe: <T = unknown>(query: string, ...values: unknown[]) => Promise<T>;
   tonhubPaymentOrder: any;
   tonhubPaymentInvoice: any;
   tonhubDepositAddress: any;
@@ -22,6 +27,21 @@ type PrismaLike = {
 
 const activeAttemptStatuses = ["PENDING", "PARTIAL"] as const;
 const reusableAttemptStatuses = ["PENDING", "PARTIAL", "PAID"] as const;
+const invoiceReadInclude = {
+  order: {
+    include: {
+      allocations: {
+        select: {
+          id: true,
+          kind: true,
+          reversesAllocationId: true,
+          movement: { select: { asset: true } },
+        },
+      },
+    },
+  },
+  quotes: { include: { rateSnapshot: true } },
+};
 
 export class TonhubOrderTermsMismatchError extends Error {
   readonly code = "TON_ORDER_TERMS_MISMATCH";
@@ -47,6 +67,33 @@ export class TonhubOrderPolicyMismatchError extends Error {
   constructor() {
     super("The externalId already belongs to an order with different snapshotted checkout policy.");
     this.name = "TonhubOrderPolicyMismatchError";
+  }
+}
+
+export class TonhubPaymentSelectionLockedError extends Error {
+  readonly code = "TON_INVOICE_PAYMENT_METHOD_LOCKED";
+
+  constructor() {
+    super("The payment method cannot be changed after the first valid movement.");
+    this.name = "TonhubPaymentSelectionLockedError";
+  }
+}
+
+export class TonhubPaymentSelectionUnavailableError extends Error {
+  readonly code = "TON_INVOICE_PAYMENT_METHOD_UNAVAILABLE";
+
+  constructor() {
+    super("The requested payment method is not available for this invoice.");
+    this.name = "TonhubPaymentSelectionUnavailableError";
+  }
+}
+
+export class TonhubPaymentSelectionExpiredError extends Error {
+  readonly code = "TON_INVOICE_EXPIRED";
+
+  constructor() {
+    super("The payment method cannot be changed after the invoice payment deadline.");
+    this.name = "TonhubPaymentSelectionExpiredError";
   }
 }
 
@@ -96,7 +143,26 @@ function normalizeOrder(value: unknown): TonhubPaymentOrderRecord | null {
 }
 
 function normalizeInvoice(value: unknown): TonhubPaymentInvoiceRecord {
-  const invoice = value as TonhubPaymentInvoiceRecord & { order?: unknown };
+  const invoice = value as TonhubPaymentInvoiceRecord & {
+    order?: {
+      allocations?: Array<{
+        id: string;
+        kind: string;
+        reversesAllocationId: string | null;
+        movement?: { asset?: unknown } | null;
+      }>;
+    };
+  };
+  const allocations = invoice.order?.allocations ?? [];
+  const reversedAllocationIds = new Set(
+    allocations
+      .filter((allocation) => allocation.kind === "REVERSAL" && allocation.reversesAllocationId)
+      .map((allocation) => allocation.reversesAllocationId as string),
+  );
+  const creditedAssets = [...new Set(allocations
+    .filter((allocation) => allocation.kind === "CREDIT" && !reversedAllocationIds.has(allocation.id))
+    .map((allocation) => allocation.movement?.asset)
+    .filter((asset): asset is PaymentAssetSymbol => asset === "GRAM" || asset === "USDT"))];
   const order = normalizeOrder(invoice.order);
   const fiatAmountMicros = invoice.fiatAmountMicros ?? fiatCentsToMicros(invoice.fiatAmountCents);
   const paidAmountAtomic = invoice.paidAmountAtomic ?? invoice.paidNano ?? "0";
@@ -128,6 +194,7 @@ function normalizeInvoice(value: unknown): TonhubPaymentInvoiceRecord {
     ),
     amountAtomic,
     paidAmountAtomic,
+    creditedAssets,
   };
 }
 
@@ -227,7 +294,7 @@ async function syncOrderFromAttempts(
 async function findInvoiceWithOrder(db: PrismaLike, id: string) {
   const invoice = await db.tonhubPaymentInvoice.findUnique({
     where: { id },
-    include: { order: true, quotes: { include: { rateSnapshot: true } } },
+    include: invoiceReadInclude,
   });
   return invoice ? normalizeInvoice(invoice) : null;
 }
@@ -464,6 +531,10 @@ export type TonhubPaymentRepository = {
     priceLockedUntil: Date;
     activationThresholdFiatMicros?: string;
   }) => Promise<TonhubPaymentInvoiceRecord>;
+  selectInvoicePaymentAsset?: (input: {
+    invoiceId: string;
+    asset: "GRAM" | "USDT";
+  }) => Promise<TonhubPaymentInvoiceRecord | null>;
   markInvoiceExpired: (input: {
     invoiceId: string;
     expiredAt: Date;
@@ -502,7 +573,7 @@ export function createPrismaTonhubPaymentRepository(db: PrismaLike): TonhubPayme
           orderId: null,
         },
         orderBy: { createdAt: "desc" },
-        include: { order: true, quotes: { include: { rateSnapshot: true } } },
+        include: invoiceReadInclude,
       });
       if (legacyInvoice) {
         const normalized = normalizeInvoice(legacyInvoice);
@@ -528,7 +599,7 @@ export function createPrismaTonhubPaymentRepository(db: PrismaLike): TonhubPayme
             status: { in: order.status === "PAID" ? ["PAID"] : [...reusableAttemptStatuses] },
           },
           orderBy: { createdAt: "desc" },
-          include: { order: true, quotes: { include: { rateSnapshot: true } } },
+          include: invoiceReadInclude,
         });
         if (invoice) {
           return normalizeInvoice(invoice);
@@ -614,7 +685,7 @@ export function createPrismaTonhubPaymentRepository(db: PrismaLike): TonhubPayme
               status: { in: [...reusableAttemptStatuses] },
             },
             orderBy: { createdAt: "desc" },
-            include: { order: true, quotes: { include: { rateSnapshot: true } } },
+            include: invoiceReadInclude,
           });
           if (existingAttempt) {
             return normalizeInvoice(existingAttempt);
@@ -748,7 +819,7 @@ export function createPrismaTonhubPaymentRepository(db: PrismaLike): TonhubPayme
             status: { in: [...reusableAttemptStatuses] },
           },
           orderBy: { createdAt: "desc" },
-          include: { order: true, quotes: { include: { rateSnapshot: true } } },
+          include: invoiceReadInclude,
         });
         if (!concurrentAttempt) {
           throw error;
@@ -756,6 +827,92 @@ export function createPrismaTonhubPaymentRepository(db: PrismaLike): TonhubPayme
         return normalizeInvoice(concurrentAttempt);
       }
     },
+    selectInvoicePaymentAsset: async ({ invoiceId, asset }) => db.$transaction(async (tx) => {
+      const found = await findInvoiceWithOrder(tx, invoiceId);
+      if (!found) {
+        return null;
+      }
+      const currentAsset = assertPaymentAssetSnapshot(
+        parsePaymentAsset(found.checkoutAsset ?? found.asset),
+        { kind: found.assetKind, decimals: found.assetDecimals },
+      );
+      const selectionLocked = Boolean(
+        found.status !== "PENDING" ||
+        found.paymentSelectionLockedAt ||
+        found.paymentSelectionLockedAsset ||
+        found.firstMovementAt ||
+        found.observedAt ||
+        BigInt(found.creditedFiatMicros ?? "0") > BigInt(0) ||
+        BigInt(found.paidAmountAtomic ?? found.paidNano ?? "0") > BigInt(0)
+      );
+      if (selectionLocked && currentAsset.symbol === asset) {
+        return found;
+      }
+      if (selectionLocked) {
+        throw new TonhubPaymentSelectionLockedError();
+      }
+      const quote = found.quotes?.find((candidate) => candidate.asset === asset);
+      if (currentAsset.symbol !== asset && !quote) {
+        throw new TonhubPaymentSelectionUnavailableError();
+      }
+      const invoiceDeadline = found.priceLockedUntil ?? found.expiresAt;
+      const quoteDeadline = quote?.expiresAt ?? null;
+      const deadline = invoiceDeadline && quoteDeadline
+        ? new Date(Math.min(invoiceDeadline.getTime(), quoteDeadline.getTime()))
+        : invoiceDeadline ?? quoteDeadline;
+      const clockRows = await tx.$queryRawUnsafe<Array<{ now: Date }>>(
+        'SELECT clock_timestamp() AS "now"',
+      );
+      const databaseNow = clockRows[0]?.now;
+      if (
+        !deadline ||
+        !(databaseNow instanceof Date) ||
+        !Number.isFinite(databaseNow.getTime()) ||
+        databaseNow.getTime() >= deadline.getTime()
+      ) {
+        throw new TonhubPaymentSelectionExpiredError();
+      }
+      if (currentAsset.symbol === asset) {
+        return found;
+      }
+      if (!quote) {
+        throw new TonhubPaymentSelectionUnavailableError();
+      }
+      const nextAsset = assertPaymentAssetSnapshot(parsePaymentAsset(quote.asset), {
+        kind: quote.assetKind,
+        decimals: quote.assetDecimals,
+      });
+      const changed = await tx.tonhubPaymentInvoice.updateMany({
+        where: {
+          id: found.id,
+          status: "PENDING",
+          paymentSelectionLockedAsset: null,
+          paymentSelectionLockedAt: null,
+          creditedFiatMicros: "0",
+          paidAmountAtomic: "0",
+          paidNano: "0",
+          version: found.version ?? 0,
+        },
+        data: {
+          asset: nextAsset.symbol,
+          checkoutAsset: nextAsset.symbol,
+          assetKind: nextAsset.kind,
+          assetDecimals: nextAsset.decimals,
+          amountAtomic: quote.amountAtomic,
+          amountNano: quote.amountAtomic,
+          providerName: nextAsset.kind === "JETTON" ? "ton-jetton-direct" : "ton-direct",
+          version: { increment: 1 },
+        },
+      });
+      if (!changed.count) {
+        const latest = await findInvoiceWithOrder(tx, invoiceId);
+        if (latest?.checkoutAsset === asset) {
+          return latest;
+        }
+        throw new TonhubPaymentSelectionLockedError();
+      }
+      return findInvoiceWithOrder(tx, invoiceId);
+    }),
     markInvoiceExpired: async ({ invoiceId, expiredAt }) => db.$transaction(async (tx) => {
       const found = await findInvoiceWithOrder(tx, invoiceId);
       if (!found || !activeAttemptStatuses.includes(found.status as typeof activeAttemptStatuses[number])) {

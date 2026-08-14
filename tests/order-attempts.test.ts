@@ -2,6 +2,8 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import {
   TonhubOrderTermsMismatchError,
+  TonhubPaymentSelectionExpiredError,
+  TonhubPaymentSelectionLockedError,
   createPrismaTonhubPaymentRepository,
 } from "../backend/src/repository";
 import { createTonhubPaymentInvoice } from "../backend/src/payments";
@@ -33,6 +35,7 @@ function createMemoryPrisma() {
   let sequence = 0;
   let nextInvoiceCreateHook: ((data: Row) => never) | null = null;
   let nextInvoiceFindHook: ((row: Row | null) => Promise<Row | null>) | null = null;
+  let databaseNow = new Date("2026-08-13T10:00:30.000Z");
 
   const nextId = (prefix: string) => `${prefix}-${++sequence}`;
   const hydrateInvoice = (row: Row | undefined) => row
@@ -59,6 +62,12 @@ function createMemoryPrisma() {
 
   const db: any = {
     $transaction: async (handler: (tx: any) => Promise<unknown>) => handler(db),
+    $queryRawUnsafe: async (query: string) => {
+      if (!query.includes("clock_timestamp()")) {
+        throw new Error(`Unexpected raw query: ${query}`);
+      }
+      return [{ now: new Date(databaseNow) }];
+    },
     tonhubPaymentOrder: {
       findUnique: async ({ where }: Row) =>
         orders.find((row) => matchesWhere(row, where)) ?? null,
@@ -158,6 +167,9 @@ function createMemoryPrisma() {
     },
     onNextInvoiceFind(hook: (row: Row | null) => Promise<Row | null>) {
       nextInvoiceFindHook = hook;
+    },
+    setDatabaseNow(value: Date) {
+      databaseNow = value;
     },
   };
 }
@@ -331,6 +343,125 @@ test("checkout issuance writes order policy and both TON asset quotes in the inv
     }),
     /selected quote must exactly match/,
   );
+});
+
+test("an unfunded attempt switches to its stored alternate quote and locks after the first movement", async () => {
+  const memory = createMemoryPrisma();
+  const repository = createPrismaTonhubPaymentRepository(memory.db);
+  const expiresAt = new Date("2026-08-13T11:00:00.000Z");
+  const gramQuoteExpiresAt = new Date("2026-08-13T10:30:00.000Z");
+  const usdtQuoteExpiresAt = new Date("2026-08-13T10:45:00.000Z");
+  const usdtQuote = {
+    source: "usd-peg" as const,
+    rateSnapshotId: "selection-usdt-rate",
+    asset: "USDT" as const,
+    assetDecimals: 6,
+    fiatPerAsset: 1,
+    amountAtomic: "100000000",
+    amountFormatted: "100.00 USD₮",
+    fiatAmountCents: 10_000,
+    fiatAmount: 100,
+    fiatCurrency: "USD" as const,
+    grossFiatMicros: "100000000",
+    discountFiatMicros: "0",
+    netFiatMicros: "100000000",
+    quotedAt: createdAt,
+    expiresAt: usdtQuoteExpiresAt,
+    updatedAt: createdAt,
+    fetchedAt: createdAt,
+  };
+  const gramQuote = {
+    ...quote,
+    rateSnapshotId: "selection-gram-rate",
+    amountAtomic: "49500000000",
+    grossFiatMicros: "100000000",
+    discountFiatMicros: "1000000",
+    netFiatMicros: "99000000",
+    quotedAt: createdAt,
+    expiresAt: gramQuoteExpiresAt,
+  };
+  const created = await repository.createPendingInvoice({
+    ...pendingInput("merchant-switch-method"),
+    amountCents: 10_000,
+    network: "mainnet",
+    depositAddress: { ...depositAddress, network: "mainnet", walletNetworkGlobalId: -239 },
+    quote: usdtQuote,
+    quotes: [usdtQuote, gramQuote],
+    orderPolicy: {
+      minimumOrderFiatMicros: "10000000",
+      gramDiscountMaxFiatMicros: "1000000",
+      intermediateSweepTriggerBps: 9000,
+      intermediateSweepMinFiatMicros: "100000000",
+      maxAutomaticSweepsPerAsset: 2,
+    },
+    expiresAt,
+    priceLockedUntil: expiresAt,
+  });
+
+  const switched = await repository.selectInvoicePaymentAsset?.({
+    invoiceId: created.id,
+    asset: "GRAM",
+  });
+  assert.equal(switched?.checkoutAsset, "GRAM");
+  assert.equal(switched?.asset, "GRAM");
+  assert.equal(switched?.assetKind, "NATIVE");
+  assert.equal(switched?.assetDecimals, 9);
+  assert.equal(switched?.amountAtomic, gramQuote.amountAtomic);
+  assert.equal(switched?.address, created.address);
+  assert.equal(memory.invoices.length, 1);
+  assert.equal(memory.depositAddresses.length, 1);
+
+  memory.setDatabaseNow(gramQuoteExpiresAt);
+  await assert.rejects(
+    repository.selectInvoicePaymentAsset!({ invoiceId: created.id, asset: "GRAM" }),
+    TonhubPaymentSelectionExpiredError,
+  );
+  memory.setDatabaseNow(usdtQuoteExpiresAt);
+  await assert.rejects(
+    repository.selectInvoicePaymentAsset!({ invoiceId: created.id, asset: "USDT" }),
+    TonhubPaymentSelectionExpiredError,
+  );
+  assert.equal(memory.invoices[0]?.checkoutAsset, "GRAM");
+  memory.setDatabaseNow(new Date("2026-08-13T10:01:00.000Z"));
+
+  Object.assign(memory.invoices[0]!, {
+    paymentSelectionLockedAsset: "GRAM",
+    paymentSelectionLockedAt: new Date("2026-08-13T10:01:00.000Z"),
+    firstMovementAt: new Date("2026-08-13T10:01:00.000Z"),
+  });
+  await assert.rejects(
+    repository.selectInvoicePaymentAsset!({ invoiceId: created.id, asset: "USDT" }),
+    TonhubPaymentSelectionLockedError,
+  );
+  assert.equal(memory.invoices[0]?.checkoutAsset, "GRAM");
+});
+
+test("invoice reads expose only active credited assets for mixed-payment remainder pricing", async () => {
+  const memory = createMemoryPrisma();
+  const repository = createPrismaTonhubPaymentRepository(memory.db);
+  const created = await repository.createPendingInvoice(pendingInput("mixed-credit-assets"));
+  memory.orders[0].allocations = [
+    {
+      id: "credited-gram",
+      kind: "CREDIT",
+      reversesAllocationId: null,
+      movement: { asset: "GRAM" },
+    },
+    {
+      id: "reversed-gram",
+      kind: "REVERSAL",
+      reversesAllocationId: "credited-gram",
+      movement: { asset: "GRAM" },
+    },
+    {
+      id: "credited-usdt",
+      kind: "CREDIT",
+      reversesAllocationId: null,
+      movement: { asset: "USDT" },
+    },
+  ];
+
+  assert.deepEqual((await repository.findInvoiceById(created.id))?.creditedAssets, ["USDT"]);
 });
 
 test("a public USDT attempt persists the selected jetton identity without changing the fiat order", async () => {

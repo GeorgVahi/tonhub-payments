@@ -2,7 +2,8 @@ import { Hono } from "hono";
 import {
   checkTonhubPaymentInvoice,
   createTonhubPaymentInvoice,
-  getTonhubPaymentInvoice
+  getTonhubPaymentInvoice,
+  selectTonhubPaymentInvoicePaymentMethod
 } from "../payments";
 import { parseFiatCurrency, resolveAllowedNetworks, resolveDefaultNetwork } from "../config";
 import { fetchTonFiatRate } from "../rates";
@@ -94,6 +95,12 @@ export function createTonhubPaymentRoutes() {
 
   app.post("/api/tonhub-payments/invoices/:id/check", async (context) => {
     const response = await checkTonhubPaymentInvoice(context.req.param("id"));
+    return context.json(response.body, response.status);
+  });
+
+  app.post("/api/tonhub-payments/invoices/:id/payment-method", async (context) => {
+    const body = await context.req.json().catch(() => null);
+    const response = await selectTonhubPaymentInvoicePaymentMethod(context.req.param("id"), body);
     return context.json(response.body, response.status);
   });
 

@@ -293,6 +293,17 @@ immutable rate snapshots and use integer arithmetic. USD₮ returns a
 standard `ton://transfer` jetton link plus the unique owner address and manual
 amount fallback. The link pins the compiled official mainnet USDT master.
 
+Before the first valid on-chain movement, the widget can switch the concrete
+instruction with `POST /api/tonhub-payments/invoices/:id/payment-method`; the
+server atomically replaces it from the other immutable quote without changing
+the order, invoice, or unique deposit address. The first valid movement freezes
+that selection. After it is frozen, the widget may still open the other TON
+asset as an additional top-up instruction on the same address. Its amount is
+recalculated from the gross fiat remainder and stored rate, so a USD₮-selected
+or mixed payment never inherits the GRAM-only discount. The summary continues
+to show the remaining amount in the originally selected asset while the ledger
+combines actual GRAM and official USD₮ credits.
+
 The order minimum defaults to $10/€10 and the intermediate unswept-balance
 threshold defaults to $100/€100. Configure integer cents with
 `TON_MIN_ORDER_{USD,EUR}_CENTS`, `TON_GRAM_DISCOUNT_{USD,EUR}_CENTS`, and
@@ -562,7 +573,11 @@ export function PaymentBox() {
 
 The widget fetches `/api/tonhub-payments/config`, renders the testnet/mainnet
 switch from `TON_ALLOWED_NETWORKS`, creates invoices, shows the QR/deeplink, and
-polls the backend for confirmation.
+polls the backend for confirmation. Enabled mainnet checkout presents familiar
+USD₮ first and labels it explicitly as Tether issued on TON. GRAM remains an
+alternative with the conditional full-GRAM saving. Tonhub, Tonkeeper, Trust
+Wallet, Wallet in Telegram, TON Connect, QR, deeplink, and exact manual fields
+share the same server-authoritative instruction.
 
 ## Sweep Worker
 

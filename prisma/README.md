@@ -146,3 +146,13 @@ covering invoices created by an old process near the migration boundary.
   derives the mutable order summary from those rows and serializes it against
   USDT CREDIT allocations, so neither a direct writer nor a concurrent worker
   can leave an active GRAM-only discount on a mixed payment.
+- `20260814104000_checkout_payment_rails` hardens the pre-movement payment
+  method switch. Any change to the asset/kind/decimals/amount instruction must
+  match the immutable quote for that invoice, and the full instruction becomes
+  immutable as soon as payment-selection evidence is locked. The unique
+  address, raw address, reference, strategy, and wallet-derivation tuple are
+  immutable from issuance. Deployment first calls the reusable
+  `tonhub_assert_checkout_payment_rail_integrity()` audit and fails closed if a
+  pre-rollout quote-backed invoice has already drifted from its quote or linked
+  deposit. Direct SQL writers therefore cannot manufacture or redirect a
+  checkout rail.

@@ -3,11 +3,14 @@ import { PrismaClient } from "@prisma/client";
 import {
   TonhubOrderNotRetryableError,
   TonhubOrderTermsMismatchError,
+  TonhubPaymentSelectionLockedError,
   createPrismaTonhubPaymentRepository,
 } from "../backend/src/repository";
+import { createPrismaRateSnapshotRepository } from "../backend/src/rate-snapshots";
 
 const prisma = new PrismaClient();
 const repository = createPrismaTonhubPaymentRepository(prisma as any);
+const rateRepository = createPrismaRateSnapshotRepository(prisma as any);
 const createdAt = new Date("2026-08-13T10:00:00.000Z");
 const input = {
   externalId: "repository-rehearsal-order",
@@ -784,6 +787,241 @@ try {
   assert.equal(usdtAttempt.assetDecimals, 6);
   assert.equal(usdtAttempt.amountAtomic, "5000000");
   assert.equal(usdtAttempt.order?.fiatAmountMicros, "5000000");
+
+  const [railClock] = await prisma.$queryRawUnsafe<Array<{ now: Date }>>(
+    'SELECT clock_timestamp() AS "now"',
+  );
+  assert.ok(railClock?.now instanceof Date);
+  const railQuotedAt = new Date(railClock.now.getTime() - 1000);
+  const [railGramRate, railUsdtRate] = await rateRepository.recordMany([
+    {
+      asset: "GRAM",
+      baseCurrency: "GRAM",
+      quoteCurrency: "USD",
+      price: "2",
+      source: "coingecko",
+      observedAt: railQuotedAt,
+      fetchedAt: railQuotedAt,
+      payload: { provider: "repository-rail-rehearsal" },
+    },
+    {
+      asset: "USDT",
+      baseCurrency: "USDT",
+      quoteCurrency: "USD",
+      price: "1",
+      source: "usd-peg",
+      observedAt: railQuotedAt,
+      fetchedAt: railQuotedAt,
+      payload: { policy: "1 USDT = 1 USD" },
+    },
+  ]);
+  const railExpiresAt = new Date(railQuotedAt.getTime() + 60 * 60 * 1000);
+  const railUsdtQuote = {
+    source: "usd-peg" as const,
+    rateSnapshotId: railUsdtRate.id,
+    asset: "USDT" as const,
+    assetDecimals: 6,
+    fiatPerAsset: 1,
+    amountAtomic: "100000000",
+    amountFormatted: "100.00 USD₮",
+    fiatAmountCents: 10_000,
+    fiatAmount: 100,
+    fiatCurrency: "USD" as const,
+    grossFiatMicros: "100000000",
+    discountFiatMicros: "0",
+    netFiatMicros: "100000000",
+    quotedAt: railQuotedAt,
+    expiresAt: railExpiresAt,
+    updatedAt: railQuotedAt,
+    fetchedAt: railQuotedAt,
+  };
+  const railGramQuote = {
+    source: "coingecko" as const,
+    rateSnapshotId: railGramRate.id,
+    asset: "GRAM" as const,
+    assetDecimals: 9,
+    fiatPerAsset: 2,
+    amountAtomic: "49500000000",
+    amountFormatted: "49.50 GRAM (ex TON)",
+    fiatAmountCents: 10_000,
+    fiatAmount: 100,
+    fiatCurrency: "USD" as const,
+    fiatPerGram: 2,
+    fiatPerTon: 2,
+    amountNano: "49500000000",
+    amountGram: "49.50 GRAM (ex TON)",
+    amountTon: "49.50 GRAM (ex TON)",
+    grossFiatMicros: "100000000",
+    discountFiatMicros: "1000000",
+    netFiatMicros: "99000000",
+    quotedAt: railQuotedAt,
+    expiresAt: railExpiresAt,
+    updatedAt: railQuotedAt,
+    fetchedAt: railQuotedAt,
+  };
+  const railInvoice = await repository.createPendingInvoice({
+    ...input,
+    externalId: "repository-payment-rail-order",
+    amountCents: 10_000,
+    network: "mainnet",
+    reference: "REPOSITORY-PAYMENT-RAIL",
+    depositAddress: {
+      ...input.depositAddress,
+      network: "mainnet",
+      address: "EQ_REPOSITORY_PAYMENT_RAIL",
+      addressRaw: "0:repository-payment-rail",
+      walletContext: 960,
+      walletNetworkGlobalId: -239,
+    },
+    quote: railUsdtQuote,
+    quotes: [railUsdtQuote, railGramQuote],
+    orderPolicy: {
+      minimumOrderFiatMicros: "10000000",
+      gramDiscountMaxFiatMicros: "1000000",
+      intermediateSweepTriggerBps: 9000,
+      intermediateSweepMinFiatMicros: "100000000",
+      maxAutomaticSweepsPerAsset: 2,
+    },
+    createdAt: railQuotedAt,
+    expiresAt: railExpiresAt,
+    priceLockedAt: railQuotedAt,
+    priceLockedUntil: railExpiresAt,
+  });
+  const railSwitched = await repository.selectInvoicePaymentAsset!({
+    invoiceId: railInvoice.id,
+    asset: "GRAM",
+  });
+  assert.equal(railSwitched?.checkoutAsset, "GRAM");
+  assert.equal(railSwitched?.assetKind, "NATIVE");
+  assert.equal(railSwitched?.amountAtomic, "49500000000");
+  const railDeposit = await prisma.tonhubDepositAddress.findUniqueOrThrow({
+    where: { invoiceId: railInvoice.id },
+  });
+  await prisma.tonhubPaymentMovement.create({
+    data: {
+      fingerprint: "mainnet:repository-rail-rejected:incoming:0",
+      depositAddressId: railDeposit.id,
+      network: "mainnet",
+      direction: "INCOMING",
+      asset: "GRAM",
+      assetKind: "NATIVE",
+      assetDecimals: 9,
+      amountAtomic: "1",
+      toAddress: railInvoice.addressRaw,
+      transactionHash: "1".repeat(64),
+      blockchainAt: railQuotedAt,
+      status: "REJECTED",
+      validationCode: "REHEARSAL_REJECTED_EVIDENCE",
+    },
+  });
+  assert.equal(
+    (await repository.selectInvoicePaymentAsset!({ invoiceId: railInvoice.id, asset: "USDT" }))?.checkoutAsset,
+    "USDT",
+  );
+  assert.equal(
+    (await repository.selectInvoicePaymentAsset!({ invoiceId: railInvoice.id, asset: "GRAM" }))?.checkoutAsset,
+    "GRAM",
+  );
+  await assert.rejects(
+    prisma.$transaction(async (tx) => {
+      await tx.$executeRawUnsafe(
+        'ALTER TABLE "TonhubPaymentMovement" DISABLE TRIGGER "TonhubPaymentMovement_lock_payment_selection"',
+      );
+      await tx.tonhubPaymentMovement.create({
+        data: {
+          fingerprint: "mainnet:repository-rail-pre-evidence:incoming:0",
+          depositAddressId: railDeposit.id,
+          network: "mainnet",
+          direction: "INCOMING",
+          asset: "GRAM",
+          assetKind: "NATIVE",
+          assetDecimals: 9,
+          amountAtomic: "1",
+          toAddress: railInvoice.addressRaw,
+          transactionHash: "2".repeat(64),
+          blockchainAt: railQuotedAt,
+          status: "OBSERVED",
+        },
+      });
+      await tx.tonhubPaymentInvoice.update({
+        where: { id: railInvoice.id },
+        data: {
+          asset: "USDT",
+          checkoutAsset: "USDT",
+          assetKind: "JETTON",
+          assetDecimals: 6,
+          amountAtomic: railUsdtQuote.amountAtomic,
+          amountNano: railUsdtQuote.amountAtomic,
+          providerName: "ton-jetton-direct",
+        },
+      });
+    }),
+    /movement or settlement evidence/i,
+  );
+  await prisma.tonhubPaymentMovement.create({
+    data: {
+      fingerprint: "mainnet:repository-rail-observed:incoming:0",
+      depositAddressId: railDeposit.id,
+      network: "mainnet",
+      direction: "INCOMING",
+      asset: "GRAM",
+      assetKind: "NATIVE",
+      assetDecimals: 9,
+      amountAtomic: "1",
+      toAddress: railInvoice.addressRaw,
+      transactionHash: "3".repeat(64),
+      blockchainAt: railQuotedAt,
+      status: "OBSERVED",
+    },
+  });
+  const movementLockedRail = await prisma.tonhubPaymentInvoice.findUniqueOrThrow({
+    where: { id: railInvoice.id },
+  });
+  assert.equal(movementLockedRail.paymentSelectionLockedAsset, "GRAM");
+  assert.equal(movementLockedRail.paymentSelectionLockedAt?.toISOString(), railQuotedAt.toISOString());
+  await assert.rejects(
+    repository.selectInvoicePaymentAsset!({ invoiceId: railInvoice.id, asset: "USDT" }),
+    TonhubPaymentSelectionLockedError,
+  );
+  await assert.rejects(
+    prisma.tonhubPaymentInvoice.update({
+      where: { id: railInvoice.id },
+      data: { checkoutAsset: "USDT" },
+    }),
+    /immutable selected quote|payment instruction/i,
+  );
+  await assert.rejects(
+    prisma.tonhubPaymentInvoice.update({
+      where: { id: railInvoice.id },
+      data: { address: "EQ_FORGED_PAYMENT_DESTINATION" },
+    }),
+    /deposit ownership|wallet derivation/i,
+  );
+  assert.equal(
+    (await prisma.tonhubPaymentInvoice.findUniqueOrThrow({ where: { id: railInvoice.id } })).address,
+    railInvoice.address,
+  );
+  await assert.rejects(
+    prisma.$transaction(async (tx) => {
+      await tx.$executeRawUnsafe(
+        'ALTER TABLE "TonhubPaymentInvoice" DISABLE TRIGGER "TonhubPaymentInvoice_guard_payment_selection"',
+      );
+      await tx.tonhubPaymentInvoice.update({
+        where: { id: railInvoice.id },
+        data: { address: "EQ_PRE_ROLLOUT_DRIFT" },
+      });
+      await tx.$queryRawUnsafe('SELECT "tonhub_assert_checkout_payment_rail_integrity"()');
+    }),
+    /payment rail integrity/i,
+  );
+  assert.equal(
+    (await prisma.tonhubPaymentInvoice.findUniqueOrThrow({ where: { id: railInvoice.id } })).address,
+    railInvoice.address,
+  );
+  await assert.rejects(
+    repository.selectInvoicePaymentAsset!({ invoiceId: railInvoice.id, asset: "USDT" }),
+    TonhubPaymentSelectionLockedError,
+  );
 
   process.stdout.write("Order/attempt repository rehearsal passed.\n");
 } finally {

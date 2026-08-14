@@ -1,7 +1,10 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { Address } from "@ton/core";
-import { getTonhubPaymentInvoice } from "../backend/src/payments";
+import {
+  getTonhubPaymentInvoice,
+  selectTonhubPaymentInvoicePaymentMethod,
+} from "../backend/src/payments";
 import type { TonhubPaymentRepository } from "../backend/src/repository";
 import type { TonhubPaymentInvoiceRecord } from "../backend/src/types";
 import { createTonhubPaymentRoutes } from "../backend/src/routes/payments";
@@ -30,6 +33,9 @@ import { renderToStaticMarkup } from "react-dom/server";
 import {
   checkoutAssetForNetwork,
   fiatPaymentProgress,
+  formatFiatPolicyMicros,
+  immutablePaymentOptionSaving,
+  paymentRailAction,
   PaymentStatusAnnouncement,
   TonhubPaymentWidget,
 } from "../frontend/src/TonhubPaymentWidget";
@@ -240,6 +246,18 @@ test("the widget waits for server policy and applies USDT as the mainnet default
     paid: "2.75 USD",
     remaining: "2.25 USD",
   });
+  assert.equal(formatFiatPolicyMicros("1000000", "USD"), "$1");
+  assert.equal(formatFiatPolicyMicros("1000000", "EUR"), "€1");
+  assert.equal(paymentRailAction({
+    invoiceAsset: "USDT",
+    requestedAsset: "GRAM",
+    selectionLocked: false,
+  }), "switch");
+  assert.equal(paymentRailAction({
+    invoiceAsset: "USDT",
+    requestedAsset: "GRAM",
+    selectionLocked: true,
+  }), "top-up");
 
   const initialMarkup = renderToStaticMarkup(createElement(TonhubPaymentWidget, {
     initialNetwork: "mainnet",
@@ -254,6 +272,14 @@ test("the widget waits for server policy and applies USDT as the mainnet default
   assert.match(statusMarkup, /role="status"/);
   assert.match(statusMarkup, /aria-live="polite"/);
   assert.match(statusMarkup, /aria-atomic="true"/);
+});
+
+test("an issued invoice displays its immutable GRAM saving after checkout env policy drifts", () => {
+  assert.equal(formatFiatPolicyMicros("2000000", "USD"), "$2");
+  assert.equal(immutablePaymentOptionSaving([
+    { asset: "USDT", discountFiatFormatted: "$0" },
+    { asset: "GRAM", discountFiatFormatted: "$1" },
+  ], "GRAM"), "$1");
 });
 
 test("official USDT deeplink carries the unique deposit owner, master, and micro-USDT amount", () => {
@@ -653,6 +679,10 @@ test("invoice responses use neutral atomic fields for a six-decimal jetton", asy
       discountFiatMicros: option.discountFiatMicros,
       amountAtomic: option.amountAtomic,
       fiatPerAsset: option.fiatPerAsset,
+      selected: option.selected,
+      selectionLocked: option.selectionLocked,
+      payableAmountAtomic: option.payableAmountAtomic,
+      payableAmountFormatted: option.payableAmountFormatted,
     })),
     [
       {
@@ -661,6 +691,10 @@ test("invoice responses use neutral atomic fields for a six-decimal jetton", asy
         discountFiatMicros: "0",
         amountAtomic: "5000000",
         fiatPerAsset: 1,
+        selected: true,
+        selectionLocked: true,
+        payableAmountAtomic: "4000000",
+        payableAmountFormatted: "4.00 USD₮",
       },
       {
         asset: "GRAM",
@@ -668,8 +702,56 @@ test("invoice responses use neutral atomic fields for a six-decimal jetton", asy
         discountFiatMicros: "1000000",
         amountAtomic: "2000000000",
         fiatPerAsset: 2,
+        selected: false,
+        selectionLocked: true,
+        payableAmountAtomic: "2000000000",
+        payableAmountFormatted: "2.00 GRAM (ex TON)",
       },
     ],
+  );
+  assert.equal(serialized.paymentSelectionLocked, true);
+
+  const mixedTopUpRepository: TonhubPaymentRepository = {
+    ...repository,
+    findInvoiceById: async () => ({
+      ...invoice,
+      creditedFiatMicros: "2000000",
+      remainingFiatMicros: "3000000",
+      paidNano: "2000000",
+      paidAmountAtomic: "2000000",
+    }),
+  };
+  const mixedTopUpResponse = await getTonhubPaymentInvoice(invoice.id, {
+    repository: mixedTopUpRepository,
+  });
+  const mixedTopUpOptions = (mixedTopUpResponse.body.invoice as {
+    paymentOptions: Array<{ asset: string; payableAmountAtomic: string }>;
+  }).paymentOptions;
+  assert.equal(
+    mixedTopUpOptions.find((option) => option.asset === "GRAM")?.payableAmountAtomic,
+    "1500000000",
+  );
+
+  const gramSelectedMixedResponse = await getTonhubPaymentInvoice(invoice.id, {
+    repository: {
+      ...repository,
+      findInvoiceById: async () => ({
+        ...invoice,
+        asset: "GRAM",
+        checkoutAsset: "GRAM",
+        assetKind: "NATIVE",
+        assetDecimals: 9,
+        amountNano: "2000000000",
+        amountAtomic: "2000000000",
+        paidNano: "0",
+        paidAmountAtomic: "0",
+        creditedAssets: ["USDT"],
+      }),
+    },
+  });
+  assert.equal(
+    (gramSelectedMixedResponse.body.invoice as { remainingAmountAtomic: string }).remainingAmountAtomic,
+    "2000000000",
   );
 
   const internalTestnetRepository: TonhubPaymentRepository = {
@@ -694,6 +776,41 @@ test("invoice responses use neutral atomic fields for a six-decimal jetton", asy
     (nonUniqueResponse.body.invoice as { deeplink: string | null }).deeplink,
     null,
   );
+
+  let selectedAsset: string | null = null;
+  const selectionRepository: TonhubPaymentRepository = {
+    ...repository,
+    selectInvoicePaymentAsset: async ({ asset }) => {
+      selectedAsset = asset;
+      return {
+        ...invoice,
+        asset,
+        checkoutAsset: asset,
+        assetKind: asset === "GRAM" ? "NATIVE" : "JETTON",
+        assetDecimals: asset === "GRAM" ? 9 : 6,
+        amountNano: asset === "GRAM" ? "2000000000" : "5000000",
+        amountAtomic: asset === "GRAM" ? "2000000000" : "5000000",
+        paidNano: "0",
+        paidAmountAtomic: "0",
+        creditedFiatMicros: "0",
+        remainingFiatMicros: "5000000",
+        status: "PENDING",
+        observedAt: null,
+        firstMovementAt: null,
+        paymentSelectionLockedAsset: null,
+        paymentSelectionLockedAt: null,
+      };
+    },
+  };
+  const selectionResponse = await selectTonhubPaymentInvoicePaymentMethod(
+    invoice.id,
+    { asset: "gram" },
+    { repository: selectionRepository },
+  );
+  assert.equal(selectionResponse.status, 200);
+  assert.equal(selectedAsset, "GRAM");
+  assert.equal((selectionResponse.body.invoice as { asset: string }).asset, "GRAM");
+  assert.equal((selectionResponse.body.invoice as { paymentSelectionLocked: boolean }).paymentSelectionLocked, false);
 
   for (const [patch, message] of [
     [{ assetDecimals: 9 }, /Stored USDT decimals 9 do not match registry decimals 6/],
