@@ -4,7 +4,9 @@ The migration history starts with `20260813100000_baseline`, which is an exact
 snapshot of the original GRAM-only schema. Later migrations are additive: the
 foundation keeps every legacy table and column, while the order-attempt
 migration links existing invoices to fiat-denominated orders and fills neutral
-amount fields.
+amount fields. The TON checkout policy migration adds immutable GRAM and USDT
+quote evidence plus append-only payment-method adjustments without renaming or
+removing any legacy field.
 
 ## Empty database
 
@@ -113,3 +115,20 @@ covering invoices created by an old process near the migration boundary.
   order at the database boundary, and recovery cases are idempotent per
   movement/reason. Deposit addresses carry a dedicated settlement retry time so
   worker backoff and queue fairness do not reuse scanner or sweep timestamps.
+- New TON orders snapshot their minimum-order, GRAM-discount, intermediate-sweep,
+  and automatic-sweep-count policies. Those terms and the gross fiat obligation
+  are immutable; legacy orders retain zero-valued compatibility defaults.
+- An invoice can hold one immutable quote for each machine asset code (`USDT`
+  and `GRAM`). PostgreSQL validates invoice/order/rate ownership, exact atomic
+  rounding, the mainnet-only zero-discount USDT policy, and the capped GRAM
+  offer. Quote rows retain their own restricted order and network identity;
+  their invoice ownership, currency, chronology, and deadline basis cannot be
+  rewritten after insertion. Once the first movement locks a selected asset,
+  that selection cannot be rewritten.
+- A GRAM payment-method discount is a separate append-only adjustment. It can
+  fill only the exact all-GRAM shortfall, must reference the locked GRAM quote,
+  and never mutates the order's original gross amount. Corrections use one
+  exact append-only reversal rather than editing financial history. PostgreSQL
+  derives the mutable order summary from those rows and serializes it against
+  USDT CREDIT allocations, so neither a direct writer nor a concurrent worker
+  can leave an active GRAM-only discount on a mixed payment.

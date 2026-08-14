@@ -46,6 +46,11 @@ enum TonhubMovementAllocationKind {
   REVERSAL
 }
 
+enum TonhubOrderAdjustmentKind {
+  PAYMENT_METHOD_DISCOUNT
+  REVERSAL
+}
+
 enum TonhubAssetSweepStatus {
   QUEUED
   GAS_CHECK
@@ -78,24 +83,32 @@ enum TonhubWebhookAttemptStatus {
 }
 
 model TonhubPaymentOrder {
-  id                    String                     @id @default(cuid())
-  externalId            String?                    @unique
-  fiatAmountMicros      String
-  fiatCurrency          String
-  creditedFiatMicros    String                     @default("0")
-  overpaymentFiatMicros String                     @default("0")
-  status                TonhubPaymentOrderStatus   @default(PENDING)
-  paidAt                DateTime?
-  expiresAt             DateTime?
-  cancelledAt           DateTime?
-  createdAt             DateTime                   @default(now())
-  updatedAt             DateTime                   @updatedAt
-  metadata              Json?
-  invoices              TonhubPaymentInvoice[]
-  allocations           TonhubMovementAllocation[]
-  sweeps                TonhubAssetSweep[]
-  recoveryCases         TonhubRecoveryCase[]
-  registeredRefunds     TonhubRegisteredRefund[]
+  id                             String                     @id @default(cuid())
+  externalId                     String?                    @unique
+  fiatAmountMicros               String
+  fiatCurrency                   String
+  creditedFiatMicros             String                     @default("0")
+  discountFiatMicros             String                     @default("0")
+  overpaymentFiatMicros          String                     @default("0")
+  minimumOrderFiatMicros         String                     @default("0")
+  gramDiscountMaxFiatMicros      String                     @default("0")
+  intermediateSweepTriggerBps    Int                        @default(0)
+  intermediateSweepMinFiatMicros String                     @default("0")
+  maxAutomaticSweepsPerAsset     Int                        @default(0)
+  status                         TonhubPaymentOrderStatus   @default(PENDING)
+  paidAt                         DateTime?
+  expiresAt                      DateTime?
+  cancelledAt                    DateTime?
+  createdAt                      DateTime                   @default(now())
+  updatedAt                      DateTime                   @updatedAt
+  metadata                       Json?
+  invoices                       TonhubPaymentInvoice[]
+  quotes                         TonhubPaymentQuote[]
+  allocations                    TonhubMovementAllocation[]
+  adjustments                    TonhubOrderAdjustment[]
+  sweeps                         TonhubAssetSweep[]
+  recoveryCases                  TonhubRecoveryCase[]
+  registeredRefunds              TonhubRegisteredRefund[]
 
   @@index([status, createdAt])
   @@index([status, expiresAt])
@@ -143,6 +156,8 @@ model TonhubPaymentInvoice {
   scanPriorityAt                DateTime?
   lastScannedAt                 DateTime?
   settlementReason              String?
+  paymentSelectionLockedAsset   String?
+  paymentSelectionLockedAt      DateTime?
   version                       Int                        @default(0)
   observedPayments              Json?
   createdAt                     DateTime                   @default(now())
@@ -153,6 +168,8 @@ model TonhubPaymentInvoice {
   depositAddress                TonhubDepositAddress?
   transactions                  TonhubPaymentTransaction[]
   allocations                   TonhubMovementAllocation[]
+  quotes                        TonhubPaymentQuote[]
+  adjustments                   TonhubOrderAdjustment[]
   sweeps                        TonhubAssetSweep[]
   recoveryCases                 TonhubRecoveryCase[]
   registeredRefunds             TonhubRegisteredRefund[]
@@ -243,9 +260,38 @@ model TonhubRateSnapshot {
   createdAt     DateTime                @default(now())
   payload       Json?
   movements     TonhubPaymentMovement[]
+  quotes        TonhubPaymentQuote[]
 
   @@unique([asset, baseCurrency, quoteCurrency, source, observedAt])
   @@index([asset, quoteCurrency, observedAt])
+}
+
+model TonhubPaymentQuote {
+  id                 String                  @id @default(cuid())
+  orderId            String
+  invoiceId          String
+  network            String
+  asset              String
+  assetKind          String
+  assetDecimals      Int
+  fiatCurrency       String
+  grossFiatMicros    String
+  discountFiatMicros String                  @default("0")
+  netFiatMicros      String
+  amountAtomic       String
+  rateSnapshotId     String
+  quotedAt           DateTime
+  expiresAt          DateTime
+  createdAt          DateTime                @default(now())
+  order              TonhubPaymentOrder      @relation(fields: [orderId], references: [id], onDelete: Restrict)
+  invoice            TonhubPaymentInvoice    @relation(fields: [invoiceId], references: [id], onDelete: Restrict)
+  rateSnapshot       TonhubRateSnapshot      @relation(fields: [rateSnapshotId], references: [id], onDelete: Restrict)
+  adjustments        TonhubOrderAdjustment[]
+
+  @@unique([invoiceId, asset])
+  @@index([orderId])
+  @@index([rateSnapshotId])
+  @@index([expiresAt])
 }
 
 model TonhubPaymentMovement {
@@ -306,6 +352,29 @@ model TonhubMovementAllocation {
   @@index([movementId, kind])
   @@index([orderId, allocatedAt])
   @@index([invoiceId, allocatedAt])
+}
+
+model TonhubOrderAdjustment {
+  id                   String                    @id @default(cuid())
+  idempotencyKey       String                    @unique
+  orderId              String
+  invoiceId            String
+  quoteId              String
+  kind                 TonhubOrderAdjustmentKind @default(PAYMENT_METHOD_DISCOUNT)
+  reversesAdjustmentId String?                   @unique
+  fiatAmountMicros     String
+  fiatCurrency         String
+  reason               String
+  evidence             Json?
+  createdAt            DateTime                  @default(now())
+  order                TonhubPaymentOrder        @relation(fields: [orderId], references: [id], onDelete: Restrict)
+  invoice              TonhubPaymentInvoice      @relation(fields: [invoiceId], references: [id], onDelete: Restrict)
+  quote                TonhubPaymentQuote        @relation(fields: [quoteId], references: [id], onDelete: Restrict)
+  reversesAdjustment   TonhubOrderAdjustment?    @relation("TonhubAdjustmentReversal", fields: [reversesAdjustmentId], references: [id], onDelete: Restrict)
+  reversedByAdjustment TonhubOrderAdjustment?    @relation("TonhubAdjustmentReversal")
+
+  @@index([orderId, createdAt])
+  @@index([invoiceId, createdAt])
 }
 
 model TonhubScanCursor {

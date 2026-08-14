@@ -275,6 +275,13 @@ try {
       TONHUB_CANARY_VERIFY_SUFFIX: "clean",
     },
   });
+  run(process.execPath, [tsxCli, "scripts/verify-ton-checkout-policy-foundation.ts"], {
+    env: {
+      ...process.env,
+      DATABASE_URL: databaseUrl("clean_migration"),
+      TONHUB_CHECKOUT_POLICY_VERIFY_SUFFIX: "clean",
+    },
+  });
   prisma(
     databaseUrl("clean_migration"),
     "migrate",
@@ -404,6 +411,13 @@ try {
       ...process.env,
       DATABASE_URL: databaseUrl("legacy_migration"),
       TONHUB_CANARY_VERIFY_SUFFIX: "legacy",
+    },
+  });
+  run(process.execPath, [tsxCli, "scripts/verify-ton-checkout-policy-foundation.ts"], {
+    env: {
+      ...process.env,
+      DATABASE_URL: databaseUrl("legacy_migration"),
+      TONHUB_CHECKOUT_POLICY_VERIFY_SUFFIX: "legacy",
     },
   });
 

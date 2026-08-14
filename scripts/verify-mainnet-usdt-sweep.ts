@@ -137,7 +137,7 @@ async function main() {
       ? gasSeqno
       : depositSeqno,
     sendGasTopup: async ({ amountNano, seqno }) => {
-      assert.equal(amountNano, seqno === 12 ? 110_000_000n : 10_000_000n);
+      assert.equal(amountNano, seqno === 12 ? 111_000_000n : 11_000_000n);
       assert.ok(seqno === 12 || seqno === 13);
       gasSeqno += 1;
       depositTon += amountNano;
@@ -199,8 +199,8 @@ async function main() {
   const confirmed = await prisma.tonhubAssetSweep.findUniqueOrThrow({ where: { id: sweep.id } });
   assert.equal(confirmed.status, "CONFIRMED");
   assert.equal(confirmed.amountAtomic, "5000000");
-  assert.equal(confirmed.gasTopupAmountNano, "110000000");
-  assert.equal(confirmed.reserveTopupAmountNano, "10000000");
+  assert.equal(confirmed.gasTopupAmountNano, "111000000");
+  assert.equal(confirmed.reserveTopupAmountNano, "11000000");
   assert.equal(confirmed.reserveTopupSeqno, 13);
   assert.equal(confirmed.gasServicePlanKey, null);
   assert.equal(confirmed.transactionHash, "92".repeat(32));

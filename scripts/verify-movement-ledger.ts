@@ -632,7 +632,7 @@ try {
       if (url.pathname.endsWith("/transactions")) {
         return new Response(JSON.stringify({ transactions: [] }), { status: 200 });
       }
-      if (!url.searchParams.has("jetton_wallet")) {
+      if (!url.searchParams.has("jetton_master")) {
         return new Response(JSON.stringify({ jetton_transfers: [] }), { status: 200 });
       }
       return new Response(JSON.stringify({
