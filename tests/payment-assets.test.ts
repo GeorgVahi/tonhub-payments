@@ -16,6 +16,7 @@ import {
   paymentUnitAtomic,
 } from "../shared/payment-assets";
 import { isCheckoutAssetAvailable, resolveCheckoutAssetPolicy } from "../backend/src/checkout-assets";
+import { resolveCheckoutOrderPolicy } from "../backend/src/checkout-order-policy";
 import { buildTonJettonTransferLink } from "../backend/src/ton/direct-payments";
 import { officialMainnetUsdtMasterFriendlyAddress } from "../backend/src/ton/mainnet-usdt";
 import { createTonQrSvg } from "../frontend/src/createTonQrSvg";
@@ -60,6 +61,7 @@ test("the asset registry and default-off public policy keep testnet GRAM-only", 
   );
   assert.equal(parsePaymentAsset("ton"), paymentAssets.GRAM);
   assert.equal(parsePaymentAsset(" usdt "), paymentAssets.USDT);
+  assert.equal(paymentAssets.USDT.label, "USD₮");
   assert.throws(() => parsePaymentAsset("USD"), /Unsupported payment asset/);
   assert.ok(Object.isFrozen(paymentAssets));
   assert.ok(Object.isFrozen(paymentAssets.GRAM));
@@ -69,13 +71,16 @@ test("the asset registry and default-off public policy keep testnet GRAM-only", 
     config: {
       defaultAsset: string;
       checkoutAssets: string[];
-      assets: Array<{ symbol: string }>;
+      assets: Array<{ symbol: string; label: string }>;
+      orderPolicyByCurrency: Record<string, { minimumOrderFiatMicros: string }>;
     };
   };
   assert.equal(response.status, 200);
   assert.equal(body.config.defaultAsset, "GRAM");
   assert.deepEqual(body.config.checkoutAssets, ["GRAM"]);
   assert.deepEqual(body.config.assets.map((asset) => asset.symbol), ["GRAM", "USDT"]);
+  assert.equal(body.config.assets.find((asset) => asset.symbol === "USDT")?.label, "USD₮");
+  assert.equal(body.config.orderPolicyByCurrency.USD?.minimumOrderFiatMicros, "10000000");
 });
 
 test("public USDT policy requires all independent mainnet settlement flags", () => {
@@ -110,6 +115,50 @@ test("public USDT policy requires all independent mainnet settlement flags", () 
     TON_MOVEMENT_SETTLEMENT_ENABLED: "true",
     TON_GRAM_SETTLEMENT_MODE: "legacy",
   }).usdtMainnetEnabled, false);
+  assert.equal(resolveCheckoutAssetPolicy({
+    TON_USDT_MAINNET_CHECKOUT_ENABLED: "true",
+    TON_USDT_MAINNET_ADAPTER_ENABLED: "true",
+    TON_MOVEMENT_SETTLEMENT_ENABLED: "true",
+    TON_GRAM_SETTLEMENT_MODE: "compare",
+  }).usdtMainnetEnabled, false);
+});
+
+test("fiat checkout policy snapshots strict env minimum, GRAM saving, and bounded sweep policy", () => {
+  assert.deepEqual(resolveCheckoutOrderPolicy("USD", {}), {
+    minimumOrderFiatMicros: "10000000",
+    gramDiscountMaxFiatMicros: "1000000",
+    intermediateSweepTriggerBps: 9000,
+    intermediateSweepMinFiatMicros: "100000000",
+    maxAutomaticSweepsPerAsset: 2,
+  });
+  assert.deepEqual(resolveCheckoutOrderPolicy("EUR", {
+    TON_MIN_ORDER_EUR_CENTS: "2500",
+    TON_GRAM_DISCOUNT_EUR_CENTS: "150",
+    TON_INTERMEDIATE_SWEEP_MIN_EUR_CENTS: "12500",
+    TON_INTERMEDIATE_SWEEP_TRIGGER_BPS: "9500",
+    TON_MAX_AUTOMATIC_SWEEPS_PER_ASSET: "1",
+  }), {
+    minimumOrderFiatMicros: "25000000",
+    gramDiscountMaxFiatMicros: "1500000",
+    intermediateSweepTriggerBps: 9500,
+    intermediateSweepMinFiatMicros: "125000000",
+    maxAutomaticSweepsPerAsset: 1,
+  });
+  assert.throws(
+    () => resolveCheckoutOrderPolicy("USD", { TON_MIN_ORDER_USD_CENTS: "1000oops" }),
+    /must be an integer/,
+  );
+  assert.throws(
+    () => resolveCheckoutOrderPolicy("USD", {
+      TON_MIN_ORDER_USD_CENTS: "100",
+      TON_GRAM_DISCOUNT_USD_CENTS: "100",
+    }),
+    /must be less/,
+  );
+  assert.throws(
+    () => resolveCheckoutOrderPolicy("USD", { TON_MAX_AUTOMATIC_SWEEPS_PER_ASSET: "3" }),
+    /between 1 and 2/,
+  );
 });
 
 test("mainnet USDT canary is exact-order allowlisted without public checkout exposure", () => {
@@ -359,11 +408,11 @@ test("atomic conversion is exact for native GRAM and six-decimal USDT", () => {
   assert.equal(parseAssetAmountToAtomic("5", "USDT"), "5000000");
   assert.equal(parseAssetAmountToAtomic("0.000001", "USDT"), "1");
   assert.equal(formatAssetAmount("1234567890", "GRAM"), "1.23456789 GRAM (ex TON)");
-  assert.equal(formatAssetAmount("5000001", "USDT"), "5.000001 USDT");
-  assert.equal(formatAssetAmount("0", "USDT"), "0 USDT");
+  assert.equal(formatAssetAmount("5000001", "USDT"), "5.000001 USD₮");
+  assert.equal(formatAssetAmount("0", "USDT"), "0 USD₮");
   assert.equal(
     formatAssetAmount("1234567890123456789012345", "USDT"),
-    "1234567890123456789.012345 USDT",
+    "1234567890123456789.012345 USD₮",
   );
 });
 
@@ -372,7 +421,7 @@ test("checkout rounding is asset-specific and never uses floating point", () => 
   assert.equal(paymentUnitAtomic("USDT"), BigInt("10000"));
   assert.equal(ceilAtomicToPaymentUnit("10000001", "GRAM"), "20000000");
   assert.equal(ceilAtomicToPaymentUnit("5000001", "USDT"), "5010000");
-  assert.equal(formatCheckoutAssetAmount("5000001", "USDT"), "5.01 USDT");
+  assert.equal(formatCheckoutAssetAmount("5000001", "USDT"), "5.01 USD₮");
   assert.equal(formatCheckoutAssetAmount("0", "GRAM"), "0.00 GRAM (ex TON)");
 });
 
@@ -439,14 +488,64 @@ test("invoice responses use neutral atomic fields for a six-decimal jetton", asy
     createdAt,
     updatedAt: createdAt,
     metadata: null,
+    quotes: [
+      {
+        id: "usdt-contract-quote",
+        orderId: "usdt-contract-order-id",
+        invoiceId: "usdt-contract-invoice",
+        network: "mainnet",
+        asset: "USDT",
+        assetKind: "JETTON",
+        assetDecimals: 6,
+        fiatCurrency: "USD",
+        grossFiatMicros: "5000000",
+        discountFiatMicros: "0",
+        netFiatMicros: "5000000",
+        amountAtomic: "5000000",
+        rateSnapshotId: "usdt-contract-rate",
+        quotedAt: createdAt,
+        expiresAt: new Date("2026-08-13T11:00:00.000Z"),
+        createdAt,
+        rateSnapshot: {
+          price: "1",
+          source: "usd-peg",
+          observedAt: createdAt,
+          fetchedAt: createdAt,
+        },
+      },
+      {
+        id: "gram-contract-quote",
+        orderId: "usdt-contract-order-id",
+        invoiceId: "usdt-contract-invoice",
+        network: "mainnet",
+        asset: "GRAM",
+        assetKind: "NATIVE",
+        assetDecimals: 9,
+        fiatCurrency: "USD",
+        grossFiatMicros: "5000000",
+        discountFiatMicros: "1000000",
+        netFiatMicros: "4000000",
+        amountAtomic: "2000000000",
+        rateSnapshotId: "gram-contract-rate",
+        quotedAt: createdAt,
+        expiresAt: new Date("2026-08-13T11:00:00.000Z"),
+        createdAt,
+        rateSnapshot: {
+          price: "2",
+          source: "coingecko",
+          observedAt: createdAt,
+          fetchedAt: createdAt,
+        },
+      },
+    ],
     payload: {
       quote: {
-        source: "usd-peg",
+        source: "coingecko",
         asset: "USDT",
         assetDecimals: 6,
-        fiatPerAsset: 1,
-        amountAtomic: "5000000",
-        amountFormatted: "5.00 USDT",
+        fiatPerAsset: 999,
+        amountAtomic: "999000000",
+        amountFormatted: "999 USD₮",
         fiatAmountCents: 500,
         fiatAmount: 5,
         fiatCurrency: "USD",
@@ -489,14 +588,14 @@ test("invoice responses use neutral atomic fields for a six-decimal jetton", asy
       assetKind: "JETTON",
       assetDecimals: 6,
       amountAtomic: "4000000",
-      amountFormatted: "4.00 USDT",
+      amountFormatted: "4.00 USD₮",
       expectedAmountAtomic: "5000000",
-      expectedAmountFormatted: "5.00 USDT",
+      expectedAmountFormatted: "5.00 USD₮",
       paidAmountAtomic: "1000000",
-      paidAmountFormatted: "1 USDT",
+      paidAmountFormatted: "1 USD₮",
       creditedFiatFormatted: "1.00 USD",
       remainingAmountAtomic: "4000000",
-      remainingAmountFormatted: "4.00 USDT",
+      remainingAmountFormatted: "4.00 USD₮",
       remainingFiatFormatted: "4.00 USD",
       deeplink: `ton://transfer/EQ_USDT_CONTRACT?jetton=${officialMainnetUsdtMasterFriendlyAddress}&amount=4000000`,
     },
@@ -509,8 +608,9 @@ test("invoice responses use neutral atomic fields for a six-decimal jetton", asy
   assert.equal(serialized.remainingNano, null);
   assert.deepEqual(serialized.quote, {
     source: "usd-peg",
-    rateSnapshotId: null,
+    rateSnapshotId: "usdt-contract-rate",
     asset: "USDT",
+    label: "USD₮",
     assetDecimals: 6,
     fiatAmountCents: 500,
     fiatAmount: 5,
@@ -519,7 +619,12 @@ test("invoice responses use neutral atomic fields for a six-decimal jetton", asy
     fiatPerTon: null,
     fiatPerAsset: 1,
     amountAtomic: "5000000",
-    amountFormatted: "5.00 USDT",
+    amountFormatted: "5.00 USD₮",
+    grossFiatMicros: "5000000",
+    discountFiatMicros: "0",
+    netFiatMicros: "5000000",
+    quotedAt: createdAt.toISOString(),
+    expiresAt: new Date("2026-08-13T11:00:00.000Z").toISOString(),
     amountNano: null,
     amountGram: null,
     amountTon: null,
@@ -531,11 +636,36 @@ test("invoice responses use neutral atomic fields for a six-decimal jetton", asy
     asset: "USDT",
     assetDecimals: 6,
     amountAtomic: "1000000",
-    amountFormatted: "1 USDT",
+    amountFormatted: "1 USD₮",
     createdAt: createdAt.toISOString(),
     status: "observed",
     comment: "",
   }]);
+  assert.deepEqual(
+    (serialized.paymentOptions as Array<Record<string, unknown>>).map((option) => ({
+      asset: option.asset,
+      label: option.label,
+      discountFiatMicros: option.discountFiatMicros,
+      amountAtomic: option.amountAtomic,
+      fiatPerAsset: option.fiatPerAsset,
+    })),
+    [
+      {
+        asset: "USDT",
+        label: "USD₮",
+        discountFiatMicros: "0",
+        amountAtomic: "5000000",
+        fiatPerAsset: 1,
+      },
+      {
+        asset: "GRAM",
+        label: "GRAM (ex TON)",
+        discountFiatMicros: "1000000",
+        amountAtomic: "2000000000",
+        fiatPerAsset: 2,
+      },
+    ],
+  );
 
   const internalTestnetRepository: TonhubPaymentRepository = {
     ...repository,

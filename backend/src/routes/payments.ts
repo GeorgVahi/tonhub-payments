@@ -9,6 +9,7 @@ import { fetchTonFiatRate } from "../rates";
 import { gramAsset } from "../ton/direct-payments";
 import { listPaymentAssets, paymentAssets } from "../../../shared/payment-assets";
 import { resolveCheckoutAssetPolicy } from "../checkout-assets";
+import { resolveCheckoutOrderPolicy } from "../checkout-order-policy";
 
 export function createTonhubPaymentRoutes() {
   const app = new Hono();
@@ -41,6 +42,10 @@ export function createTonhubPaymentRoutes() {
           checkoutFractionDigits: asset.checkoutFractionDigits,
           pricingStrategy: asset.pricingStrategy
         })),
+        orderPolicyByCurrency: {
+          USD: resolveCheckoutOrderPolicy("USD"),
+          EUR: resolveCheckoutOrderPolicy("EUR"),
+        },
         invoiceTtlMinutes: Number.parseInt(process.env.TON_INVOICE_TTL_MINUTES || "60", 10),
         partialPaymentTtlHours: Number.parseInt(process.env.TON_PARTIAL_PAYMENT_TTL_HOURS || "24", 10)
       }

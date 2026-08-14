@@ -59,7 +59,7 @@ export function resolveCheckoutAssetPolicy(
   if (!["ledger", "compare", "legacy"].includes(settlementMode)) {
     throw new Error("TON_GRAM_SETTLEMENT_MODE must be ledger, compare, or legacy.");
   }
-  const runtimeReady = observerEnabled && movementSettlementEnabled && settlementMode !== "legacy";
+  const runtimeReady = observerEnabled && movementSettlementEnabled && settlementMode === "ledger";
   const usdtMainnetEnabled = checkoutRequested && runtimeReady;
   const usdtMainnetCanaryEnabled = canaryExternalIds.length > 0 && runtimeReady && settlementMode === "ledger";
   const mainnetAssets: PaymentAssetSymbol[] = usdtMainnetEnabled ? ["USDT", "GRAM"] : ["GRAM"];

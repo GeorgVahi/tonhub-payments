@@ -85,15 +85,23 @@ function publicDependencies(overrides: Record<string, unknown> = {}) {
       createTonDepositAddress: () => depositAddress,
       createTonInvoiceReference: () => "PUBLIC-USDT",
       checkoutAssetAvailable: (asset: string, network: string) => asset === "USDT" && network === "mainnet",
+      defaultCheckoutAsset: () => "GRAM",
+      checkoutOrderPolicy: () => ({
+        minimumOrderFiatMicros: "0",
+        gramDiscountMaxFiatMicros: "0",
+        intermediateSweepTriggerBps: 0,
+        intermediateSweepMinFiatMicros: "0",
+        maxAutomaticSweepsPerAsset: 0,
+      }),
       movementSettlementEnabled: () => true,
       rateSnapshotMaxAgeMs: () => 300_000,
-      findRateSnapshot: async () => ({
-        id: "usdt-usd-checkout-snapshot",
-        asset: "USDT" as const,
-        baseCurrency: "USDT" as const,
+      findRateSnapshot: async ({ asset = "USDT" }: { asset?: "GRAM" | "USDT" } = {}) => ({
+        id: `${asset.toLowerCase()}-usd-checkout-snapshot`,
+        asset,
+        baseCurrency: asset,
         quoteCurrency: "USD" as const,
-        price: "1",
-        source: "usd-peg" as const,
+        price: asset === "GRAM" ? "2.5" : "1",
+        source: asset === "GRAM" ? "coingecko" as const : "usd-peg" as const,
         observedAt: createdAt,
         fetchedAt: createdAt,
         payload: { policy: "1 USDT = 1 USD" },
@@ -120,13 +128,170 @@ test("public mainnet checkout creates a USDT attempt from a fresh immutable rate
   assert.equal(invoice.asset, "USDT");
   assert.equal(invoice.assetKind, "JETTON");
   assert.equal(invoice.amountAtomic, "12340000");
-  assert.equal(invoice.amountFormatted, "12.34 USDT");
+  assert.equal(invoice.amountFormatted, "12.34 USD₮");
   assert.equal(invoice.quote.rateSnapshotId, "usdt-usd-checkout-snapshot");
   const deeplink = new URL(invoice.deeplink);
   assert.equal(deeplink.searchParams.get("jetton"), officialMainnetUsdtMasterFriendlyAddress);
   assert.equal(deeplink.searchParams.get("amount"), "12340000");
   assert.equal(fixture.createdInput().quote.asset, "USDT");
   assert.equal(fixture.createdInput().activationThresholdFiatMicros, "6170000");
+});
+
+test("mainnet checkout without an asset selects USD₮ and persists immutable USD₮ and GRAM offers", async () => {
+  const fixture = publicDependencies({
+    defaultCheckoutAsset: () => "USDT",
+    checkoutOrderPolicy: () => ({
+      minimumOrderFiatMicros: "10000000",
+      gramDiscountMaxFiatMicros: "1000000",
+      intermediateSweepTriggerBps: 9000,
+      intermediateSweepMinFiatMicros: "100000000",
+      maxAutomaticSweepsPerAsset: 2,
+    }),
+    checkoutAssetAvailable: (asset: string, network: string) => (
+      network === "mainnet" && ["USDT", "GRAM"].includes(asset)
+    ),
+    findRateSnapshot: async ({ asset }: { asset: "GRAM" | "USDT" }) => ({
+      id: `${asset.toLowerCase()}-usd-checkout-snapshot`,
+      asset,
+      baseCurrency: asset,
+      quoteCurrency: "USD" as const,
+      price: asset === "GRAM" ? "2" : "1",
+      source: asset === "GRAM" ? "coingecko" as const : "usd-peg" as const,
+      observedAt: createdAt,
+      fetchedAt: createdAt,
+      payload: { policy: "dual TON offer" },
+      createdAt,
+    }),
+  });
+  const response = await createTonhubPaymentInvoice({
+    amount: "100.00",
+    currency: "USD",
+    network: "mainnet",
+    externalId: "merchant-default-usdt",
+  }, fixture.dependencies as any);
+
+  assert.equal(response.status, 200);
+  assert.equal((response.body.invoice as Record<string, unknown>).asset, "USDT");
+  assert.equal(fixture.createdInput().quote.asset, "USDT");
+  assert.deepEqual(
+    fixture.createdInput().quotes.map((quote: Record<string, string>) => ({
+      asset: quote.asset,
+      grossFiatMicros: quote.grossFiatMicros,
+      discountFiatMicros: quote.discountFiatMicros,
+      netFiatMicros: quote.netFiatMicros,
+      amountAtomic: quote.amountAtomic,
+    })),
+    [
+      {
+        asset: "USDT",
+        grossFiatMicros: "100000000",
+        discountFiatMicros: "0",
+        netFiatMicros: "100000000",
+        amountAtomic: "100000000",
+      },
+      {
+        asset: "GRAM",
+        grossFiatMicros: "100000000",
+        discountFiatMicros: "1000000",
+        netFiatMicros: "99000000",
+        amountAtomic: "49500000000",
+      },
+    ],
+  );
+  assert.deepEqual(fixture.createdInput().orderPolicy, {
+    minimumOrderFiatMicros: "10000000",
+    gramDiscountMaxFiatMicros: "1000000",
+    intermediateSweepTriggerBps: 9000,
+    intermediateSweepMinFiatMicros: "100000000",
+    maxAutomaticSweepsPerAsset: 2,
+  });
+});
+
+test("a new order below the env-snapshotted fiat minimum is rejected before rates, address, or persistence", async () => {
+  let sideEffects = 0;
+  const fixture = publicDependencies({
+    defaultCheckoutAsset: () => "USDT",
+    checkoutOrderPolicy: () => ({
+      minimumOrderFiatMicros: "10000000",
+      gramDiscountMaxFiatMicros: "1000000",
+      intermediateSweepTriggerBps: 9000,
+      intermediateSweepMinFiatMicros: "100000000",
+      maxAutomaticSweepsPerAsset: 2,
+    }),
+    checkoutAssetAvailable: () => true,
+    findRateSnapshot: async () => { sideEffects += 1; return null; },
+    createTonDepositAddress: () => { sideEffects += 1; return depositAddress; },
+  });
+  const response = await createTonhubPaymentInvoice({
+    amount: "9.99",
+    currency: "USD",
+    network: "mainnet",
+    externalId: "merchant-below-minimum",
+  }, fixture.dependencies as any);
+
+  assert.equal(response.status, 400);
+  assert.equal(response.body.errorCode, "TON_INVOICE_BELOW_MINIMUM");
+  assert.equal(sideEffects, 0);
+  assert.equal(fixture.createdInput(), null);
+});
+
+test("EUR issuance keeps the gross order while quoting the €1 GRAM saving and full-price USD₮", async () => {
+  const fixture = publicDependencies({
+    checkoutOrderPolicy: () => ({
+      minimumOrderFiatMicros: "10000000",
+      gramDiscountMaxFiatMicros: "1000000",
+      intermediateSweepTriggerBps: 9000,
+      intermediateSweepMinFiatMicros: "100000000",
+      maxAutomaticSweepsPerAsset: 2,
+    }),
+    checkoutAssetAvailable: (asset: string, network: string) => (
+      network === "mainnet" && ["GRAM", "USDT"].includes(asset)
+    ),
+    findRateSnapshot: async ({ asset }: { asset: "GRAM" | "USDT" }) => ({
+      id: `${asset.toLowerCase()}-eur-checkout-snapshot`,
+      asset,
+      baseCurrency: asset,
+      quoteCurrency: "EUR" as const,
+      price: asset === "GRAM" ? "1.5" : "0.9",
+      source: asset === "GRAM" ? "coingecko" as const : "usd-peg" as const,
+      observedAt: createdAt,
+      fetchedAt: createdAt,
+      payload: { policy: "dual TON EUR offer" },
+      createdAt,
+    }),
+  });
+  const response = await createTonhubPaymentInvoice({
+    amount: "10.00",
+    currency: "EUR",
+    network: "mainnet",
+    asset: "GRAM",
+    externalId: "merchant-eur-dual-offer",
+  }, fixture.dependencies as any);
+
+  assert.equal(response.status, 200);
+  assert.equal(fixture.createdInput().amountCents, 1_000);
+  assert.deepEqual(
+    fixture.createdInput().quotes.map((quote: Record<string, string>) => ({
+      asset: quote.asset,
+      discountFiatMicros: quote.discountFiatMicros,
+      netFiatMicros: quote.netFiatMicros,
+      amountAtomic: quote.amountAtomic,
+    })),
+    [
+      {
+        asset: "GRAM",
+        discountFiatMicros: "1000000",
+        netFiatMicros: "9000000",
+        amountAtomic: "6000000000",
+      },
+      {
+        asset: "USDT",
+        discountFiatMicros: "0",
+        netFiatMicros: "10000000",
+        amountAtomic: "11120000",
+      },
+    ],
+  );
 });
 
 test("mainnet canary issuance passes the merchant external id into the owner policy", async () => {
@@ -194,7 +359,7 @@ test("stopping mainnet canary issuance still reuses an already issued USDT attem
         assetDecimals: 6,
         fiatPerAsset: 1,
         amountAtomic: "5000000",
-        amountFormatted: "5.00 USDT",
+        amountFormatted: "5.00 USD₮",
         fiatAmountCents: 500,
         fiatAmount: 5,
         fiatCurrency: "USD",
@@ -314,7 +479,7 @@ test("USDT/EUR checkout rounds the exact decimal cross up to the configured paym
   }, fixture.dependencies as any);
   assert.equal(response.status, 200);
   assert.equal((response.body.invoice as Record<string, any>).amountAtomic, "5560000");
-  assert.equal((response.body.invoice as Record<string, any>).amountFormatted, "5.56 USDT");
+  assert.equal((response.body.invoice as Record<string, any>).amountFormatted, "5.56 USD₮");
 });
 
 test("an existing merchant attempt keeps its original asset when a retry requests another one", async () => {

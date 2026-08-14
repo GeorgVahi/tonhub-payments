@@ -57,7 +57,7 @@ npm run worker:sweep -- --network=mainnet --watch --interval-seconds=15
 They can only process mainnet. Public USDT checkout is a third, independent
 rollout switch: it is exposed only when `TON_USDT_MAINNET_CHECKOUT_ENABLED`,
 `TON_USDT_MAINNET_ADAPTER_ENABLED`, and `TON_MOVEMENT_SETTLEMENT_ENABLED` are
-all `true`, and settlement mode is not `legacy`. Testnet checkout remains
+all `true`, and settlement mode is exactly `ledger`. Testnet checkout remains
 GRAM-only. A production USDT rollout therefore runs the rate, USDT observer,
 GRAM shadow observer, settlement, native-sweep, and asset-sweep workers before
 enabling the public switch. The GRAM observer must include mainnet so a native
@@ -267,19 +267,32 @@ of payment-asset identity and precision:
 - `GRAM` is the TON native coin exposed under the product name
   `GRAM (ex TON)`. The legacy input alias `TON` resolves to `GRAM`; amounts use
   9 atomic decimals and checkout amounts are rounded up to 2 displayed digits.
-- `USDT` is a TON jetton with 6 atomic decimals and a USD-peg pricing strategy.
+- `USDT` is the machine code for official TON-network Tether, presented to users
+  as `USD₮`. It is a TON jetton with 6 atomic decimals and a USD-peg pricing strategy.
   Public mainnet checkout presents it first when the independent public flag
   and all required settlement services are enabled; GRAM remains the alternate
   choice. Public testnet and the internal arbitrary test jetton remain GRAM-only.
 
 `POST /api/tonhub-payments/invoices` accepts optional `asset: "GRAM" | "USDT"`.
-Omitting it preserves the legacy GRAM API contract. The choice fixes the
-concrete attempt and payment instruction but not the fiat order obligation; a
+When omitted, the server policy selects USD₮ on enabled mainnet checkout and
+GRAM on testnet. The choice fixes the concrete attempt and payment instruction
+but not the fiat order obligation; a
 retry of the same merchant `externalId` reuses the existing attempt instead of
-silently switching assets. USDT issuance reads a fresh immutable USD-peg or EUR
-cross snapshot, calculates micro-USDT with integer arithmetic, and returns a
+silently switching assets. New issuance stores both available TON offers on the
+same unique deposit address: USD₮ keeps the gross fiat amount, while the GRAM
+offer snapshots a maximum $1/€1 saving. The saving is not credited here; final
+all-GRAM eligibility is decided by settlement. Both offers reference fresh
+immutable rate snapshots and use integer arithmetic. USD₮ returns a
 standard `ton://transfer` jetton link plus the unique owner address and manual
 amount fallback. The link pins the compiled official mainnet USDT master.
+
+The order minimum defaults to $10/€10 and the intermediate unswept-balance
+threshold defaults to $100/€100. Configure integer cents with
+`TON_MIN_ORDER_{USD,EUR}_CENTS`, `TON_GRAM_DISCOUNT_{USD,EUR}_CENTS`, and
+`TON_INTERMEDIATE_SWEEP_MIN_{USD,EUR}_CENTS`; configure the percentage and
+automatic-sweep cap with `TON_INTERMEDIATE_SWEEP_TRIGGER_BPS` and
+`TON_MAX_AUTOMATIC_SWEEPS_PER_ASSET` (1 or 2). These values are immutable snapshots on
+new orders, so an env change never rewrites an already issued obligation.
 
 The React widget also supports TON Connect through the official
 `@tonconnect/ui-react` client. Pass an HTTPS manifest URL through the

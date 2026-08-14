@@ -11,7 +11,13 @@ export type TonhubPaymentOrderRecord = {
   fiatAmountMicros: string;
   fiatCurrency: string;
   creditedFiatMicros: string;
+  discountFiatMicros?: string;
   overpaymentFiatMicros: string;
+  minimumOrderFiatMicros?: string;
+  gramDiscountMaxFiatMicros?: string;
+  intermediateSweepTriggerBps?: number;
+  intermediateSweepMinFiatMicros?: string;
+  maxAutomaticSweepsPerAsset?: number;
   status: TonhubPaymentOrderStatus;
   paidAt: Date | null;
   expiresAt: Date | null;
@@ -55,6 +61,40 @@ export type TonhubRateQuote = {
   fetchedAt: Date;
 };
 
+export type TonhubCheckoutQuote = TonhubRateQuote & {
+  rateSnapshotId: string;
+  grossFiatMicros: string;
+  discountFiatMicros: string;
+  netFiatMicros: string;
+  quotedAt: Date;
+  expiresAt: Date;
+};
+
+export type TonhubPaymentQuoteRecord = {
+  id: string;
+  orderId: string;
+  invoiceId: string;
+  network: string;
+  asset: PaymentAssetSymbol;
+  assetKind: string;
+  assetDecimals: number;
+  fiatCurrency: string;
+  grossFiatMicros: string;
+  discountFiatMicros: string;
+  netFiatMicros: string;
+  amountAtomic: string;
+  rateSnapshotId: string;
+  quotedAt: Date;
+  expiresAt: Date;
+  createdAt: Date;
+  rateSnapshot?: {
+    price: unknown;
+    source?: string;
+    observedAt?: Date;
+    fetchedAt?: Date;
+  } | null;
+};
+
 export type TonhubPaymentInvoiceRecord = {
   id: string;
   externalId: string | null;
@@ -63,6 +103,8 @@ export type TonhubPaymentInvoiceRecord = {
   network: string;
   asset: string;
   checkoutAsset?: string;
+  paymentSelectionLockedAsset?: string | null;
+  paymentSelectionLockedAt?: Date | null;
   assetKind?: string;
   assetDecimals?: number;
   fiatAmountCents: number;
@@ -100,6 +142,7 @@ export type TonhubPaymentInvoiceRecord = {
   updatedAt: Date;
   metadata: unknown;
   payload: unknown;
+  quotes?: TonhubPaymentQuoteRecord[];
 };
 
 export type TonhubCreateInvoiceInput = {

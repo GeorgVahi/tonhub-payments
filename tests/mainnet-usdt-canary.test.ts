@@ -17,8 +17,10 @@ function db(input: { orders?: any[]; rates?: Record<string, any>; migration?: bo
   return {
     $queryRawUnsafe: async () => input.migration === false ? [] : [{ finished_at: now, rolled_back_at: null }],
     tonhubRateSnapshot: {
-      findFirst: async (query: any) => input.rates?.[query.where.quoteCurrency] ?? {
-        price: query.where.quoteCurrency === "USD" ? "1" : "0.9",
+      findFirst: async (query: any) => input.rates?.[`${query.where.asset}/${query.where.quoteCurrency}`] ?? {
+        price: query.where.asset === "GRAM"
+          ? (query.where.quoteCurrency === "USD" ? "1.1" : "1")
+          : (query.where.quoteCurrency === "USD" ? "1" : "0.9"),
         observedAt: new Date(now.getTime() - 30_000),
       },
     },
@@ -44,8 +46,8 @@ test("mainnet canary preflight stops on public exposure, stale rates, recovery, 
   const report = await inspectMainnetUsdtCanary({
     db: db({
       rates: {
-        USD: { price: "0.99", observedAt: new Date(now.getTime() - 301_000) },
-        EUR: { price: "0.9", observedAt: new Date(now.getTime() + 1_000) },
+        "USDT/USD": { price: "0.99", observedAt: new Date(now.getTime() - 301_000) },
+        "USDT/EUR": { price: "0.9", observedAt: new Date(now.getTime() + 1_000) },
       },
       orders: [{
         id: "order-1",
@@ -76,6 +78,21 @@ test("mainnet canary preflight stops on public exposure, stale rates, recovery, 
   assert.ok(report.blockers.some((value) => value.includes("sweep")));
   assert.ok(report.blockers.some((value) => value.includes("webhook")));
   assert.deepEqual(report.warnings, []);
+});
+
+test("mainnet canary preflight requires the GRAM snapshots used by the alternate immutable offer", async () => {
+  const now = new Date("2026-08-13T12:00:00.000Z");
+  const report = await inspectMainnetUsdtCanary({
+    db: db({
+      rates: {
+        "GRAM/USD": { price: "1.1", observedAt: new Date(now.getTime() - 301_000) },
+      },
+    }) as any,
+    env,
+    now,
+  });
+  assert.equal(report.ok, false);
+  assert.ok(report.blockers.some((value) => value.includes("GRAM/USD")));
 });
 
 test("mainnet canary preflight blocks reviewed recovery and a recovery order until resolution", async () => {

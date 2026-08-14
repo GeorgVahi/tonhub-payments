@@ -2,10 +2,12 @@ import { prisma } from "./db";
 import type { TonUniqueDepositAddress } from "./ton/deposit-addresses";
 import type {
   TonhubObservedPayment,
+  TonhubCheckoutQuote,
   TonhubPaymentInvoiceRecord,
   TonhubPaymentOrderRecord,
   TonhubRateQuote,
 } from "./types";
+import type { TonhubCheckoutOrderPolicy } from "./checkout-order-policy";
 import { gramAsset, type TonNetwork } from "./ton/direct-payments";
 import { assertPaymentAssetSnapshot, parsePaymentAsset } from "../../shared/payment-assets";
 
@@ -15,6 +17,7 @@ type PrismaLike = {
   tonhubPaymentInvoice: any;
   tonhubDepositAddress: any;
   tonhubPaymentTransaction: any;
+  tonhubPaymentQuote: any;
 };
 
 const activeAttemptStatuses = ["PENDING", "PARTIAL"] as const;
@@ -35,6 +38,15 @@ export class TonhubOrderNotRetryableError extends Error {
   constructor(status: string) {
     super(`The order cannot create a new payment attempt while it is ${status}.`);
     this.name = "TonhubOrderNotRetryableError";
+  }
+}
+
+export class TonhubOrderPolicyMismatchError extends Error {
+  readonly code = "TON_ORDER_POLICY_MISMATCH";
+
+  constructor() {
+    super("The externalId already belongs to an order with different snapshotted checkout policy.");
+    this.name = "TonhubOrderPolicyMismatchError";
   }
 }
 
@@ -70,7 +82,17 @@ function calculateFiatCreditMicros(input: {
 }
 
 function normalizeOrder(value: unknown): TonhubPaymentOrderRecord | null {
-  return value ? value as TonhubPaymentOrderRecord : null;
+  if (!value) return null;
+  const order = value as TonhubPaymentOrderRecord;
+  return {
+    ...order,
+    discountFiatMicros: order.discountFiatMicros ?? "0",
+    minimumOrderFiatMicros: order.minimumOrderFiatMicros ?? "0",
+    gramDiscountMaxFiatMicros: order.gramDiscountMaxFiatMicros ?? "0",
+    intermediateSweepTriggerBps: order.intermediateSweepTriggerBps ?? 0,
+    intermediateSweepMinFiatMicros: order.intermediateSweepMinFiatMicros ?? "0",
+    maxAutomaticSweepsPerAsset: order.maxAutomaticSweepsPerAsset ?? 0,
+  };
 }
 
 function normalizeInvoice(value: unknown): TonhubPaymentInvoiceRecord {
@@ -118,6 +140,21 @@ function assertOrderTerms(
     (input.currency !== undefined && order.fiatCurrency !== input.currency)
   ) {
     throw new TonhubOrderTermsMismatchError();
+  }
+}
+
+function assertOrderPolicy(
+  order: TonhubPaymentOrderRecord,
+  policy: TonhubCheckoutOrderPolicy,
+) {
+  if (
+    order.minimumOrderFiatMicros !== policy.minimumOrderFiatMicros ||
+    order.gramDiscountMaxFiatMicros !== policy.gramDiscountMaxFiatMicros ||
+    order.intermediateSweepTriggerBps !== policy.intermediateSweepTriggerBps ||
+    order.intermediateSweepMinFiatMicros !== policy.intermediateSweepMinFiatMicros ||
+    order.maxAutomaticSweepsPerAsset !== policy.maxAutomaticSweepsPerAsset
+  ) {
+    throw new TonhubOrderPolicyMismatchError();
   }
 }
 
@@ -190,7 +227,7 @@ async function syncOrderFromAttempts(
 async function findInvoiceWithOrder(db: PrismaLike, id: string) {
   const invoice = await db.tonhubPaymentInvoice.findUnique({
     where: { id },
-    include: { order: true },
+    include: { order: true, quotes: { include: { rateSnapshot: true } } },
   });
   return invoice ? normalizeInvoice(invoice) : null;
 }
@@ -403,6 +440,7 @@ async function ensureInvoiceOrder(
 
 export type TonhubPaymentRepository = {
   findInvoiceById: (id: string) => Promise<TonhubPaymentInvoiceRecord | null>;
+  findOrderByExternalId?: (externalId: string) => Promise<TonhubPaymentOrderRecord | null>;
   findReusableInvoice: (input: {
     externalId?: string | null;
     network: TonNetwork;
@@ -417,6 +455,8 @@ export type TonhubPaymentRepository = {
     depositAddress: TonUniqueDepositAddress;
     reference: string;
     quote: TonhubRateQuote;
+    quotes?: TonhubCheckoutQuote[];
+    orderPolicy?: TonhubCheckoutOrderPolicy;
     metadata?: unknown;
     createdAt: Date;
     expiresAt: Date;
@@ -448,6 +488,9 @@ export type TonhubPaymentRepository = {
 export function createPrismaTonhubPaymentRepository(db: PrismaLike): TonhubPaymentRepository {
   return {
     findInvoiceById: async (id) => findInvoiceWithOrder(db, id),
+    findOrderByExternalId: async (externalId) => normalizeOrder(
+      await db.tonhubPaymentOrder.findUnique({ where: { externalId } }),
+    ),
     findReusableInvoice: async ({ externalId, amountCents, currency }) => {
       if (!externalId) {
         return null;
@@ -459,7 +502,7 @@ export function createPrismaTonhubPaymentRepository(db: PrismaLike): TonhubPayme
           orderId: null,
         },
         orderBy: { createdAt: "desc" },
-        include: { order: true },
+        include: { order: true, quotes: { include: { rateSnapshot: true } } },
       });
       if (legacyInvoice) {
         const normalized = normalizeInvoice(legacyInvoice);
@@ -485,7 +528,7 @@ export function createPrismaTonhubPaymentRepository(db: PrismaLike): TonhubPayme
             status: { in: order.status === "PAID" ? ["PAID"] : [...reusableAttemptStatuses] },
           },
           orderBy: { createdAt: "desc" },
-          include: { order: true },
+          include: { order: true, quotes: { include: { rateSnapshot: true } } },
         });
         if (invoice) {
           return normalizeInvoice(invoice);
@@ -512,13 +555,42 @@ export function createPrismaTonhubPaymentRepository(db: PrismaLike): TonhubPayme
           const checkoutAsset = assertPaymentAssetSnapshot(parsePaymentAsset(input.quote.asset), {
             decimals: input.quote.assetDecimals,
           });
+          const orderPolicy = input.orderPolicy ?? {
+            minimumOrderFiatMicros: "0",
+            gramDiscountMaxFiatMicros: "0",
+            intermediateSweepTriggerBps: 0,
+            intermediateSweepMinFiatMicros: "0",
+            maxAutomaticSweepsPerAsset: 0,
+          };
+          const checkoutQuotes = input.quotes ?? [];
+          if (input.orderPolicy && checkoutQuotes.length === 0) {
+            throw new Error("Checkout policy issuance requires persisted payment quotes.");
+          }
+          if (checkoutQuotes.length > 0) {
+            const symbols = checkoutQuotes.map((quote) => quote.asset);
+            const selectedQuote = checkoutQuotes.find((quote) => quote.asset === checkoutAsset.symbol);
+            if (
+              new Set(symbols).size !== symbols.length ||
+              !selectedQuote ||
+              checkoutQuotes.some((quote) => quote.fiatCurrency !== input.currency) ||
+              selectedQuote.amountAtomic !== input.quote.amountAtomic ||
+              selectedQuote.assetDecimals !== input.quote.assetDecimals ||
+              selectedQuote.rateSnapshotId !== input.quote.rateSnapshotId
+            ) {
+              throw new Error(
+                "Checkout quotes must be unique and the selected quote must exactly match the invoice instruction.",
+              );
+            }
+          }
           const amountAtomic = input.quote.amountAtomic;
           const orderData = {
             externalId: input.externalId || null,
             fiatAmountMicros,
             fiatCurrency: input.currency,
             creditedFiatMicros: "0",
+            discountFiatMicros: "0",
             overpaymentFiatMicros: "0",
+            ...orderPolicy,
             status: "PENDING",
             expiresAt: input.expiresAt,
             metadata: toInputJson(input.metadata ?? null),
@@ -534,6 +606,7 @@ export function createPrismaTonhubPaymentRepository(db: PrismaLike): TonhubPayme
             : await tx.tonhubPaymentOrder.create({ data: orderData }))!;
 
           assertOrderTerms(order, input);
+          assertOrderPolicy(order, orderPolicy);
 
           const existingAttempt = await tx.tonhubPaymentInvoice.findFirst({
             where: {
@@ -541,7 +614,7 @@ export function createPrismaTonhubPaymentRepository(db: PrismaLike): TonhubPayme
               status: { in: [...reusableAttemptStatuses] },
             },
             orderBy: { createdAt: "desc" },
-            include: { order: true },
+            include: { order: true, quotes: { include: { rateSnapshot: true } } },
           });
           if (existingAttempt) {
             return normalizeInvoice(existingAttempt);
@@ -573,6 +646,8 @@ export function createPrismaTonhubPaymentRepository(db: PrismaLike): TonhubPayme
               network: input.network,
               asset: checkoutAsset.symbol,
               checkoutAsset: checkoutAsset.symbol,
+              paymentSelectionLockedAsset: null,
+              paymentSelectionLockedAt: null,
               assetKind: checkoutAsset.kind,
               assetDecimals: checkoutAsset.decimals,
               fiatAmountCents: input.amountCents,
@@ -631,7 +706,29 @@ export function createPrismaTonhubPaymentRepository(db: PrismaLike): TonhubPayme
             },
           });
 
-          return normalizeInvoice(invoice);
+          if (checkoutQuotes.length > 0) {
+            await tx.tonhubPaymentQuote.createMany({
+              data: checkoutQuotes.map((quote) => ({
+                orderId: order.id,
+                invoiceId: invoice.id,
+                network: input.network,
+                asset: quote.asset,
+                assetKind: parsePaymentAsset(quote.asset).kind,
+                assetDecimals: quote.assetDecimals,
+                fiatCurrency: input.currency,
+                grossFiatMicros: quote.grossFiatMicros,
+                discountFiatMicros: quote.discountFiatMicros,
+                netFiatMicros: quote.netFiatMicros,
+                amountAtomic: quote.amountAtomic,
+                rateSnapshotId: quote.rateSnapshotId,
+                quotedAt: quote.quotedAt,
+                expiresAt: quote.expiresAt,
+                createdAt: quote.quotedAt,
+              })),
+            });
+          }
+
+          return (await findInvoiceWithOrder(tx, invoice.id)) ?? normalizeInvoice(invoice);
         });
       } catch (error) {
         if (!input.externalId || !isConcurrentOrderAttemptConflict(error)) {
@@ -651,7 +748,7 @@ export function createPrismaTonhubPaymentRepository(db: PrismaLike): TonhubPayme
             status: { in: [...reusableAttemptStatuses] },
           },
           orderBy: { createdAt: "desc" },
-          include: { order: true },
+          include: { order: true, quotes: { include: { rateSnapshot: true } } },
         });
         if (!concurrentAttempt) {
           throw error;

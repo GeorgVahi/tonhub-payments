@@ -29,6 +29,7 @@ function createMemoryPrisma() {
   const invoices: Row[] = [];
   const depositAddresses: Row[] = [];
   const transactions: Row[] = [];
+  const quotes: Row[] = [];
   let sequence = 0;
   let nextInvoiceCreateHook: ((data: Row) => never) | null = null;
   let nextInvoiceFindHook: ((row: Row | null) => Promise<Row | null>) | null = null;
@@ -40,6 +41,7 @@ function createMemoryPrisma() {
         order: row.orderId
           ? orders.find((candidate) => candidate.id === row.orderId) ?? null
           : null,
+        quotes: quotes.filter((candidate) => candidate.invoiceId === row.id),
       }
     : null;
   const updateMany = (rows: Row[], input: Row) => {
@@ -134,6 +136,14 @@ function createMemoryPrisma() {
         return row;
       },
     },
+    tonhubPaymentQuote: {
+      createMany: async ({ data }: Row) => {
+        for (const value of data) {
+          quotes.push({ id: nextId("quote"), ...value });
+        }
+        return { count: data.length };
+      },
+    },
   };
 
   return {
@@ -142,6 +152,7 @@ function createMemoryPrisma() {
     invoices,
     depositAddresses,
     transactions,
+    quotes,
     onNextInvoiceCreate(hook: (data: Row) => never) {
       nextInvoiceCreateHook = hook;
     },
@@ -223,6 +234,103 @@ test("new invoices dual-write one order and one active attempt", async () => {
   assert.equal(memory.invoices[0]?.paidAmountAtomic, "0");
   assert.equal(memory.invoices[0]?.checkoutAsset, "GRAM");
   assert.equal(memory.invoices[0]?.activationThresholdFiatMicros, "2500000");
+});
+
+test("checkout issuance writes order policy and both TON asset quotes in the invoice transaction", async () => {
+  const memory = createMemoryPrisma();
+  const repository = createPrismaTonhubPaymentRepository(memory.db);
+  const expiresAt = new Date("2026-08-13T11:00:00.000Z");
+  const gramQuote = {
+    ...quote,
+    rateSnapshotId: "gram-usd-policy-snapshot",
+    grossFiatMicros: "100000000",
+    discountFiatMicros: "1000000",
+    netFiatMicros: "99000000",
+    quotedAt: createdAt,
+    expiresAt,
+  };
+  const usdtQuote = {
+    source: "usd-peg" as const,
+    rateSnapshotId: "usdt-usd-policy-snapshot",
+    asset: "USDT" as const,
+    assetDecimals: 6,
+    fiatPerAsset: 1,
+    amountAtomic: "100000000",
+    amountFormatted: "100.00 USD₮",
+    fiatAmountCents: 10_000,
+    fiatAmount: 100,
+    fiatCurrency: "USD" as const,
+    grossFiatMicros: "100000000",
+    discountFiatMicros: "0",
+    netFiatMicros: "100000000",
+    quotedAt: createdAt,
+    expiresAt,
+    updatedAt: createdAt,
+    fetchedAt: createdAt,
+  };
+
+  const invoice = await repository.createPendingInvoice({
+    ...pendingInput("merchant-dual-offer"),
+    amountCents: 10_000,
+    quote: usdtQuote,
+    quotes: [usdtQuote, gramQuote],
+    orderPolicy: {
+      minimumOrderFiatMicros: "10000000",
+      gramDiscountMaxFiatMicros: "1000000",
+      intermediateSweepTriggerBps: 9000,
+      intermediateSweepMinFiatMicros: "100000000",
+      maxAutomaticSweepsPerAsset: 2,
+    },
+    expiresAt,
+    priceLockedUntil: expiresAt,
+  });
+
+  assert.equal(invoice.checkoutAsset, "USDT");
+  assert.deepEqual(
+    memory.quotes.map(({ invoiceId, asset, discountFiatMicros }) => ({
+      invoiceId,
+      asset,
+      discountFiatMicros,
+    })),
+    [
+      { invoiceId: invoice.id, asset: "USDT", discountFiatMicros: "0" },
+      { invoiceId: invoice.id, asset: "GRAM", discountFiatMicros: "1000000" },
+    ],
+  );
+  assert.deepEqual(
+    {
+      minimumOrderFiatMicros: memory.orders[0]?.minimumOrderFiatMicros,
+      gramDiscountMaxFiatMicros: memory.orders[0]?.gramDiscountMaxFiatMicros,
+      intermediateSweepTriggerBps: memory.orders[0]?.intermediateSweepTriggerBps,
+      intermediateSweepMinFiatMicros: memory.orders[0]?.intermediateSweepMinFiatMicros,
+      maxAutomaticSweepsPerAsset: memory.orders[0]?.maxAutomaticSweepsPerAsset,
+    },
+    {
+      minimumOrderFiatMicros: "10000000",
+      gramDiscountMaxFiatMicros: "1000000",
+      intermediateSweepTriggerBps: 9000,
+      intermediateSweepMinFiatMicros: "100000000",
+      maxAutomaticSweepsPerAsset: 2,
+    },
+  );
+  await assert.rejects(
+    repository.createPendingInvoice({
+      ...pendingInput("merchant-selected-quote-drift"),
+      amountCents: 10_000,
+      quote: { ...usdtQuote, amountAtomic: "999000000" },
+      quotes: [usdtQuote, gramQuote],
+      orderPolicy: {
+        minimumOrderFiatMicros: "10000000",
+        gramDiscountMaxFiatMicros: "1000000",
+        intermediateSweepTriggerBps: 9000,
+        intermediateSweepMinFiatMicros: "100000000",
+        maxAutomaticSweepsPerAsset: 2,
+      },
+      expiresAt,
+      priceLockedUntil: expiresAt,
+    }),
+    /selected quote must exactly match/,
+  );
 });
 
 test("a public USDT attempt persists the selected jetton identity without changing the fiat order", async () => {
@@ -689,9 +797,9 @@ test("the legacy create endpoint reports an order terms conflict without fetchin
     },
     {
       repository,
-      fetchTonFiatRate: async () => {
+      findRateSnapshot: async () => {
         rateFetches += 1;
-        throw new Error("the mismatch must be resolved before rate lookup");
+        throw new Error("the mismatch must be resolved before snapshot lookup");
       },
     },
   );

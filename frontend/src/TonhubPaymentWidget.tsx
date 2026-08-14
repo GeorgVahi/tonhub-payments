@@ -321,7 +321,7 @@ export function TonhubPaymentWidget({
   });
   const [assetLabels, setAssetLabels] = useState<Record<PaymentAsset, string>>({
     GRAM: "GRAM (ex TON)",
-    USDT: "USDT"
+    USDT: "USD₮"
   });
   const [invoice, setInvoice] = useState<TonhubInvoice | null>(null);
   const [notice, setNotice] = useState<WidgetNotice | null>(null);

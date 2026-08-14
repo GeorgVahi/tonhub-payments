@@ -31,16 +31,18 @@ import {
 } from "./ton/deposit-addresses";
 import { findTonDepositAddressPayments } from "./ton/matching";
 import { canonicalTonTransactionHash } from "./ton/gram-shadow-scanner";
-import { ceilTonAmountNanoFromFiat, fetchTonFiatRate } from "./rates";
 import {
   TonhubOrderNotRetryableError,
+  TonhubOrderPolicyMismatchError,
   TonhubOrderTermsMismatchError,
   prismaTonhubPaymentRepository,
   type TonhubPaymentRepository
 } from "./repository";
 import type {
+  TonhubCheckoutQuote,
   TonhubObservedPayment,
   TonhubPaymentInvoiceRecord,
+  TonhubPaymentQuoteRecord,
   TonhubRateQuote
 } from "./types";
 import { resolveTonApiConfig } from "./ton/direct-payments";
@@ -62,7 +64,14 @@ import {
 } from "./gram-ledger-source";
 import { calculateActivationThresholdFiatMicros } from "./movement-ledger";
 import { mixedAssetSettlement, type MixedSettlementResult } from "./mixed-settlement";
-import { isCheckoutAssetAvailable } from "./checkout-assets";
+import {
+  defaultCheckoutAssetForNetwork,
+  isCheckoutAssetAvailable,
+} from "./checkout-assets";
+import {
+  resolveCheckoutOrderPolicy,
+  type TonhubCheckoutOrderPolicy,
+} from "./checkout-order-policy";
 import {
   prismaRateSnapshotRepository,
   rateSnapshotMaxAgeMs,
@@ -80,13 +89,8 @@ type TonhubPaymentDependencies = {
     startUtime?: number;
     endUtime?: number;
   }) => Promise<TonCenterTransactionsResponse>;
-  fetchTonFiatRate: (currency: FiatCurrency) => Promise<{
-    fiatPerTon: number;
-    updatedAt: Date | null;
-    fetchedAt: Date;
-  }>;
   findRateSnapshot: (input: {
-    asset: "USDT";
+    asset: "GRAM" | "USDT";
     quoteCurrency: FiatCurrency;
     at: Date;
     maxAgeMs: number;
@@ -97,6 +101,8 @@ type TonhubPaymentDependencies = {
     network: TonNetwork,
     externalId?: string,
   ) => boolean;
+  defaultCheckoutAsset: (network: TonNetwork) => "GRAM" | "USDT";
+  checkoutOrderPolicy: (currency: FiatCurrency) => TonhubCheckoutOrderPolicy;
   createTonDepositAddress: (input: { network: TonNetwork }) => TonUniqueDepositAddress;
   createTonInvoiceReference: (prefix?: string) => string;
   gramLedgerSource: GramLedgerSettlementSource;
@@ -460,9 +466,9 @@ function formatFiatMicros(value: string | null | undefined, currency: FiatCurren
 }
 
 function ceilAssetAtomicFromFiat(input: {
-  amountCents: number;
+  fiatAmountMicros: string;
   fiatPerAsset: string;
-  asset: typeof paymentAssets.USDT;
+  asset: typeof paymentAssets.GRAM | typeof paymentAssets.USDT;
 }) {
   const normalized = input.fiatPerAsset.trim();
   if (!/^\d+(?:\.\d+)?$/.test(normalized)) {
@@ -474,10 +480,82 @@ function ceilAssetAtomicFromFiat(input: {
     throw new Error("Checkout rate must be greater than zero.");
   }
   const scale = BigInt(10) ** BigInt(fraction.length);
-  const numerator = BigInt(input.amountCents) * (BigInt(10) ** BigInt(input.asset.decimals)) * scale;
-  const denominator = BigInt(100) * coefficient;
+  if (!/^\d+$/.test(input.fiatAmountMicros) || BigInt(input.fiatAmountMicros) <= BigInt(0)) {
+    throw new Error("Checkout fiat amount must be a positive integer number of micros.");
+  }
+  const numerator = BigInt(input.fiatAmountMicros) * (BigInt(10) ** BigInt(input.asset.decimals)) * scale;
+  const denominator = BigInt(1_000_000) * coefficient;
   const exactAtomic = (numerator + denominator - BigInt(1)) / denominator;
   return ceilAtomicToPaymentUnit(exactAtomic, input.asset);
+}
+
+function checkoutOrderPolicyFromStoredOrder(
+  order: TonhubPaymentInvoiceRecord["order"],
+): TonhubCheckoutOrderPolicy | null {
+  if (!order) return null;
+  return Object.freeze({
+    minimumOrderFiatMicros: order.minimumOrderFiatMicros ?? "0",
+    gramDiscountMaxFiatMicros: order.gramDiscountMaxFiatMicros ?? "0",
+    intermediateSweepTriggerBps: order.intermediateSweepTriggerBps ?? 0,
+    intermediateSweepMinFiatMicros: order.intermediateSweepMinFiatMicros ?? "0",
+    maxAutomaticSweepsPerAsset: order.maxAutomaticSweepsPerAsset ?? 0,
+  });
+}
+
+function buildCheckoutQuote(input: {
+  asset: typeof paymentAssets.GRAM | typeof paymentAssets.USDT;
+  amountCents: number;
+  currency: FiatCurrency;
+  grossFiatMicros: string;
+  discountFiatMicros: string;
+  snapshot: RateSnapshotRecord;
+  quotedAt: Date;
+  expiresAt: Date;
+}): TonhubCheckoutQuote {
+  const netFiatMicros = (
+    BigInt(input.grossFiatMicros) - BigInt(input.discountFiatMicros)
+  ).toString();
+  if (BigInt(netFiatMicros) <= BigInt(0)) {
+    throw new Error("Checkout quote discount must leave a positive amount payable.");
+  }
+  const amountAtomic = ceilAssetAtomicFromFiat({
+    fiatAmountMicros: netFiatMicros,
+    fiatPerAsset: input.snapshot.price,
+    asset: input.asset,
+  });
+  const fiatPerAsset = Number(input.snapshot.price);
+  if (!Number.isFinite(fiatPerAsset) || fiatPerAsset <= 0) {
+    throw new Error("Checkout rate cannot be represented for the public response.");
+  }
+  const amountFormatted = formatCheckoutAssetAmount(amountAtomic, input.asset);
+  return {
+    source: input.asset.pricingStrategy === "MARKET" ? "coingecko" : "usd-peg",
+    rateSnapshotId: input.snapshot.id,
+    asset: input.asset.symbol,
+    assetDecimals: input.asset.decimals,
+    fiatPerAsset,
+    amountAtomic,
+    amountFormatted,
+    fiatAmountCents: input.amountCents,
+    fiatAmount: input.amountCents / 100,
+    fiatCurrency: input.currency,
+    ...(input.asset.symbol === "GRAM"
+      ? {
+          fiatPerGram: fiatPerAsset,
+          fiatPerTon: fiatPerAsset,
+          amountNano: amountAtomic,
+          amountGram: amountFormatted,
+          amountTon: amountFormatted,
+        }
+      : {}),
+    grossFiatMicros: input.grossFiatMicros,
+    discountFiatMicros: input.discountFiatMicros,
+    netFiatMicros,
+    quotedAt: input.quotedAt,
+    expiresAt: input.expiresAt,
+    updatedAt: input.snapshot.observedAt,
+    fetchedAt: input.snapshot.fetchedAt,
+  };
 }
 
 function extractQuote(invoice: TonhubPaymentInvoiceRecord): TonhubRateQuote | null {
@@ -561,10 +639,12 @@ function serializeQuote(quote: TonhubRateQuote | null) {
     decimals: quote.assetDecimals,
   });
   const amountAtomic = quote.amountAtomic;
+  const checkoutQuote = quote as Partial<TonhubCheckoutQuote>;
   return {
         source: quote.source,
         rateSnapshotId: quote.rateSnapshotId ?? null,
         asset: asset.symbol,
+        label: asset.label,
         assetDecimals: asset.decimals,
         fiatAmountCents: quote.fiatAmountCents,
         fiatAmount: quote.fiatAmount,
@@ -574,6 +654,11 @@ function serializeQuote(quote: TonhubRateQuote | null) {
         fiatPerAsset: quote.fiatPerAsset,
         amountAtomic,
         amountFormatted: formatCheckoutAssetAmount(amountAtomic, asset),
+        grossFiatMicros: checkoutQuote.grossFiatMicros ?? null,
+        discountFiatMicros: checkoutQuote.discountFiatMicros ?? null,
+        netFiatMicros: checkoutQuote.netFiatMicros ?? null,
+        quotedAt: checkoutQuote.quotedAt?.toISOString() ?? null,
+        expiresAt: checkoutQuote.expiresAt?.toISOString() ?? null,
         amountNano: asset.symbol === paymentAssets.GRAM.symbol ? quote.amountNano ?? amountAtomic : null,
         amountGram: asset.symbol === paymentAssets.GRAM.symbol
           ? quote.amountGram ?? formatCheckoutAssetAmount(amountAtomic, asset)
@@ -586,7 +671,53 @@ function serializeQuote(quote: TonhubRateQuote | null) {
       };
 }
 
-function serializeInvoice(invoice: TonhubPaymentInvoiceRecord, quote = extractQuote(invoice)) {
+function serializeStoredQuote(
+  quote: TonhubPaymentQuoteRecord,
+  invoice: TonhubPaymentInvoiceRecord,
+) {
+  const asset = assertPaymentAssetSnapshot(parsePaymentAsset(quote.asset), {
+    kind: quote.assetKind,
+    decimals: quote.assetDecimals,
+  });
+  const fiatPerAsset = quote.rateSnapshot?.price === undefined || quote.rateSnapshot?.price === null
+    ? null
+    : Number(String(quote.rateSnapshot.price));
+  const amountFormatted = formatCheckoutAssetAmount(quote.amountAtomic, asset);
+  const source = quote.rateSnapshot?.source === "usd-peg" || quote.rateSnapshot?.source === "coingecko"
+    ? quote.rateSnapshot.source
+    : asset.pricingStrategy === "MARKET" ? "coingecko" : "usd-peg";
+  return {
+    source,
+    rateSnapshotId: quote.rateSnapshotId,
+    asset: asset.symbol,
+    label: asset.label,
+    assetDecimals: asset.decimals,
+    fiatAmountCents: invoice.fiatAmountCents,
+    fiatAmount: invoice.fiatAmountCents / 100,
+    fiatCurrency: quote.fiatCurrency,
+    fiatPerGram: asset.symbol === paymentAssets.GRAM.symbol ? fiatPerAsset : null,
+    fiatPerTon: asset.symbol === paymentAssets.GRAM.symbol ? fiatPerAsset : null,
+    fiatPerAsset: Number.isFinite(fiatPerAsset) && Number(fiatPerAsset) > 0 ? fiatPerAsset : null,
+    amountAtomic: quote.amountAtomic,
+    amountFormatted,
+    grossFiatMicros: quote.grossFiatMicros,
+    discountFiatMicros: quote.discountFiatMicros,
+    netFiatMicros: quote.netFiatMicros,
+    quotedAt: quote.quotedAt.toISOString(),
+    expiresAt: quote.expiresAt.toISOString(),
+    amountNano: asset.symbol === paymentAssets.GRAM.symbol ? quote.amountAtomic : null,
+    amountGram: asset.symbol === paymentAssets.GRAM.symbol ? amountFormatted : null,
+    amountTon: asset.symbol === paymentAssets.GRAM.symbol ? amountFormatted : null,
+    updatedAt: quote.rateSnapshot?.observedAt?.toISOString() ?? null,
+    fetchedAt: quote.rateSnapshot?.fetchedAt?.toISOString() ?? null,
+  };
+}
+
+function serializeInvoice(
+  invoice: TonhubPaymentInvoiceRecord,
+  quote = extractQuote(invoice),
+  checkoutQuotes?: readonly TonhubCheckoutQuote[],
+) {
   const asset = assertPaymentAssetSnapshot(parsePaymentAsset(invoice.checkoutAsset ?? invoice.asset), {
     kind: invoice.assetKind,
     decimals: invoice.assetDecimals,
@@ -622,6 +753,18 @@ function serializeInvoice(invoice: TonhubPaymentInvoiceRecord, quote = extractQu
   const paidGram = asset.symbol === paymentAssets.GRAM.symbol ? paidAmountFormatted : null;
   const remainingGram = asset.symbol === paymentAssets.GRAM.symbol ? remainingAmountFormatted : null;
   const fiatCurrency = parseFiatCurrency(invoice.fiatCurrency);
+  const storedPaymentOptions = (invoice.quotes ?? []).map((value) => serializeStoredQuote(value, invoice));
+  const paymentOptions = (storedPaymentOptions.length > 0
+    ? storedPaymentOptions
+    : (checkoutQuotes ?? []).map((value) => serializeQuote(value)))
+    .sort((left, right) => {
+      if (left?.asset === asset.symbol) return -1;
+      if (right?.asset === asset.symbol) return 1;
+      return String(left?.asset).localeCompare(String(right?.asset));
+    });
+  const selectedQuote = paymentOptions.find((value) => value?.asset === asset.symbol) ??
+    serializeQuote(quote) ??
+    null;
 
   return {
     id: invoice.id,
@@ -688,7 +831,8 @@ function serializeInvoice(invoice: TonhubPaymentInvoiceRecord, quote = extractQu
     partialPaymentStartedAt: invoice.partialPaymentStartedAt?.toISOString() ?? null,
     partialPaymentExpiresAt: invoice.partialPaymentExpiresAt?.toISOString() ?? null,
     observedPayments: storedObservedPayments(invoice),
-    quote: serializeQuote(quote),
+    quote: selectedQuote,
+    paymentOptions,
     order: invoice.order
       ? {
           id: invoice.order.id,
@@ -696,6 +840,7 @@ function serializeInvoice(invoice: TonhubPaymentInvoiceRecord, quote = extractQu
           fiatAmountMicros: invoice.order.fiatAmountMicros,
           fiatCurrency: invoice.order.fiatCurrency,
           creditedFiatMicros: invoice.order.creditedFiatMicros,
+          discountFiatMicros: invoice.order.discountFiatMicros,
           overpaymentFiatMicros: invoice.order.overpaymentFiatMicros,
           status: invoice.order.status,
           paidAt: invoice.order.paidAt?.toISOString() ?? null,
@@ -731,12 +876,13 @@ function resolveDependencies(
     now: () => new Date(),
     resolveTonApiConfig,
     fetchTonTransactions: (input) => fetchTonTransactions(input),
-    fetchTonFiatRate,
     findRateSnapshot: (input) => prismaRateSnapshotRepository.findAt(input),
     rateSnapshotMaxAgeMs,
     checkoutAssetAvailable: (asset, network, externalId) => (
       isCheckoutAssetAvailable(asset, network, process.env, externalId)
     ),
+    defaultCheckoutAsset: (network) => defaultCheckoutAssetForNetwork(network, process.env),
+    checkoutOrderPolicy: (currency) => resolveCheckoutOrderPolicy(currency, process.env),
     createTonDepositAddress: ({ network }) => createTonV5R1DepositAddressFromEnv({ network }),
     createTonInvoiceReference,
     gramLedgerSource: prismaGramLedgerSettlementSource,
@@ -1287,7 +1433,7 @@ export async function createTonhubPaymentInvoice(
     const currency = parseFiatCurrency(parsed.data.currency);
     const amountCents = parseFiatAmountToCents(parsed.data.amount);
     const network = parseTonNetwork(parsed.data.network || resolveDefaultNetwork());
-    const asset = parsePaymentAsset(parsed.data.asset ?? paymentAssets.GRAM.symbol);
+    const requestedAsset = parsed.data.asset ? parsePaymentAsset(parsed.data.asset) : null;
     assertNetworkAllowed(network);
 
     const reusableInvoice = await deps.repository.findReusableInvoice({
@@ -1330,6 +1476,24 @@ export async function createTonhubPaymentInvoice(
       };
     }
 
+    const asset = requestedAsset ?? parsePaymentAsset(deps.defaultCheckoutAsset(network));
+    const storedOrder = parsed.data.externalId && deps.repository.findOrderByExternalId
+      ? await deps.repository.findOrderByExternalId(parsed.data.externalId)
+      : null;
+    const orderPolicy = checkoutOrderPolicyFromStoredOrder(storedOrder) ?? deps.checkoutOrderPolicy(currency);
+    const grossFiatMicros = (BigInt(amountCents) * BigInt(10_000)).toString();
+    if (!storedOrder && BigInt(grossFiatMicros) < BigInt(orderPolicy.minimumOrderFiatMicros)) {
+      return {
+        status: 400,
+        body: {
+          errorCode: "TON_INVOICE_BELOW_MINIMUM",
+          error: `Minimum order is ${formatFiatMicros(orderPolicy.minimumOrderFiatMicros, currency)}.`,
+          minimumFiatMicros: orderPolicy.minimumOrderFiatMicros,
+          currency,
+        },
+      };
+    }
+
     if (!deps.checkoutAssetAvailable(asset.symbol, network, parsed.data.externalId)) {
       return {
         status: 400,
@@ -1341,60 +1505,44 @@ export async function createTonhubPaymentInvoice(
     }
 
     const createdAt = deps.now();
-    let quote: TonhubRateQuote;
-    if (asset.symbol === paymentAssets.USDT.symbol) {
+    const expiresAt = addMinutes(createdAt, invoiceTtlMinutes());
+    const quoteAssets = [asset];
+    for (const candidate of [paymentAssets.USDT, paymentAssets.GRAM] as const) {
+      if (
+        candidate.symbol !== asset.symbol &&
+        deps.checkoutAssetAvailable(candidate.symbol, network, parsed.data.externalId)
+      ) {
+        quoteAssets.push(candidate);
+      }
+    }
+    const quotes: TonhubCheckoutQuote[] = [];
+    for (const quoteAsset of quoteAssets) {
       const snapshot = await deps.findRateSnapshot({
-        asset: "USDT",
+        asset: quoteAsset.symbol,
         quoteCurrency: currency,
         at: createdAt,
         maxAgeMs: deps.rateSnapshotMaxAgeMs(),
       });
       if (!snapshot) {
-        throw new Error(`No fresh USDT/${currency} rate snapshot is available.`);
+        throw new Error(`No fresh ${quoteAsset.symbol}/${currency} rate snapshot is available.`);
       }
-      const amountAtomic = ceilAssetAtomicFromFiat({
+      const discountFiatMicros = quoteAsset.symbol === "GRAM"
+        ? orderPolicy.gramDiscountMaxFiatMicros
+        : "0";
+      quotes.push(buildCheckoutQuote({
+        asset: quoteAsset,
         amountCents,
-        fiatPerAsset: snapshot.price,
-        asset: paymentAssets.USDT,
-      });
-      quote = {
-        source: "usd-peg",
-        rateSnapshotId: snapshot.id,
-        asset: paymentAssets.USDT.symbol,
-        assetDecimals: paymentAssets.USDT.decimals,
-        fiatPerAsset: Number(snapshot.price),
-        amountAtomic,
-        amountFormatted: formatCheckoutAssetAmount(amountAtomic, paymentAssets.USDT),
-        fiatAmountCents: amountCents,
-        fiatAmount: amountCents / 100,
-        fiatCurrency: currency,
-        updatedAt: snapshot.observedAt,
-        fetchedAt: snapshot.fetchedAt,
-      };
-    } else {
-      const rate = await deps.fetchTonFiatRate(currency);
-      const amountNano = ceilTonAmountNanoFromFiat({
-        amountCents,
-        fiatPerTon: rate.fiatPerTon
-      });
-      quote = {
-        source: "coingecko",
-        asset: paymentAssets.GRAM.symbol,
-        assetDecimals: paymentAssets.GRAM.decimals,
-        fiatPerAsset: rate.fiatPerTon,
-        amountAtomic: amountNano,
-        amountFormatted: formatPaymentNanoTon(amountNano),
-        fiatAmountCents: amountCents,
-        fiatAmount: amountCents / 100,
-        fiatCurrency: currency,
-        fiatPerGram: rate.fiatPerTon,
-        fiatPerTon: rate.fiatPerTon,
-        amountNano,
-        amountGram: formatPaymentNanoTon(amountNano),
-        amountTon: formatPaymentNanoTon(amountNano),
-        updatedAt: rate.updatedAt,
-        fetchedAt: rate.fetchedAt
-      };
+        currency,
+        grossFiatMicros,
+        discountFiatMicros,
+        snapshot,
+        quotedAt: createdAt,
+        expiresAt,
+      }));
+    }
+    const quote = quotes.find((candidate) => candidate.asset === asset.symbol);
+    if (!quote) {
+      throw new Error(`Selected ${asset.symbol} quote was not created.`);
     }
     const depositAddress = deps.createTonDepositAddress({ network });
     const invoice = await deps.repository.createPendingInvoice({
@@ -1405,11 +1553,13 @@ export async function createTonhubPaymentInvoice(
       depositAddress,
       reference: deps.createTonInvoiceReference(process.env.TON_INVOICE_REFERENCE_PREFIX || "TONHUB"),
       quote,
+      quotes,
+      orderPolicy,
       metadata: parsed.data.metadata,
       createdAt,
-      expiresAt: addMinutes(createdAt, invoiceTtlMinutes()),
+      expiresAt,
       priceLockedAt: createdAt,
-      priceLockedUntil: addMinutes(createdAt, invoiceTtlMinutes()),
+      priceLockedUntil: expiresAt,
       activationThresholdFiatMicros: deps.movementSettlementEnabled()
         ? calculateActivationThresholdFiatMicros({
             orderFiatMicros: (BigInt(amountCents) * BigInt(10_000)).toString(),
@@ -1422,11 +1572,15 @@ export async function createTonhubPaymentInvoice(
       status: 200,
       body: {
         ok: true,
-        invoice: serializeInvoice(invoice, quote)
+        invoice: serializeInvoice(invoice, quote, quotes)
       }
     };
   } catch (error) {
-    if (error instanceof TonhubOrderTermsMismatchError || error instanceof TonhubOrderNotRetryableError) {
+    if (
+      error instanceof TonhubOrderTermsMismatchError ||
+      error instanceof TonhubOrderPolicyMismatchError ||
+      error instanceof TonhubOrderNotRetryableError
+    ) {
       return {
         status: 409,
         body: {

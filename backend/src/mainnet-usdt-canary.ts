@@ -1,7 +1,7 @@
 import { resolveAllowedNetworks } from "./config";
 import { resolveCheckoutAssetPolicy } from "./checkout-assets";
 
-const requiredMigration = "20260813107000_transactional_webhooks";
+const requiredMigration = "20260814100000_ton_checkout_policy_foundation";
 
 type CanaryDb = {
   $queryRawUnsafe: (query: string, ...values: unknown[]) => Promise<any[]>;
@@ -62,20 +62,22 @@ export async function inspectMainnetUsdtCanary(input: {
   }
 
   const maxAgeMs = snapshotMaxAgeMs(env);
-  const rateRows = await Promise.all(["USD", "EUR"].map(async (quoteCurrency) => ({
+  const rateRows = await Promise.all((["GRAM", "USDT"] as const).flatMap((asset) =>
+    (["USD", "EUR"] as const).map(async (quoteCurrency) => ({
+    asset,
     quoteCurrency,
     row: await input.db.tonhubRateSnapshot.findFirst({
-      where: { asset: "USDT", baseCurrency: "USDT", quoteCurrency },
+      where: { asset, baseCurrency: asset, quoteCurrency },
       orderBy: [{ observedAt: "desc" }, { id: "desc" }],
     }),
-  })));
-  for (const { quoteCurrency, row } of rateRows) {
+  }))));
+  for (const { asset, quoteCurrency, row } of rateRows) {
     if (!row || !(row.observedAt instanceof Date) || row.observedAt > now ||
         now.getTime() - row.observedAt.getTime() > maxAgeMs) {
-      blockers.push(`A fresh no-lookahead USDT/${quoteCurrency} rate snapshot is required.`);
+      blockers.push(`A fresh no-lookahead ${asset}/${quoteCurrency} rate snapshot is required.`);
       continue;
     }
-    if (quoteCurrency === "USD" && String(row.price) !== "1") {
+    if (asset === "USDT" && quoteCurrency === "USD" && String(row.price) !== "1") {
       blockers.push("The canary requires the exact 1 USDT = 1 USD snapshot policy.");
     }
   }

@@ -56,7 +56,7 @@ async function copyWithFallback(value: string) {
 }
 
 export function copyableAssetAmount(value: string) {
-  return value.replace(/\s*(?:GRAM\s*\(ex\s*TON\)|GRAM|TON|USDT)$/i, "").trim();
+  return value.replace(/\s*(?:GRAM\s*\(ex\s*TON\)|GRAM|TON|USDT|USD₮)$/i, "").trim();
 }
 
 export const copyableTonAmount = copyableAssetAmount;

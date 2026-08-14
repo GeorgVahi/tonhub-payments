@@ -26,7 +26,7 @@ const definitions = {
   }),
   USDT: Object.freeze({
     symbol: "USDT",
-    label: "USDT",
+    label: "USD₮",
     network: "TON",
     kind: "JETTON",
     decimals: 6,
