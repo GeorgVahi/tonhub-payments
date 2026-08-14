@@ -1,4 +1,4 @@
-import { Component, lazy, Suspense, useEffect, useMemo, useState, type ReactNode } from "react";
+import { Component, lazy, Suspense, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import {
   AlertTriangle,
   CheckCircle2,
@@ -12,6 +12,14 @@ import {
   TonManualTransferFields
 } from "./TonManualTransferFields";
 import { normalizeTonConnectManifestUrl } from "./ton-connect-manifest";
+import {
+  clearInvoiceResumeReference,
+  invoiceResumeStorageKey,
+  readInvoiceResumeReference,
+  requestInvoiceResume,
+  validInvoiceResumeId,
+  writeInvoiceResumeReference,
+} from "./invoice-resume";
 
 const TonConnectPayment = lazy(() => import("./TonConnectPayment").then((module) => ({
   default: module.TonConnectPayment,
@@ -69,7 +77,7 @@ type PaymentOption = {
   deeplink: string | null;
 };
 
-type TonhubInvoice = {
+export type TonhubInvoice = {
   id: string;
   externalId: string | null;
   network: TonNetwork;
@@ -154,10 +162,13 @@ export type TonhubPaymentWidgetProps = {
   initialCurrency?: FiatCurrency;
   initialNetwork?: TonNetwork;
   initialAsset?: PaymentAsset;
+  initialInvoiceId?: string;
+  resumeStorageKey?: string;
   externalId?: string;
   metadata?: unknown;
   tonConnectManifestUrl?: string;
   onPaid?: (invoice: TonhubInvoice) => void;
+  onInvoiceChange?: (invoice: TonhubInvoice | null) => void;
 };
 
 const statusLabels: Record<InvoiceStatus, string> = {
@@ -224,6 +235,17 @@ export function paymentRailAction(input: {
 }) {
   if (input.invoiceAsset === input.requestedAsset) return "selected" as const;
   return input.selectionLocked ? "top-up" as const : "switch" as const;
+}
+
+export function refreshedPaymentInstructionAsset(input: {
+  current: PaymentAsset | null;
+  invoiceAsset: PaymentAsset;
+  available: PaymentAsset[];
+  preserve: boolean;
+}) {
+  return input.preserve && input.current && input.available.includes(input.current)
+    ? input.current
+    : input.invoiceAsset;
 }
 
 export function immutablePaymentOptionSaving(
@@ -347,12 +369,19 @@ export function TonhubPaymentWidget({
   initialCurrency = "EUR",
   initialNetwork,
   initialAsset,
+  initialInvoiceId,
+  resumeStorageKey,
   externalId,
   metadata,
   tonConnectManifestUrl,
-  onPaid
+  onPaid,
+  onInvoiceChange,
 }: TonhubPaymentWidgetProps) {
   const base = useMemo(() => normalizeApiBase(apiBase), [apiBase]);
+  const resumeKey = useMemo(() => {
+    if (!resumeStorageKey?.trim()) return null;
+    return invoiceResumeStorageKey(base, resumeStorageKey);
+  }, [base, resumeStorageKey]);
   const tonConnectManifest = useMemo(
     () => normalizeTonConnectManifestUrl(tonConnectManifestUrl),
     [tonConnectManifestUrl],
@@ -383,6 +412,17 @@ export function TonhubPaymentWidget({
   const [notice, setNotice] = useState<WidgetNotice | null>(null);
   const [busy, setBusy] = useState(false);
   const [configReady, setConfigReady] = useState(false);
+  const [restoring, setRestoring] = useState(Boolean(initialInvoiceId || resumeStorageKey));
+  const [resumeBlocked, setResumeBlocked] = useState(false);
+  const [resumeRevision, setResumeRevision] = useState(0);
+  const onPaidRef = useRef(onPaid);
+  const onInvoiceChangeRef = useRef(onInvoiceChange);
+  const lastNotifiedInvoiceRef = useRef<string | null>(null);
+
+  useEffect(() => {
+    onPaidRef.current = onPaid;
+    onInvoiceChangeRef.current = onInvoiceChange;
+  }, [onInvoiceChange, onPaid]);
 
   useEffect(() => {
     let cancelled = false;
@@ -439,6 +479,97 @@ export function TonhubPaymentWidget({
   }, [base, initialAsset, initialNetwork]);
 
   useEffect(() => {
+    if (!configReady) return undefined;
+
+    let cancelled = false;
+    const explicitId = initialInvoiceId === undefined
+      ? null
+      : validInvoiceResumeId(initialInvoiceId);
+    if (initialInvoiceId !== undefined && !explicitId) {
+      setRestoring(false);
+      setResumeBlocked(true);
+      setNotice({
+        tone: "error",
+        title: "Saved payment could not be restored",
+        message: "The supplied invoice reference is invalid. Check the order link before creating another payment.",
+      });
+      return undefined;
+    }
+
+    const storedId = !explicitId && resumeKey
+      ? readInvoiceResumeReference(window.localStorage, resumeKey)
+      : null;
+    const invoiceId = explicitId ?? storedId;
+    if (!invoiceId) {
+      setRestoring(false);
+      setResumeBlocked(false);
+      return undefined;
+    }
+
+    setRestoring(true);
+    setResumeBlocked(false);
+    requestInvoiceResume<TonhubInvoice>({ apiBase: base, invoiceId })
+      .then((result) => {
+        if (cancelled) return;
+        if (result.state === "not-found" && storedId) {
+          if (resumeKey) clearInvoiceResumeReference(window.localStorage, resumeKey);
+          setResumeBlocked(false);
+          setNotice({
+            tone: "warning",
+            title: "Saved payment was not found",
+            message: "The saved browser reference is no longer available. You can create a new payment.",
+          });
+          return;
+        }
+        if (result.state !== "restored") {
+          throw new Error("Unable to restore invoice.");
+        }
+
+        presentInvoice(result.invoice);
+        if (result.invoice.status === "PARTIAL") {
+          setNotice({
+            tone: "info",
+            title: "Payment restored",
+            message: `${result.invoice.creditedFiatFormatted} is already credited. ${result.invoice.remainingFiatFormatted ?? "The outstanding balance"} remains to be paid.`,
+          });
+        } else if (result.invoice.status === "PENDING") {
+          setNotice({
+            tone: "info",
+            title: "Payment restored",
+            message: "Continue with the same unique TON address and exact amount shown below.",
+          });
+        } else {
+          setNotice(null);
+        }
+        if (result.invoice.status === "PAID") {
+          onPaidRef.current?.(result.invoice);
+        }
+      })
+      .catch(() => {
+        if (cancelled) return;
+        setResumeBlocked(true);
+        setNotice({
+          tone: "error",
+          title: "Saved payment could not be restored",
+          message: "The payment service did not return the saved invoice. Retry before creating another payment.",
+        });
+      })
+      .finally(() => {
+        if (!cancelled) setRestoring(false);
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [base, configReady, initialInvoiceId, resumeKey, resumeRevision]);
+
+  useEffect(() => {
+    if (resumeKey && invoice) {
+      writeInvoiceResumeReference(window.localStorage, resumeKey, invoice.id);
+    }
+  }, [invoice?.id, resumeKey]);
+
+  useEffect(() => {
     if (!invoice || !isPayable(invoice.status)) {
       return undefined;
     }
@@ -486,12 +617,9 @@ export function TonhubPaymentWidget({
         return;
       }
 
-      setInvoice(body.invoice);
-      setInstructionAsset(body.invoice.asset);
-      setAsset(body.invoice.asset);
-      setNetwork(body.invoice.network);
+      presentInvoice(body.invoice);
       if (body.finalized || body.invoice.status === "PAID") {
-        onPaid?.(body.invoice);
+        onPaidRef.current?.(body.invoice);
       }
     } catch {
       setNotice({
@@ -537,12 +665,7 @@ export function TonhubPaymentWidget({
         return;
       }
 
-      setInvoice(body.invoice);
-      setInstructionAsset((current) => body.invoice?.paymentOptions.some((option) => option.asset === current)
-        ? current
-        : body.invoice?.asset ?? null);
-      setAsset(body.invoice.asset);
-      setNetwork(body.invoice.network);
+      presentInvoice(body.invoice, { preserveInstruction: true });
       if (!response.ok) {
         if (!options.quiet) {
           setNotice(errorNotice({
@@ -557,7 +680,7 @@ export function TonhubPaymentWidget({
 
       if (body.finalized || body.invoice.status === "PAID") {
         setNotice(null);
-        onPaid?.(body.invoice);
+        onPaidRef.current?.(body.invoice);
       } else if (!options.quiet) {
         setNotice({
           tone: "info",
@@ -581,9 +704,41 @@ export function TonhubPaymentWidget({
   }
 
   function resetInvoice() {
+    if (resumeKey) clearInvoiceResumeReference(window.localStorage, resumeKey);
     setInvoice(null);
     setInstructionAsset(null);
     setNotice(null);
+    lastNotifiedInvoiceRef.current = null;
+    onInvoiceChangeRef.current?.(null);
+  }
+
+  function presentInvoice(
+    nextInvoice: TonhubInvoice,
+    options: { preserveInstruction?: boolean } = {},
+  ) {
+    setInvoice(nextInvoice);
+    setInstructionAsset((current) => refreshedPaymentInstructionAsset({
+      current,
+      invoiceAsset: nextInvoice.asset,
+      available: nextInvoice.paymentOptions.map((option) => option.asset),
+      preserve: options.preserveInstruction === true,
+    }));
+    setAsset(nextInvoice.asset);
+    setNetwork(nextInvoice.network);
+    setCurrency(nextInvoice.fiatCurrency);
+    setAmount((nextInvoice.fiatAmountCents / 100).toFixed(2));
+    const notificationFingerprint = [
+      nextInvoice.id,
+      nextInvoice.status,
+      nextInvoice.asset,
+      nextInvoice.creditedFiatMicros,
+      nextInvoice.remainingFiatMicros,
+      nextInvoice.amountAtomic,
+    ].join(":");
+    if (lastNotifiedInvoiceRef.current !== notificationFingerprint) {
+      lastNotifiedInvoiceRef.current = notificationFingerprint;
+      onInvoiceChangeRef.current?.(nextInvoice);
+    }
   }
 
   async function selectInvoicePaymentMethod(nextAsset: PaymentAsset) {
@@ -625,9 +780,7 @@ export function TonhubPaymentWidget({
         }
         return;
       }
-      setInvoice(body.invoice);
-      setAsset(body.invoice.asset);
-      setInstructionAsset(body.invoice.asset);
+      presentInvoice(body.invoice);
       setNotice({
         tone: "success",
         title: `Payment method changed to ${assetLabels[body.invoice.asset]}`,
@@ -690,6 +843,7 @@ export function TonhubPaymentWidget({
   const invoiceGramSaving = invoice
     ? immutablePaymentOptionSaving(invoice.paymentOptions, "GRAM")
     : null;
+  const checkoutLocked = busy || restoring || resumeBlocked || Boolean(invoice);
 
   return (
     <section className="tonhub-payment-widget" data-tonhub-payment-widget>
@@ -702,7 +856,7 @@ export function TonhubPaymentWidget({
             step="0.01"
             type="number"
             value={amount}
-            disabled={Boolean(invoice)}
+            disabled={checkoutLocked}
             onChange={(event) => setAmount(event.target.value)}
           />
           {minimumOrder ? <small>Minimum order: {minimumOrder}</small> : null}
@@ -711,7 +865,7 @@ export function TonhubPaymentWidget({
           <span>Currency</span>
           <select
             value={currency}
-            disabled={Boolean(invoice)}
+            disabled={checkoutLocked}
             onChange={(event) => setCurrency(event.target.value as FiatCurrency)}
           >
             <option value="EUR">EUR</option>
@@ -728,7 +882,7 @@ export function TonhubPaymentWidget({
                 type="button"
                 role="radio"
                 aria-checked={item === network}
-                disabled={!configReady || !allowedNetworks.includes(item) || busy || Boolean(invoice)}
+                disabled={!configReady || !allowedNetworks.includes(item) || checkoutLocked}
                 onClick={() => selectNetwork(item)}
               >
                 {item}
@@ -751,7 +905,7 @@ export function TonhubPaymentWidget({
                   type="button"
                   role="radio"
                   aria-checked={item === asset}
-                  disabled={!configReady || busy || Boolean(invoice)}
+                  disabled={!configReady || checkoutLocked}
                   onClick={() => setAsset(item)}
                 >
                   <strong>{assetLabels[item]}</strong>
@@ -766,11 +920,13 @@ export function TonhubPaymentWidget({
         <button
           className="tonhub-payment-widget__primary"
           type="button"
-          disabled={!configReady || busy || Boolean(invoice)}
+          disabled={!configReady || checkoutLocked}
           onClick={() => void createInvoice()}
         >
           {!configReady
             ? "Loading payment options..."
+            : restoring
+              ? "Restoring payment..."
             : busy
               ? "Creating..."
               : `Continue with ${assetLabels[asset]}`}
@@ -987,6 +1143,19 @@ export function TonhubPaymentWidget({
           <strong>{notice.title}</strong>
           <span>{notice.message}</span>
           {notice.code ? <code>{notice.code}</code> : null}
+          {resumeBlocked ? (
+            <button
+              className="tonhub-payment-widget__secondary"
+              type="button"
+              onClick={() => {
+                setRestoring(true);
+                setResumeBlocked(false);
+                setResumeRevision((value) => value + 1);
+              }}
+            >
+              Retry saved payment
+            </button>
+          ) : null}
         </div>
       ) : null}
     </section>

@@ -582,6 +582,9 @@ export function PaymentBox() {
       initialCurrency="EUR"
       initialNetwork="testnet"
       externalId="order-123"
+      initialInvoiceId={order.paymentInvoiceId ?? undefined}
+      resumeStorageKey={`order:${order.id}`}
+      onInvoiceChange={(invoice) => savePaymentInvoiceId(order.id, invoice?.id ?? null)}
     />
   );
 }
@@ -594,6 +597,17 @@ USD₮ first and labels it explicitly as Tether issued on TON. GRAM remains an
 alternative with the conditional full-GRAM saving. Tonhub, Tonkeeper, Trust
 Wallet, Wallet in Telegram, TON Connect, QR, deeplink, and exact manual fields
 share the same server-authoritative instruction.
+
+`externalId` must be the merchant's stable order identifier. Persist the invoice
+ID reported by `onInvoiceChange` with that order and pass it back as
+`initialInvoiceId` when the buyer returns from another browser or device. A
+non-sensitive, order-scoped `resumeStorageKey` additionally keeps only the
+opaque invoice ID in browser `localStorage`, so a closed or refreshed tab can
+restore the same `PENDING` or `PARTIAL` attempt automatically. Restoration
+always reloads the authoritative amounts and status from the API; it never
+trusts cached money fields and never creates a second invoice for the remainder.
+The demo also accepts `?invoice=<invoice-id>` once, stores the reference locally,
+and removes it from the address bar after a successful restore.
 
 ## Sweep Worker
 

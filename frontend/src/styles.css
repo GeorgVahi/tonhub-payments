@@ -683,6 +683,13 @@
   padding: 3px 8px;
 }
 
+.tonhub-payment-widget__notice > .tonhub-payment-widget__secondary {
+  width: fit-content;
+  min-height: 38px;
+  margin-top: 5px;
+  padding: 7px 12px;
+}
+
 @media (max-width: 900px) {
   .tonhub-payment-widget__form {
     grid-template-columns: repeat(2, minmax(0, 1fr));

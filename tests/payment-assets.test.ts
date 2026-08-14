@@ -37,12 +37,120 @@ import {
   immutablePaymentOptionSaving,
   paymentRailAction,
   PaymentStatusAnnouncement,
+  refreshedPaymentInstructionAsset,
   TonhubPaymentWidget,
 } from "../frontend/src/TonhubPaymentWidget";
 import {
   buildTonConnectTransaction,
 } from "../frontend/src/ton-connect-transaction";
 import { normalizeTonConnectManifestUrl } from "../frontend/src/ton-connect-manifest";
+import {
+  clearInvoiceResumeReference,
+  invoiceResumeUrl,
+  invoiceResumeStorageKey,
+  readInvoiceResumeReference,
+  requestInvoiceResume,
+  writeInvoiceResumeReference,
+} from "../frontend/src/invoice-resume";
+
+function memoryStorage() {
+  const values = new Map<string, string>();
+  return {
+    getItem: (key: string) => values.get(key) ?? null,
+    setItem: (key: string, value: string) => { values.set(key, value); },
+    removeItem: (key: string) => { values.delete(key); },
+  };
+}
+
+test("invoice resume references store only a validated opaque invoice id", () => {
+  const storage = memoryStorage();
+  const key = invoiceResumeStorageKey("/api/tonhub-payments/", "merchant-checkout");
+
+  assert.equal(key, "tonhub-payment-widget:resume:%2Fapi%2Ftonhub-payments:merchant-checkout");
+  assert.equal(
+    invoiceResumeUrl("/api/tonhub-payments/", "cmst2xb790003xjptfs2iit8m"),
+    "/api/tonhub-payments/invoices/cmst2xb790003xjptfs2iit8m",
+  );
+  assert.equal(readInvoiceResumeReference(storage, key), null);
+  assert.equal(writeInvoiceResumeReference(storage, key, "cmst2xb790003xjptfs2iit8m"), true);
+  assert.equal(readInvoiceResumeReference(storage, key), "cmst2xb790003xjptfs2iit8m");
+  assert.equal(writeInvoiceResumeReference(storage, key, "../../admin"), false);
+  assert.equal(readInvoiceResumeReference(storage, key), "cmst2xb790003xjptfs2iit8m");
+
+  clearInvoiceResumeReference(storage, key);
+  assert.equal(readInvoiceResumeReference(storage, key), null);
+});
+
+test("invoice resume storage fails closed on malformed or stale browser data", () => {
+  const storage = memoryStorage();
+  const key = invoiceResumeStorageKey("/api/tonhub-payments", "order:123");
+
+  storage.setItem(key, JSON.stringify({ version: 2, invoiceId: "cmst2xb790003xjptfs2iit8m" }));
+  assert.equal(readInvoiceResumeReference(storage, key), null);
+  assert.equal(storage.getItem(key), null);
+
+  storage.setItem(key, "not-json");
+  assert.equal(readInvoiceResumeReference(storage, key), null);
+  assert.equal(storage.getItem(key), null);
+  assert.throws(() => invoiceResumeStorageKey("/api/tonhub-payments", "   "), /non-empty/i);
+  assert.throws(() => invoiceResumeUrl("/api/tonhub-payments", "../../admin"), /invalid/i);
+});
+
+test("invoice resume reloads the authoritative server invoice and rejects mismatched responses", async () => {
+  const invoice = { id: "cmst2xb790003xjptfs2iit8m", status: "PARTIAL" };
+  const requestedUrls: string[] = [];
+  const restored = await requestInvoiceResume({
+    apiBase: "/api/tonhub-payments/",
+    invoiceId: invoice.id,
+    fetcher: async (url) => {
+      requestedUrls.push(url);
+      return { ok: true, status: 200, json: async () => ({ invoice }) };
+    },
+  });
+  assert.deepEqual(requestedUrls, [
+    "/api/tonhub-payments/invoices/cmst2xb790003xjptfs2iit8m",
+  ]);
+  assert.deepEqual(restored, { state: "restored", invoice });
+
+  const missing = await requestInvoiceResume({
+    apiBase: "/api/tonhub-payments",
+    invoiceId: invoice.id,
+    fetcher: async () => ({ ok: false, status: 404, json: async () => ({}) }),
+  });
+  assert.deepEqual(missing, { state: "not-found" });
+
+  const mismatched = await requestInvoiceResume({
+    apiBase: "/api/tonhub-payments",
+    invoiceId: invoice.id,
+    fetcher: async () => ({
+      ok: true,
+      status: 200,
+      json: async () => ({ invoice: { ...invoice, id: "different-invoice" } }),
+    }),
+  });
+  assert.deepEqual(mismatched, { state: "failed" });
+});
+
+test("invoice refresh preserves an explicitly opened top-up rail", () => {
+  assert.equal(refreshedPaymentInstructionAsset({
+    current: "GRAM",
+    invoiceAsset: "USDT",
+    available: ["USDT", "GRAM"],
+    preserve: true,
+  }), "GRAM");
+  assert.equal(refreshedPaymentInstructionAsset({
+    current: "GRAM",
+    invoiceAsset: "USDT",
+    available: ["USDT"],
+    preserve: true,
+  }), "USDT");
+  assert.equal(refreshedPaymentInstructionAsset({
+    current: "GRAM",
+    invoiceAsset: "USDT",
+    available: ["USDT", "GRAM"],
+    preserve: false,
+  }), "USDT");
+});
 
 test("the asset registry and default-off public policy keep testnet GRAM-only", async () => {
   assert.deepEqual(

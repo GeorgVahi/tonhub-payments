@@ -1,3 +1,3 @@
 export { TonhubPaymentWidget } from "./TonhubPaymentWidget";
-export type { TonhubPaymentWidgetProps } from "./TonhubPaymentWidget";
+export type { TonhubInvoice, TonhubPaymentWidgetProps } from "./TonhubPaymentWidget";
 
