@@ -65,7 +65,7 @@
   grid-template-areas:
     "amount currency network primary"
     "asset asset asset asset";
-  align-items: end;
+  align-items: start;
 }
 
 .tonhub-payment-widget__form > :nth-child(1) {
@@ -103,7 +103,14 @@
   font-size: 0.76rem;
   font-weight: 700;
   letter-spacing: 0;
+  line-height: 1.2;
   text-transform: uppercase;
+}
+
+@media (min-width: 901px) {
+  .tonhub-payment-widget__form > .tonhub-payment-widget__primary {
+    margin-top: calc(0.76rem * 1.2 + 7px);
+  }
 }
 
 .tonhub-payment-widget input,
@@ -246,7 +253,7 @@
 
 .tonhub-payment-widget__summary {
   display: grid;
-  grid-template-columns: repeat(4, minmax(0, 1fr));
+  grid-template-columns: repeat(3, minmax(0, 1fr));
   gap: 10px;
 }
 
@@ -527,6 +534,8 @@
 }
 
 .tonhub-payment-widget__wallet-note {
+  justify-self: center;
+  width: 100%;
   max-width: 65ch;
   margin: 0;
   color: var(--tonhub-muted-strong);
@@ -675,8 +684,7 @@
 }
 
 @media (max-width: 900px) {
-  .tonhub-payment-widget__form,
-  .tonhub-payment-widget__summary {
+  .tonhub-payment-widget__form {
     grid-template-columns: repeat(2, minmax(0, 1fr));
   }
 

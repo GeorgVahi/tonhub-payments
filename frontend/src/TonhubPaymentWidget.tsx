@@ -801,6 +801,16 @@ export function TonhubPaymentWidget({
               <span>{assetLabels[invoice.asset]} remaining</span>
               <strong>{invoice.amountFormatted}</strong>
             </div>
+            {invoice.quote ? (
+              <div>
+                <span>Rate</span>
+                <strong>1 {invoice.asset} = {formatRate(invoice.quote.fiatPerAsset, invoice.fiatCurrency)}</strong>
+              </div>
+            ) : null}
+            <div>
+              <span>Locked until</span>
+              <strong>{formatDateTime(invoice.priceLockedUntil)}</strong>
+            </div>
             {invoice.status === "PARTIAL" ? (
               <>
                 <div>
@@ -813,16 +823,6 @@ export function TonhubPaymentWidget({
                 </div>
               </>
             ) : null}
-            {invoice.quote ? (
-              <div>
-                <span>Rate</span>
-                <strong>1 {invoice.asset} = {formatRate(invoice.quote.fiatPerAsset, invoice.fiatCurrency)}</strong>
-              </div>
-            ) : null}
-            <div>
-              <span>Locked until</span>
-              <strong>{formatDateTime(invoice.priceLockedUntil)}</strong>
-            </div>
           </div>
 
           {isPayable(invoice.status) ? (
