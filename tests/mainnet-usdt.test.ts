@@ -183,6 +183,155 @@ test("mainnet adapter verifies the official master wallet and journals productio
   });
 });
 
+test("mainnet adapter completes an empty horizon before the recipient jetton wallet is deployed", async () => {
+  let accountWrites = 0;
+  let ledgerWrites = 0;
+  const urls: URL[] = [];
+  const adapter = createMainnetUsdtAdapter({
+    db: {
+      tonhubDepositAddress: {
+        findUnique: async () => ({
+          id: "deposit-without-usdt-wallet",
+          network: "mainnet",
+          address: ownerFriendly,
+          addressRaw: ownerRaw,
+        }),
+      },
+      tonhubDepositAssetAccount: {
+        findUnique: async () => null,
+        upsert: async () => {
+          accountWrites += 1;
+          return null;
+        },
+      },
+    } as any,
+    ledger: {
+      recordObserved: async () => { ledgerWrites += 1; },
+      recordRejected: async () => { ledgerWrites += 1; },
+    },
+    config: resolveMainnetUsdtAdapterConfig({
+      TON_USDT_MAINNET_ADAPTER_ENABLED: "true",
+    })!,
+    resolveReadConfig: () => ({
+      network: "mainnet",
+      baseUrl: "https://toncenter.com/api/v3",
+      address: "",
+      addressEnvName: "",
+    }),
+    fetchImpl: (async (input: string | URL | Request) => {
+      const url = new URL(String(input));
+      urls.push(url);
+      if (url.pathname.endsWith("/jetton/masters")) {
+        return new Response(JSON.stringify({
+          jetton_masters: [{
+            address: officialMainnetUsdtMasterAddress,
+            jetton_content: { decimals: "6" },
+          }],
+        }), { status: 200 });
+      }
+      if (url.pathname.endsWith("/jetton/wallets")) {
+        return new Response(JSON.stringify({ jetton_wallets: [] }), { status: 200 });
+      }
+      return new Response(JSON.stringify({ jetton_transfers: [] }), { status: 200 });
+    }) as typeof fetch,
+    now: () => notAfter,
+  });
+
+  const result = await adapter.observeDeposit({
+    depositAddressId: "deposit-without-usdt-wallet",
+    notBefore,
+    notAfter,
+  });
+
+  assert.equal(result.account, null);
+  assert.equal(result.transfersScanned, 0);
+  assert.equal(result.discoveryTransfersScanned, 0);
+  assert.equal(result.notificationTransactionsScanned, 0);
+  assert.equal(result.movementsObserved, 0);
+  assert.equal(result.rejectionsRecorded, 0);
+  assert.equal(accountWrites, 0);
+  assert.equal(ledgerWrites, 0);
+  assert.deepEqual(urls.map(({ pathname }) => pathname), [
+    "/api/v3/jetton/masters",
+    "/api/v3/jetton/wallets",
+    "/api/v3/jetton/transfers",
+    "/api/v3/jetton/transfers",
+  ]);
+});
+
+test("mainnet adapter cannot advance an empty-wallet horizon when provider transfers already exist", async () => {
+  let writes = 0;
+  const transfer = {
+    amount: "5000000",
+    destination: ownerFriendly,
+    jetton_master: officialMainnetUsdtMasterAddress,
+    query_id: "42",
+    source: senderFriendly,
+    source_wallet: senderWalletFriendly,
+    transaction_aborted: false,
+    transaction_hash: transactionHash,
+    transaction_lt: "900001",
+    transaction_now: 1_786_615_800,
+  };
+  const adapter = createMainnetUsdtAdapter({
+    db: {
+      tonhubDepositAddress: {
+        findUnique: async () => ({
+          id: "deposit-lagging-usdt-wallet",
+          network: "mainnet",
+          address: ownerFriendly,
+          addressRaw: ownerRaw,
+        }),
+      },
+      tonhubDepositAssetAccount: {
+        findUnique: async () => null,
+        upsert: async () => {
+          writes += 1;
+          return null;
+        },
+      },
+    } as any,
+    ledger: {
+      recordObserved: async () => { writes += 1; },
+      recordRejected: async () => { writes += 1; },
+    },
+    config: resolveMainnetUsdtAdapterConfig({
+      TON_USDT_MAINNET_ADAPTER_ENABLED: "true",
+    })!,
+    resolveReadConfig: () => ({
+      network: "mainnet",
+      baseUrl: "https://toncenter.com/api/v3",
+      address: "",
+      addressEnvName: "",
+    }),
+    fetchImpl: (async (input: string | URL | Request) => {
+      const url = new URL(String(input));
+      if (url.pathname.endsWith("/jetton/masters")) {
+        return new Response(JSON.stringify({
+          jetton_masters: [{
+            address: officialMainnetUsdtMasterAddress,
+            jetton_content: { decimals: "6" },
+          }],
+        }), { status: 200 });
+      }
+      if (url.pathname.endsWith("/jetton/wallets")) {
+        return new Response(JSON.stringify({ jetton_wallets: [] }), { status: 200 });
+      }
+      return new Response(JSON.stringify({ jetton_transfers: [transfer] }), { status: 200 });
+    }) as typeof fetch,
+  });
+
+  await assert.rejects(
+    adapter.observeDeposit({
+      depositAddressId: "deposit-lagging-usdt-wallet",
+      notBefore,
+      notAfter,
+    }),
+    /transfers exist before its wallet can be verified/,
+  );
+  assert.equal(writes, 0);
+});
+
 test("mainnet adapter refuses a testnet deposit before provider or ledger I/O", async () => {
   let fetches = 0;
   let writes = 0;

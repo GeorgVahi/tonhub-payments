@@ -24,6 +24,8 @@ export type TonCenterMessage = {
   destination?: string;
   source?: string;
   value?: string;
+  bounce?: boolean;
+  bounced?: boolean;
   message_content?: {
     decoded?: unknown;
   } | null;
@@ -34,8 +36,19 @@ export type TonCenterTransaction = {
   lt?: string;
   now?: number;
   in_msg?: TonCenterMessage | null;
+  orig_status?: string;
+  end_status?: string;
+  finality?: string;
   description?: {
     aborted?: boolean;
+    credit_first?: boolean;
+    credit_ph?: {
+      credit?: string;
+    } | null;
+    compute_ph?: {
+      skipped?: boolean;
+      reason?: string;
+    } | null;
     action?: {
       success?: boolean;
     } | null;

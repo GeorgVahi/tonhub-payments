@@ -143,6 +143,69 @@ test("GRAM shadow parser rejects unsuccessful, malformed, foreign, non-positive,
   assert.deepEqual(result.rejections.map(({ code }) => code), cases.map(({ expected }) => expected));
 });
 
+test("GRAM shadow parser accepts only finalized non-bounce credit into an uninitialized deposit wallet", () => {
+  const creditedUninitialized = transaction({
+    description: {
+      aborted: true,
+      credit_first: true,
+      credit_ph: { credit: "1500000000" },
+      compute_ph: { skipped: true, reason: "no_state" },
+      action: null,
+    },
+    in_msg: {
+      source: sourceRaw,
+      destination: destinationRaw,
+      value: "1500000000",
+      bounce: false,
+      bounced: false,
+    },
+    orig_status: "nonexist",
+    end_status: "uninit",
+    finality: "finalized",
+  } as TonCenterTransaction);
+
+  const accepted = scan([creditedUninitialized]);
+  assert.equal(accepted.rejections.length, 0);
+  assert.equal(accepted.movements.length, 1);
+  assert.equal(accepted.movements[0]?.amountAtomic, "1500000000");
+  assert.deepEqual(accepted.movements[0]?.rawPayload, {
+    evidenceVersion: 1,
+    provider: "toncenter-v3",
+    transaction: {
+      hash: hashHex,
+      lt: "900001",
+      now: 1786615800,
+      successful: false,
+      creditedUninitialized: true,
+      source: sourceRaw,
+      destination: destinationRaw,
+      value: "1500000000",
+    },
+  });
+
+  const unsafeVariants = [
+    { ...creditedUninitialized, finality: "unfinalized" },
+    { ...creditedUninitialized, end_status: "nonexist" },
+    {
+      ...creditedUninitialized,
+      description: { ...creditedUninitialized.description, credit_ph: { credit: "1499999999" } },
+    },
+    {
+      ...creditedUninitialized,
+      in_msg: { ...creditedUninitialized.in_msg, bounce: true },
+    },
+    {
+      ...creditedUninitialized,
+      in_msg: { ...creditedUninitialized.in_msg, bounced: true },
+    },
+  ] as TonCenterTransaction[];
+  const rejected = scan(unsafeVariants);
+  assert.equal(rejected.movements.length, 0);
+  assert.deepEqual(rejected.rejections.map(({ code }) => code), unsafeVariants.map(
+    () => "TRANSACTION_NOT_SUCCESSFUL",
+  ));
+});
+
 test("GRAM shadow parser rejects base64 transaction hashes with ignored junk or non-canonical padding", () => {
   const result = scan([
     transaction({ hash: `${hashBase64Url}!` }),

@@ -87,6 +87,28 @@ function positiveAtomic(value: unknown) {
   return BigInt(amount).toString();
 }
 
+function creditedUninitializedAmount(transaction: TonCenterTransaction) {
+  const description = transaction.description;
+  const message = transaction.in_msg;
+  if (
+    transaction.finality !== "finalized" ||
+    (transaction.orig_status !== "nonexist" && transaction.orig_status !== "uninit") ||
+    transaction.end_status !== "uninit" ||
+    description?.aborted !== true ||
+    description.credit_first !== true ||
+    description.compute_ph?.skipped !== true ||
+    description.compute_ph.reason !== "no_state" ||
+    description.action != null ||
+    message?.bounce !== false ||
+    message.bounced !== false
+  ) {
+    return null;
+  }
+  const messageValue = positiveAtomic(message.value);
+  const creditedValue = positiveAtomic(description.credit_ph?.credit);
+  return messageValue && creditedValue === messageValue ? creditedValue : null;
+}
+
 function rejection(
   transaction: TonCenterTransaction,
   code: GramShadowRejectionCode,
@@ -150,10 +172,12 @@ export function scanGramShadowTransactions(input: {
       rejections.push(rejection(transaction, "TRANSACTION_OUTSIDE_WINDOW"));
       continue;
     }
-    if (
-      transaction.description?.aborted !== false ||
-      transaction.description.action?.success !== true
-    ) {
+    const successful = transaction.description?.aborted === false &&
+      transaction.description.action?.success === true;
+    const creditedWhileUninitialized = successful
+      ? null
+      : creditedUninitializedAmount(transaction);
+    if (!successful && !creditedWhileUninitialized) {
       rejections.push(rejection(transaction, "TRANSACTION_NOT_SUCCESSFUL"));
       continue;
     }
@@ -172,7 +196,7 @@ export function scanGramShadowTransactions(input: {
       rejections.push(rejection(transaction, "SOURCE_INVALID"));
       continue;
     }
-    const amountAtomic = positiveAtomic(message.value);
+    const amountAtomic = creditedWhileUninitialized ?? positiveAtomic(message.value);
     if (!amountAtomic) {
       rejections.push(rejection(transaction, "AMOUNT_INVALID"));
       continue;
@@ -199,7 +223,8 @@ export function scanGramShadowTransactions(input: {
           hash,
           lt,
           now: Math.floor(blockchainAt.getTime() / 1000),
-          successful: true,
+          successful,
+          ...(creditedWhileUninitialized ? { creditedUninitialized: true } : {}),
           source,
           destination,
           value: amountAtomic,

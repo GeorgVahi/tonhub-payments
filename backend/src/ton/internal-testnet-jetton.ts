@@ -786,8 +786,72 @@ export function createVerifiedJettonAdapter(
       const uniqueWalletAddresses = [...new Set(exactWallets
         .map((wallet) => canonicalTonAddress(wallet.address))
         .filter((value): value is string => Boolean(value)))];
-      if (uniqueWalletAddresses.length !== 1) {
+      if (uniqueWalletAddresses.length > 1) {
         throw new Error(`TON Center must return exactly one verified ${profile.name} wallet.`);
+      }
+      if (uniqueWalletAddresses.length === 0) {
+        const storedAccount = await dependencies.db.tonhubDepositAssetAccount.findUnique?.({
+          where: {
+            depositAddressId_asset: {
+              depositAddressId: deposit.id,
+              asset: paymentAssets.USDT.symbol,
+            },
+          },
+        }) ?? null;
+        const startUtime = Math.max(0, Math.floor(input.notBefore.getTime() / 1000) - 1);
+        const endUtime = Math.floor(input.notAfter.getTime() / 1000) + 1;
+        const transfersPayload = requireRecord(await fetchJson({
+          config: readConfig,
+          path: "jetton/transfers",
+          search: {
+            owner_address: ownerAddressRaw,
+            jetton_master: configuredMaster,
+            direction: "in",
+            start_utime: startUtime,
+            end_utime: endUtime,
+            limit,
+            offset,
+            sort: "asc",
+          },
+          fetchImpl,
+        }), "Jetton transfers");
+        const discoveryPayload = requireRecord(await fetchJson({
+          config: readConfig,
+          path: "jetton/transfers",
+          search: {
+            owner_address: ownerAddressRaw,
+            direction: "in",
+            start_utime: startUtime,
+            end_utime: endUtime,
+            limit,
+            offset,
+            sort: "asc",
+          },
+          fetchImpl,
+        }), "Jetton discovery transfers");
+        const transfers = requireArray(
+          transfersPayload.jetton_transfers,
+          "Jetton transfers",
+        );
+        const discoveryTransfers = requireArray(
+          discoveryPayload.jetton_transfers,
+          "Jetton discovery transfers",
+        );
+        if (storedAccount || transfers.length > 0 || discoveryTransfers.length > 0) {
+          throw new Error(
+            `${profile.name} transfers exist before its wallet can be verified.`,
+          );
+        }
+        return {
+          account: null,
+          transfersScanned: 0,
+          discoveryTransfersScanned: 0,
+          notificationTransactionsScanned: 0,
+          movementsObserved: 0,
+          rejectionsRecorded: 0,
+          rejections: [],
+          nextOffset: offset + limit,
+        };
       }
       const assetWalletAddress = uniqueWalletAddresses[0];
       const verifiedAt = clock();
