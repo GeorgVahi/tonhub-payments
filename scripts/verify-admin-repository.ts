@@ -102,6 +102,8 @@ async function main() {
       expiresAt: new Date("2026-08-13T11:00:00.000Z"),
       priceLockedAt: baseTime,
       priceLockedUntil: new Date("2026-08-13T11:00:00.000Z"),
+      createdAt: baseTime,
+      updatedAt: baseTime,
     },
   });
   await prisma.tonhubDepositAddress.create({

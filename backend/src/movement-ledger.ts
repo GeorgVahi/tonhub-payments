@@ -77,8 +77,10 @@ type PrismaLike = {
   $queryRawUnsafe: <T = unknown>(query: string, ...values: unknown[]) => Promise<T>;
   tonhubPaymentMovement: any;
   tonhubMovementAllocation: any;
+  tonhubOrderAdjustment: any;
   tonhubPaymentOrder: any;
   tonhubPaymentInvoice: any;
+  tonhubPaymentQuote: any;
   tonhubDepositAddress: any;
   tonhubDepositAssetAccount: any;
   tonhubAssetSweep: any;
@@ -319,6 +321,7 @@ async function enqueueOfficialUsdtSweep(tx: PrismaLike, movement: PaymentMovemen
     movement.asset !== "USDT" ||
     movement.assetKind !== "JETTON" ||
     movement.assetDecimals !== 6 ||
+    movement.status === "REJECTED" ||
     canonicalTonAddress(movement.jettonMasterAddress) !== officialMainnetUsdtMasterAddress ||
     !officialUsdtPayload(movement.rawPayload) ||
     !movement.depositAddressId
@@ -539,6 +542,40 @@ async function lockMovement(tx: PrismaLike, movementId: string) {
   );
 }
 
+async function lockObservedMovementOrder(
+  tx: PrismaLike,
+  movement: PaymentMovementDraft,
+) {
+  if (movement.direction !== "INCOMING" || !movement.depositAddressId) {
+    return;
+  }
+  await tx.$queryRawUnsafe(
+    `SELECT payment_order."id"
+     FROM "TonhubDepositAddress" AS deposit
+     JOIN "TonhubPaymentInvoice" AS invoice ON invoice."id" = deposit."invoiceId"
+     JOIN "TonhubPaymentOrder" AS payment_order ON payment_order."id" = invoice."orderId"
+     WHERE deposit."id" = $1
+     FOR UPDATE OF payment_order`,
+    movement.depositAddressId,
+  );
+}
+
+async function lockObservedMovementSelection(
+  tx: PrismaLike,
+  movement: PaymentMovementDraft,
+) {
+  if (movement.direction !== "INCOMING" || !movement.depositAddressId) {
+    return;
+  }
+  const deposit = await tx.tonhubDepositAddress.findUnique({
+    where: { id: movement.depositAddressId },
+    include: { invoice: true },
+  });
+  if (deposit?.invoice) {
+    await lockInvoicePaymentSelection(tx, deposit.invoice, movement.blockchainAt);
+  }
+}
+
 async function orderAllocationSummary(tx: PrismaLike, orderId: string, obligation: bigint) {
   const rows = await tx.tonhubMovementAllocation.findMany({
     where: { orderId },
@@ -575,6 +612,262 @@ async function orderAllocationSummary(tx: PrismaLike, orderId: string, obligatio
   return { netCredit, paidAt, paidMovement, activeCredits };
 }
 
+type OrderAdjustmentRecord = {
+  id: string;
+  idempotencyKey: string;
+  orderId: string;
+  invoiceId: string;
+  quoteId: string;
+  kind: "PAYMENT_METHOD_DISCOUNT" | "REVERSAL";
+  reversesAdjustmentId: string | null;
+  fiatAmountMicros: string;
+  fiatCurrency: string;
+  reason: string;
+  evidence: unknown;
+};
+
+function normalizeOrderAdjustment(value: unknown): OrderAdjustmentRecord {
+  if (!value || typeof value !== "object") {
+    throw new MovementAllocationConflictError("Order adjustment evidence is missing.");
+  }
+  const row = value as OrderAdjustmentRecord;
+  if (
+    (row.kind !== "PAYMENT_METHOD_DISCOUNT" && row.kind !== "REVERSAL") ||
+    !row.id ||
+    !row.idempotencyKey ||
+    !row.orderId ||
+    !row.invoiceId ||
+    !row.quoteId ||
+    !row.fiatCurrency ||
+    !row.reason
+  ) {
+    throw new MovementAllocationConflictError("Order adjustment evidence is malformed.");
+  }
+  nonNegativeInteger(row.fiatAmountMicros, "Order adjustment fiatAmountMicros");
+  if (
+    (row.kind === "PAYMENT_METHOD_DISCOUNT" && row.reversesAdjustmentId !== null) ||
+    (row.kind === "REVERSAL" && !row.reversesAdjustmentId)
+  ) {
+    throw new MovementAllocationConflictError("Order adjustment lifecycle is malformed.");
+  }
+  return row;
+}
+
+async function orderAdjustmentSummary(tx: PrismaLike, orderId: string) {
+  const rows: OrderAdjustmentRecord[] = (await tx.tonhubOrderAdjustment.findMany({ where: { orderId } }))
+    .map(normalizeOrderAdjustment);
+  const reversedIds = new Set(
+    rows
+      .filter((row) => row.kind === "REVERSAL" && row.reversesAdjustmentId)
+      .map((row) => row.reversesAdjustmentId as string),
+  );
+  const activeDiscounts = rows.filter((row) => (
+    row.kind === "PAYMENT_METHOD_DISCOUNT" && !reversedIds.has(row.id)
+  ));
+  const netDiscount = rows.reduce((sum, row) => (
+    row.kind === "PAYMENT_METHOD_DISCOUNT"
+      ? sum + BigInt(row.fiatAmountMicros)
+      : sum - BigInt(row.fiatAmountMicros)
+  ), BigInt(0));
+  if (netDiscount < BigInt(0)) {
+    throw new MovementAllocationConflictError(`Order ${orderId} has a negative adjustment balance.`);
+  }
+  return { rows, activeDiscounts, netDiscount };
+}
+
+function sameAdjustmentFacts(
+  left: OrderAdjustmentRecord,
+  right: Omit<OrderAdjustmentRecord, "id">,
+) {
+  return left.idempotencyKey === right.idempotencyKey &&
+    left.orderId === right.orderId &&
+    left.invoiceId === right.invoiceId &&
+    left.quoteId === right.quoteId &&
+    left.kind === right.kind &&
+    left.reversesAdjustmentId === right.reversesAdjustmentId &&
+    left.fiatAmountMicros === right.fiatAmountMicros &&
+    left.fiatCurrency === right.fiatCurrency &&
+    left.reason === right.reason &&
+    jsonIdentity(left.evidence) === jsonIdentity(right.evidence);
+}
+
+async function createIdempotentOrderAdjustment(
+  tx: PrismaLike,
+  input: Omit<OrderAdjustmentRecord, "id">,
+) {
+  try {
+    return normalizeOrderAdjustment(await tx.tonhubOrderAdjustment.create({
+      data: {
+        ...input,
+        evidence: input.evidence as Prisma.InputJsonValue,
+      },
+    }));
+  } catch (error) {
+    if (!isP2002(error)) throw error;
+    const stored = normalizeOrderAdjustment(await tx.tonhubOrderAdjustment.findUnique({
+      where: { idempotencyKey: input.idempotencyKey },
+    }));
+    if (!sameAdjustmentFacts(stored, input)) {
+      throw new MovementAllocationConflictError(
+        `Order adjustment ${input.idempotencyKey} conflicts with immutable evidence.`,
+      );
+    }
+    return stored;
+  }
+}
+
+async function reverseActivePaymentMethodDiscounts(tx: PrismaLike, input: {
+  orderId: string;
+  cause: string;
+  evidence: Record<string, unknown>;
+}) {
+  const summary = await orderAdjustmentSummary(tx, input.orderId);
+  for (const discount of summary.activeDiscounts) {
+    await createIdempotentOrderAdjustment(tx, {
+      idempotencyKey: `payment-method-discount-reversal:${discount.id}`,
+      orderId: discount.orderId,
+      invoiceId: discount.invoiceId,
+      quoteId: discount.quoteId,
+      kind: "REVERSAL",
+      reversesAdjustmentId: discount.id,
+      fiatAmountMicros: discount.fiatAmountMicros,
+      fiatCurrency: discount.fiatCurrency,
+      reason: input.cause,
+      evidence: input.evidence,
+    });
+  }
+}
+
+async function lockInvoicePaymentSelection(
+  tx: PrismaLike,
+  invoice: any,
+  lockedAt: Date,
+) {
+  const selectedAsset = parsePaymentAsset(invoice.checkoutAsset ?? invoice.asset ?? "GRAM").symbol;
+  if (invoice.paymentSelectionLockedAt !== null && invoice.paymentSelectionLockedAt !== undefined) {
+    if (
+      !validDate(invoice.paymentSelectionLockedAt) ||
+      invoice.paymentSelectionLockedAsset !== selectedAsset
+    ) {
+      throw new MovementAllocationConflictError(
+        `Invoice ${invoice.id} has inconsistent payment-selection evidence.`,
+      );
+    }
+    return invoice;
+  }
+  if (invoice.paymentSelectionLockedAsset !== null && invoice.paymentSelectionLockedAsset !== undefined) {
+    throw new MovementAllocationConflictError(
+      `Invoice ${invoice.id} has incomplete payment-selection evidence.`,
+    );
+  }
+  const locked = await tx.tonhubPaymentInvoice.updateMany({
+    where: {
+      id: invoice.id,
+      paymentSelectionLockedAsset: null,
+      paymentSelectionLockedAt: null,
+    },
+    data: {
+      paymentSelectionLockedAsset: selectedAsset,
+      paymentSelectionLockedAt: lockedAt,
+    },
+  });
+  if (locked.count === 1) {
+    return {
+      ...invoice,
+      paymentSelectionLockedAsset: selectedAsset,
+      paymentSelectionLockedAt: lockedAt,
+    };
+  }
+  const current = await tx.tonhubPaymentInvoice.findUnique({ where: { id: invoice.id } });
+  if (
+    !current ||
+    current.paymentSelectionLockedAsset !== selectedAsset ||
+    !validDate(current.paymentSelectionLockedAt)
+  ) {
+    throw new MovementAllocationConflictError(
+      `Invoice ${invoice.id} payment selection changed concurrently.`,
+    );
+  }
+  return { ...invoice, ...current };
+}
+
+async function applyEligibleGramOnlyDiscount(tx: PrismaLike, input: {
+  order: any;
+  invoice: any;
+  forceRecovery: boolean;
+  movement: PaymentMovementRecord;
+  hasOtherUnresolvedMovements: boolean;
+}) {
+  if (
+    input.forceRecovery ||
+    input.hasOtherUnresolvedMovements ||
+    input.invoice.checkoutAsset !== "GRAM" ||
+    input.invoice.paymentSelectionLockedAsset !== "GRAM"
+  ) {
+    return null;
+  }
+  const obligation = BigInt(input.order.fiatAmountMicros);
+  const allocationSummary = await orderAllocationSummary(tx, input.order.id, obligation);
+  if (
+    allocationSummary.activeCredits.length === 0 ||
+    allocationSummary.activeCredits.some(({ movement }) => movement.asset !== "GRAM") ||
+    allocationSummary.netCredit >= obligation
+  ) {
+    return null;
+  }
+  const adjustmentSummary = await orderAdjustmentSummary(tx, input.order.id);
+  if (adjustmentSummary.activeDiscounts.length > 0) {
+    return adjustmentSummary.activeDiscounts[0];
+  }
+  const quote = await tx.tonhubPaymentQuote.findFirst({
+    where: {
+      orderId: input.order.id,
+      invoiceId: input.invoice.id,
+      asset: "GRAM",
+    },
+  });
+  if (!quote) return null;
+  const quoteGross = BigInt(nonNegativeInteger(quote.grossFiatMicros, "GRAM quote grossFiatMicros"));
+  const quoteDiscount = BigInt(nonNegativeInteger(
+    quote.discountFiatMicros,
+    "GRAM quote discountFiatMicros",
+  ));
+  const quoteNet = BigInt(nonNegativeInteger(quote.netFiatMicros, "GRAM quote netFiatMicros"));
+  if (
+    quote.orderId !== input.order.id ||
+    quote.invoiceId !== input.invoice.id ||
+    quote.asset !== "GRAM" ||
+    quote.fiatCurrency !== input.order.fiatCurrency ||
+    quoteGross !== obligation ||
+    quoteGross !== quoteNet + quoteDiscount
+  ) {
+    throw new MovementAllocationConflictError("The GRAM discount quote has inconsistent ownership or value.");
+  }
+  const shortfall = obligation - allocationSummary.netCredit;
+  if (quoteDiscount === BigInt(0) || allocationSummary.netCredit < quoteNet || shortfall > quoteDiscount) {
+    return null;
+  }
+  return createIdempotentOrderAdjustment(tx, {
+    idempotencyKey: `payment-method-discount:${input.order.id}`,
+    orderId: input.order.id,
+    invoiceId: input.invoice.id,
+    quoteId: quote.id,
+    kind: "PAYMENT_METHOD_DISCOUNT",
+    reversesAdjustmentId: null,
+    fiatAmountMicros: shortfall.toString(),
+    fiatCurrency: input.order.fiatCurrency,
+    reason: "GRAM_ONLY_SETTLEMENT",
+    evidence: {
+      selectedAsset: "GRAM",
+      observedAssets: ["GRAM"],
+      creditedFiatMicros: allocationSummary.netCredit.toString(),
+      grossFiatMicros: obligation.toString(),
+      closingMovementId: input.movement.id,
+      closingMovementBlockchainAt: input.movement.blockchainAt.toISOString(),
+    },
+  });
+}
+
 async function assertOrderAccountingBaseline(tx: PrismaLike, order: any) {
   const summary = await orderAllocationSummary(
     tx,
@@ -587,7 +880,17 @@ async function assertOrderAccountingBaseline(tx: PrismaLike, order: any) {
       `Order ${order.id} accounting is not backed by movement allocations; backfill or recovery is required.`,
     );
   }
-  return summary;
+  const adjustmentSummary = await orderAdjustmentSummary(tx, order.id);
+  const materializedDiscount = BigInt(nonNegativeInteger(
+    order.discountFiatMicros ?? "0",
+    "Order discountFiatMicros",
+  ));
+  if (adjustmentSummary.netDiscount !== materializedDiscount) {
+    throw new MovementAllocationConflictError(
+      `Order ${order.id} discount is not backed by append-only adjustments.`,
+    );
+  }
+  return { ...summary, adjustmentSummary };
 }
 
 async function syncOrderAccounting(tx: PrismaLike, input: {
@@ -598,7 +901,12 @@ async function syncOrderAccounting(tx: PrismaLike, input: {
   expiresAt?: Date | null;
 }) {
   const obligation = BigInt(input.order.fiatAmountMicros);
-  const { netCredit, paidAt } = await orderAllocationSummary(tx, input.order.id, obligation);
+  const { netCredit, paidAt, activeCredits } = await orderAllocationSummary(
+    tx,
+    input.order.id,
+    obligation,
+  );
+  const { netDiscount } = await orderAdjustmentSummary(tx, input.order.id);
   if (netCredit < BigInt(0)) {
     throw new Error(`Order ${input.order.id} has a negative allocation balance.`);
   }
@@ -608,11 +916,12 @@ async function syncOrderAccounting(tx: PrismaLike, input: {
   const terminalLocksRecovery = wasTerminal && !(
     input.allowExpiredRevival && input.order.status === "EXPIRED"
   );
+  const effectiveCredit = netCredit + netDiscount;
   const status = input.forceRecovery || terminalLocksRecovery
     ? "RECOVERY"
-    : netCredit >= obligation
+    : effectiveCredit >= obligation
       ? "PAID"
-      : netCredit > BigInt(0)
+      : effectiveCredit > BigInt(0)
         ? "PARTIAL"
         : "PENDING";
   return tx.tonhubPaymentOrder.update({
@@ -621,7 +930,9 @@ async function syncOrderAccounting(tx: PrismaLike, input: {
       creditedFiatMicros: credited.toString(),
       overpaymentFiatMicros: overpayment.toString(),
       status,
-      paidAt: status === "PAID" ? paidAt ?? input.paidAt ?? input.order.paidAt : input.order.paidAt,
+      paidAt: status === "PAID"
+        ? paidAt ?? activeCredits.at(-1)?.movement.blockchainAt ?? input.paidAt ?? input.order.paidAt
+        : input.order.paidAt,
       ...(input.expiresAt !== undefined ? { expiresAt: input.expiresAt } : {}),
     },
   });
@@ -720,7 +1031,10 @@ async function syncInvoiceAccounting(tx: PrismaLike, input: {
     (sum, row) => sum + BigInt(row.fiatCreditMicros),
     BigInt(0),
   );
+  const { netDiscount } = await orderAdjustmentSummary(tx, input.order.id);
   const credited = netCredit < obligation ? netCredit : obligation;
+  const effectiveCredit = netCredit + netDiscount;
+  const remaining = effectiveCredit < obligation ? obligation - effectiveCredit : BigInt(0);
   const checkoutAsset = parsePaymentAsset(input.invoice.checkoutAsset ?? "GRAM");
   const paidAmountAtomic = credits
     .filter((row) => row.movement.asset === checkoutAsset.symbol)
@@ -734,7 +1048,7 @@ async function syncInvoiceAccounting(tx: PrismaLike, input: {
   let paidMovement: PaymentMovementRecord | null = null;
   for (const row of credits) {
     cumulativeCredit += BigInt(row.fiatCreditMicros);
-    if (!paidMovement && cumulativeCredit >= obligation) {
+    if (!paidMovement && cumulativeCredit + netDiscount >= obligation) {
       paidMovement = row.movement;
     }
   }
@@ -771,14 +1085,14 @@ async function syncInvoiceAccounting(tx: PrismaLike, input: {
     data: {
       status,
       creditedFiatMicros: credited.toString(),
-      remainingFiatMicros: (obligation - credited).toString(),
+      remainingFiatMicros: remaining.toString(),
       paidNano: checkoutAsset.symbol === "GRAM" ? paidAmountAtomic.toString() : input.invoice.paidNano,
       paidAmountAtomic: paidAmountAtomic.toString(),
       firstMovementAt,
-      partialPaymentStartedAt: netCredit > BigInt(0) && netCredit < obligation
+      partialPaymentStartedAt: effectiveCredit > BigInt(0) && effectiveCredit < obligation
         ? firstMovementAt
         : input.invoice.partialPaymentStartedAt,
-      partialPaymentExpiresAt: netCredit > BigInt(0) && netCredit < obligation
+      partialPaymentExpiresAt: effectiveCredit > BigInt(0) && effectiveCredit < obligation
         ? partialPaymentExpiresAt
         : input.invoice.partialPaymentExpiresAt,
       observedAt: latestMovementAt,
@@ -852,6 +1166,7 @@ export function createMovementLedger(db: PrismaLike) {
     recordObserved: async (input: PaymentMovementDraft) => {
       const draft = validateMovementDraft(input);
       return db.$transaction(async (tx) => {
+        await lockObservedMovementOrder(tx, draft);
         await tx.tonhubPaymentMovement.createMany({
           data: [{
             ...draft,
@@ -871,6 +1186,12 @@ export function createMovementLedger(db: PrismaLike) {
         if (movementFactsIdentity(movement) !== movementFactsIdentity(draft)) {
           throw new MovementFingerprintConflictError(draft.fingerprint);
         }
+        if (movement.status === "REJECTED") {
+          throw new MovementAllocationConflictError(
+            `Rejected movement ${movement.id} cannot be replayed as observed.`,
+          );
+        }
+        await lockObservedMovementSelection(tx, movement);
         await enqueueOfficialUsdtSweep(tx, movement);
         return movement;
       });
@@ -982,13 +1303,13 @@ export function createMovementLedger(db: PrismaLike) {
       if (movement.direction !== "INCOMING") {
         throw new MovementAllocationConflictError("Only incoming movements can credit an order.");
       }
-      if (["REJECTED", "HELD_UNDER_MINIMUM"].includes(movement.status)) {
+      if (movement.status === "REJECTED") {
         throw new MovementAllocationConflictError(`Movement ${movement.id} is ${movement.status}.`);
       }
       if (movement.validationCode && movement.validationCode !== validationCode) {
         throw new MovementAllocationConflictError("Movement validation evidence cannot be replaced.");
       }
-      const invoice = await tx.tonhubPaymentInvoice.findUnique({
+      let invoice = await tx.tonhubPaymentInvoice.findUnique({
         where: { id: invoiceId },
         include: { depositAddress: true },
       });
@@ -998,6 +1319,34 @@ export function createMovementLedger(db: PrismaLike) {
       if (!movement.depositAddressId || invoice.depositAddress?.id !== movement.depositAddressId) {
         throw new MovementAllocationConflictError("Movement deposit address does not belong to the invoice.");
       }
+      const unresolvedMovements = (await tx.tonhubPaymentMovement.findMany({
+        where: {
+          depositAddress: {
+            invoice: { orderId },
+          },
+          direction: "INCOMING",
+          status: { in: ["OBSERVED", "VALIDATED", "RATE_PENDING", "RECOVERY"] },
+        },
+      }))
+        .map((value: unknown) => requireMovement(value, "unknown"))
+        .sort(compareMovementChronology);
+      const selectionMovement = [
+        movement,
+        baseline.activeCredits.find(({ allocation }) => allocation.invoiceId === invoiceId)?.movement,
+        unresolvedMovements.find(
+          (candidate: PaymentMovementRecord) => candidate.depositAddressId === movement.depositAddressId,
+        ),
+      ]
+        .filter((value): value is PaymentMovementRecord => Boolean(value))
+        .sort(compareMovementChronology)[0];
+      invoice = await lockInvoicePaymentSelection(
+        tx,
+        invoice,
+        selectionMovement?.blockchainAt ?? movement.blockchainAt,
+      );
+      if (movement.status === "HELD_UNDER_MINIMUM") {
+        throw new MovementAllocationConflictError(`Movement ${movement.id} is ${movement.status}.`);
+      }
       if (movement.status === "CREDITED") {
         const allocation = await findCreditAllocation(tx, movement.id);
         if (!allocation) {
@@ -1006,15 +1355,6 @@ export function createMovementLedger(db: PrismaLike) {
         assertAllocationTarget(allocation, { orderId, invoiceId });
         return { outcome: "credited" as const, movement, allocation, order };
       }
-      const unresolvedMovements = (await tx.tonhubPaymentMovement.findMany({
-        where: {
-          depositAddressId: movement.depositAddressId,
-          direction: "INCOMING",
-          status: { in: ["OBSERVED", "VALIDATED", "RATE_PENDING", "RECOVERY"] },
-        },
-      }))
-        .map((value: unknown) => requireMovement(value, "unknown"))
-        .sort(compareMovementChronology);
       if (unresolvedMovements[0]?.id !== movement.id) {
         return {
           outcome: "blocked-earlier-movement" as const,
@@ -1207,6 +1547,18 @@ export function createMovementLedger(db: PrismaLike) {
         return { outcome: "credited" as const, movement, allocation, order };
       }
 
+      if (movement.asset === "USDT") {
+        await reverseActivePaymentMethodDiscounts(tx, {
+          orderId,
+          cause: "USDT_CREDIT_REMOVES_GRAM_ONLY_DISCOUNT",
+          evidence: {
+            movementId: movement.id,
+            movementBlockchainAt: movement.blockchainAt.toISOString(),
+            asset: movement.asset,
+          },
+        });
+      }
+
       let allocation: MovementAllocationRecord;
       try {
         allocation = normalizeAllocation(await tx.tonhubMovementAllocation.create({
@@ -1234,6 +1586,15 @@ export function createMovementLedger(db: PrismaLike) {
         await tx.tonhubPaymentMovement.findUnique({ where: { id: movement.id } }),
         movement.id,
       );
+      await applyEligibleGramOnlyDiscount(tx, {
+        order,
+        invoice,
+        forceRecovery,
+        movement,
+        hasOtherUnresolvedMovements: unresolvedMovements.some(
+          (candidate: PaymentMovementRecord) => candidate.id !== movement.id,
+        ),
+      });
       const updatedOrder = await syncOrderAccounting(tx, {
         order,
         paidAt: movement.blockchainAt,
@@ -1307,6 +1668,16 @@ export function createMovementLedger(db: PrismaLike) {
       const order = await lockOrder(tx, original.orderId);
       await assertOrderAccountingBaseline(tx, order);
       original = normalizeAllocation(await tx.tonhubMovementAllocation.findUnique({ where: { id: allocationId } }));
+      await reverseActivePaymentMethodDiscounts(tx, {
+        orderId: original.orderId,
+        cause: "MOVEMENT_ALLOCATION_REVERSAL_REMOVES_DISCOUNT",
+        evidence: {
+          allocationId: original.id,
+          movementId: original.movementId,
+          requestedBy: allocatedBy,
+          note,
+        },
+      });
       const existing = await tx.tonhubMovementAllocation.findFirst({
         where: { reversesAllocationId: allocationId },
       });

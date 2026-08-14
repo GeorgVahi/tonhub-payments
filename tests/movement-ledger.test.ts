@@ -28,13 +28,26 @@ function matches(row: any, where: any): boolean {
 function createMemoryLedgerDb() {
   const movements: any[] = [];
   const allocations: any[] = [];
+  const adjustments: any[] = [];
+  const quotes: any[] = [{
+    id: "quote-gram-1",
+    orderId: "order-1",
+    invoiceId: "invoice-1",
+    asset: "GRAM",
+    fiatCurrency: "USD",
+    grossFiatMicros: "5000000",
+    discountFiatMicros: "1000000",
+    netFiatMicros: "4000000",
+  }];
   const orders: any[] = [{
     id: "order-1",
     externalId: "merchant-order-1",
     fiatAmountMicros: "5000000",
     fiatCurrency: "USD",
     creditedFiatMicros: "0",
+    discountFiatMicros: "0",
     overpaymentFiatMicros: "0",
+    gramDiscountMaxFiatMicros: "1000000",
     status: "PENDING",
     paidAt: null,
     expiresAt: new Date("2026-08-13T11:00:00.000Z"),
@@ -50,6 +63,8 @@ function createMemoryLedgerDb() {
     paidNano: "0",
     paidAmountAtomic: "0",
     status: "PENDING",
+    paymentSelectionLockedAsset: null,
+    paymentSelectionLockedAt: null,
     firstMovementAt: null,
     partialPaymentStartedAt: null,
     partialPaymentExpiresAt: null,
@@ -92,16 +107,28 @@ function createMemoryLedgerDb() {
   ];
   let movementSequence = 0;
   let allocationSequence = 0;
+  let adjustmentSequence = 0;
   let clock = 0;
   const now = () => new Date(1_786_617_600_000 + clock++ * 1_000);
   const db: any = {
     $transaction: async (handler: (tx: any) => Promise<unknown>) => {
-      const snapshot = structuredClone({ movements, allocations, orders, invoices, deposits, recoveryCases, assetAccounts, sweeps });
+      const snapshot = structuredClone({
+        movements,
+        allocations,
+        adjustments,
+        orders,
+        invoices,
+        deposits,
+        recoveryCases,
+        assetAccounts,
+        sweeps,
+      });
       try {
         return await handler(db);
       } catch (error) {
         movements.splice(0, movements.length, ...snapshot.movements);
         allocations.splice(0, allocations.length, ...snapshot.allocations);
+        adjustments.splice(0, adjustments.length, ...snapshot.adjustments);
         orders.splice(0, orders.length, ...snapshot.orders);
         invoices.splice(0, invoices.length, ...snapshot.invoices);
         deposits.splice(0, deposits.length, ...snapshot.deposits);
@@ -136,7 +163,16 @@ function createMemoryLedgerDb() {
         return { count };
       },
       findUnique: async ({ where }: any) => movements.find((row) => matches(row, where)) ?? null,
-      findMany: async ({ where }: any) => movements.filter((row) => matches(row, where)),
+      findMany: async ({ where }: any) => {
+        const { depositAddress: depositFilter, ...movementWhere } = where ?? {};
+        return movements.filter((row) => {
+          if (!matches(row, movementWhere)) return false;
+          const expectedOrderId = depositFilter?.invoice?.orderId;
+          if (!expectedOrderId) return true;
+          const invoice = invoices.find((candidate) => candidate.depositAddress?.id === row.depositAddressId);
+          return invoice?.orderId === expectedOrderId;
+        });
+      },
       updateMany: async ({ where, data }: any) => {
         const rows = movements.filter((row) => matches(row, where));
         for (const row of rows) {
@@ -212,6 +248,48 @@ function createMemoryLedgerDb() {
         Object.assign(row, normalizedData);
         return row;
       },
+      updateMany: async ({ where, data }: any) => {
+        const rows = invoices.filter((row) => matches(row, where));
+        rows.forEach((row) => Object.assign(row, data));
+        return { count: rows.length };
+      },
+    },
+    tonhubPaymentQuote: {
+      findFirst: async ({ where }: any) => quotes.find((row) => matches(row, where)) ?? null,
+    },
+    tonhubOrderAdjustment: {
+      findUnique: async ({ where }: any) => adjustments.find((row) => matches(row, where)) ?? null,
+      findFirst: async ({ where }: any) => adjustments.find((row) => matches(row, where)) ?? null,
+      findMany: async ({ where }: any) => adjustments.filter((row) => matches(row, where)),
+      create: async ({ data }: any) => {
+        if (
+          adjustments.some((row) => row.idempotencyKey === data.idempotencyKey) ||
+          (data.reversesAdjustmentId && adjustments.some((row) =>
+            row.reversesAdjustmentId === data.reversesAdjustmentId))
+        ) {
+          throw Object.assign(new Error("unique adjustment"), { code: "P2002" });
+        }
+        const row = {
+          id: `adjustment-${++adjustmentSequence}`,
+          kind: "PAYMENT_METHOD_DISCOUNT",
+          reversesAdjustmentId: null,
+          evidence: null,
+          createdAt: now(),
+          ...data,
+        };
+        adjustments.push(row);
+        const order = orders.find(({ id }) => id === row.orderId);
+        if (order) {
+          order.discountFiatMicros = adjustments
+            .filter((candidate) => candidate.orderId === row.orderId)
+            .reduce((sum, candidate) => (
+              candidate.kind === "PAYMENT_METHOD_DISCOUNT"
+                ? sum + BigInt(candidate.fiatAmountMicros)
+                : sum - BigInt(candidate.fiatAmountMicros)
+            ), BigInt(0)).toString();
+        }
+        return row;
+      },
     },
     tonhubDepositAddress: {
       findUnique: async ({ where }: any) => {
@@ -274,7 +352,20 @@ function createMemoryLedgerDb() {
           right.createdAt.getTime() - left.createdAt.getTime())[0] ?? null,
     },
   };
-  return { db, movements, allocations, orders, invoices, deposits, recoveryCases, assetAccounts, sweeps, rates };
+  return {
+    db,
+    movements,
+    allocations,
+    adjustments,
+    quotes,
+    orders,
+    invoices,
+    deposits,
+    recoveryCases,
+    assetAccounts,
+    sweeps,
+    rates,
+  };
 }
 
 function movement(overrides: Partial<PaymentMovementDraft> = {}): PaymentMovementDraft {
@@ -350,6 +441,15 @@ test("a rejected unsupported jetton is journaled once for recovery and can never
   assert.equal(memory.recoveryCases[0]?.invoiceId, "invoice-1");
   assert.equal(memory.recoveryCases[0]?.orderId, "order-1");
   assert.equal(memory.recoveryCases[0]?.reason, "UNSUPPORTED_JETTON_MASTER");
+  assert.equal(memory.invoices[0]?.paymentSelectionLockedAsset, null);
+  assert.equal(memory.invoices[0]?.paymentSelectionLockedAt, null);
+  await assert.rejects(
+    ledger.recordObserved(rejected),
+    /cannot be replayed as observed/,
+  );
+  assert.equal(memory.invoices[0]?.paymentSelectionLockedAsset, null);
+  assert.equal(memory.invoices[0]?.paymentSelectionLockedAt, null);
+  assert.equal(memory.sweeps.length, 0);
   await assert.rejects(
     ledger.recordRejected({
       ...rejection,
@@ -407,6 +507,11 @@ test("observed movement replay is idempotent and conflicting facts are rejected"
 
   assert.equal(first.id, replay.id);
   assert.equal(memory.movements.length, 1);
+  assert.equal(memory.invoices[0]?.paymentSelectionLockedAsset, "GRAM");
+  assert.equal(
+    memory.invoices[0]?.paymentSelectionLockedAt.toISOString(),
+    "2026-08-13T10:00:00.000Z",
+  );
   await assert.rejects(
     ledger.recordObserved(movement({ amountAtomic: "1600000000" })),
     MovementFingerprintConflictError,
@@ -610,6 +715,284 @@ test("credits aggregate exactly, retain overpayment, and remain idempotent", asy
       { asset: "GRAM", amountAtomic: "1500000000" },
       { asset: "USDT", amountAtomic: "2000000" },
     ],
+  );
+});
+
+test("an exact all-GRAM shortfall applies the immutable quote discount and closes the gross order", async () => {
+  const memory = createMemoryLedgerDb();
+  const ledger = createMovementLedger(memory.db);
+  const gram = await ledger.recordObserved(movement({ amountAtomic: "1600000000" }));
+  const paid = await ledger.creditMovement({
+    movementId: gram.id,
+    orderId: "order-1",
+    invoiceId: "invoice-1",
+    validationCode: "NATIVE_INBOUND_V1",
+    maxRateAgeMs: 300_000,
+  });
+  const replay = await ledger.creditMovement({
+    movementId: gram.id,
+    orderId: "order-1",
+    invoiceId: "invoice-1",
+    validationCode: "NATIVE_INBOUND_V1",
+    maxRateAgeMs: 300_000,
+  });
+
+  assert.equal(paid.order.status, "PAID");
+  assert.equal(paid.order.creditedFiatMicros, "4000000");
+  assert.equal(paid.order.discountFiatMicros, "1000000");
+  assert.equal(memory.invoices[0].status, "PAID");
+  assert.equal(memory.invoices[0].creditedFiatMicros, "4000000");
+  assert.equal(memory.invoices[0].remainingFiatMicros, "0");
+  assert.equal(memory.invoices[0].paymentSelectionLockedAsset, "GRAM");
+  assert.equal(
+    memory.invoices[0].paymentSelectionLockedAt.toISOString(),
+    "2026-08-13T10:00:00.000Z",
+  );
+  assert.equal(memory.adjustments.length, 1);
+  assert.deepEqual(
+    memory.adjustments.map(({ kind, fiatAmountMicros, quoteId }: any) => ({
+      kind,
+      fiatAmountMicros,
+      quoteId,
+    })),
+    [{
+      kind: "PAYMENT_METHOD_DISCOUNT",
+      fiatAmountMicros: "1000000",
+      quoteId: "quote-gram-1",
+    }],
+  );
+  assert.equal(replay.order.status, "PAID");
+  assert.equal(memory.adjustments.length, 1);
+});
+
+test("a mixed payment or a non-GRAM selected rail never receives the GRAM-only discount", async () => {
+  const mixed = createMemoryLedgerDb();
+  const mixedLedger = createMovementLedger(mixed.db);
+  const gram = await mixedLedger.recordObserved(movement({ amountAtomic: "1200000000" }));
+  await mixedLedger.creditMovement({
+    movementId: gram.id,
+    orderId: "order-1",
+    invoiceId: "invoice-1",
+    validationCode: "NATIVE_INBOUND_V1",
+  });
+  const usdt = await mixedLedger.recordObserved(movement({
+    fingerprint: "testnet:mixed-usdt:incoming:0",
+    asset: "USDT",
+    assetKind: "JETTON",
+    assetDecimals: 6,
+    amountAtomic: "1000000",
+    jettonMasterAddress: "EQ_USDT_MASTER",
+    jettonWalletAddress: "EQ_DEPOSIT_USDT_WALLET",
+    transactionHash: "mixed-usdt",
+    transactionLt: "12346",
+    blockchainAt: new Date("2026-08-13T10:00:30.000Z"),
+  }));
+  const mixedResult = await mixedLedger.creditMovement({
+    movementId: usdt.id,
+    orderId: "order-1",
+    invoiceId: "invoice-1",
+    validationCode: "JETTON_INBOUND_V1",
+  });
+
+  assert.equal(mixedResult.order.status, "PARTIAL");
+  assert.equal(mixedResult.order.creditedFiatMicros, "4000000");
+  assert.equal(mixedResult.order.discountFiatMicros, "0");
+  assert.equal(mixed.adjustments.length, 0);
+
+  const wrongSelection = createMemoryLedgerDb();
+  wrongSelection.invoices[0].checkoutAsset = "USDT";
+  const wrongSelectionLedger = createMovementLedger(wrongSelection.db);
+  const wrongRailGram = await wrongSelectionLedger.recordObserved(
+    movement({ amountAtomic: "1600000000" }),
+  );
+  const wrongSelectionResult = await wrongSelectionLedger.creditMovement({
+    movementId: wrongRailGram.id,
+    orderId: "order-1",
+    invoiceId: "invoice-1",
+    validationCode: "NATIVE_INBOUND_V1",
+  });
+  assert.equal(wrongSelectionResult.order.status, "PARTIAL");
+  assert.equal(wrongSelectionResult.order.discountFiatMicros, "0");
+  assert.equal(wrongSelection.invoices[0].paymentSelectionLockedAsset, "USDT");
+  assert.equal(wrongSelection.adjustments.length, 0);
+});
+
+test("known later USDT evidence on another attempt prevents a transient GRAM discount", async () => {
+  const memory = createMemoryLedgerDb();
+  memory.invoices.push({
+    ...structuredClone(memory.invoices[0]),
+    id: "invoice-2",
+    checkoutAsset: "USDT",
+    status: "EXPIRED",
+    paymentSelectionLockedAsset: null,
+    paymentSelectionLockedAt: null,
+    depositAddress: { id: "deposit-2" },
+  });
+  memory.deposits.push({ id: "deposit-2", status: "EXPIRED" });
+  const ledger = createMovementLedger(memory.db);
+  const gram = await ledger.recordObserved(movement({ amountAtomic: "1600000000" }));
+  await ledger.recordObserved(movement({
+    fingerprint: "testnet:known-later-usdt:incoming:0",
+    depositAddressId: "deposit-2",
+    asset: "USDT",
+    assetKind: "JETTON",
+    assetDecimals: 6,
+    amountAtomic: "1000000",
+    toAddress: "EQ_ALTERNATE_DEPOSIT",
+    jettonMasterAddress: "EQ_USDT_MASTER",
+    jettonWalletAddress: "EQ_DEPOSIT_USDT_WALLET",
+    transactionHash: "known-later-usdt",
+    transactionLt: "12346",
+    blockchainAt: new Date("2026-08-13T10:00:30.000Z"),
+  }));
+  const partial = await ledger.creditMovement({
+    movementId: gram.id,
+    orderId: "order-1",
+    invoiceId: "invoice-1",
+    validationCode: "NATIVE_INBOUND_V1",
+  });
+
+  assert.equal(partial.order.status, "PARTIAL");
+  assert.equal(partial.order.discountFiatMicros, "0");
+  assert.equal(memory.adjustments.length, 0);
+  assert.equal(memory.recoveryCases.length, 0);
+});
+
+test("a later USDT credit reverses an active GRAM-only discount before entering recovery", async () => {
+  const memory = createMemoryLedgerDb();
+  const ledger = createMovementLedger(memory.db);
+  const gram = await ledger.recordObserved(movement({ amountAtomic: "1600000000" }));
+  await ledger.creditMovement({
+    movementId: gram.id,
+    orderId: "order-1",
+    invoiceId: "invoice-1",
+    validationCode: "NATIVE_INBOUND_V1",
+  });
+  const usdt = await ledger.recordObserved(movement({
+    fingerprint: "testnet:post-discount-usdt:incoming:0",
+    asset: "USDT",
+    assetKind: "JETTON",
+    assetDecimals: 6,
+    amountAtomic: "1000000",
+    jettonMasterAddress: "EQ_USDT_MASTER",
+    jettonWalletAddress: "EQ_DEPOSIT_USDT_WALLET",
+    transactionHash: "post-discount-usdt",
+    transactionLt: "12346",
+    blockchainAt: new Date("2026-08-13T10:00:30.000Z"),
+  }));
+  const recovered = await ledger.creditMovement({
+    movementId: usdt.id,
+    orderId: "order-1",
+    invoiceId: "invoice-1",
+    validationCode: "JETTON_INBOUND_V1",
+  });
+
+  assert.equal(recovered.order.status, "RECOVERY");
+  assert.equal(recovered.order.creditedFiatMicros, "5000000");
+  assert.equal(recovered.order.discountFiatMicros, "0");
+  assert.deepEqual(
+    memory.adjustments.map(({ kind, reversesAdjustmentId }: any) => ({ kind, reversesAdjustmentId })),
+    [
+      { kind: "PAYMENT_METHOD_DISCOUNT", reversesAdjustmentId: null },
+      { kind: "REVERSAL", reversesAdjustmentId: memory.adjustments[0].id },
+    ],
+  );
+  assert.equal(memory.recoveryCases.at(-1)?.reason, "POST_PAID_MOVEMENT");
+});
+
+test("reversing a GRAM credit first reverses its dependent payment-method discount", async () => {
+  const memory = createMemoryLedgerDb();
+  const ledger = createMovementLedger(memory.db);
+  const gram = await ledger.recordObserved(movement({ amountAtomic: "1600000000" }));
+  const paid = await ledger.creditMovement({
+    movementId: gram.id,
+    orderId: "order-1",
+    invoiceId: "invoice-1",
+    validationCode: "NATIVE_INBOUND_V1",
+  });
+  const reversed = await ledger.reverseAllocation({
+    allocationId: paid.allocation!.id,
+    allocatedBy: "admin",
+    note: "invalid GRAM ownership evidence",
+  });
+
+  assert.equal(reversed.order.status, "RECOVERY");
+  assert.equal(reversed.order.creditedFiatMicros, "0");
+  assert.equal(reversed.order.discountFiatMicros, "0");
+  assert.equal(memory.invoices[0].remainingFiatMicros, "5000000");
+  assert.deepEqual(
+    memory.adjustments.map(({ kind, reversesAdjustmentId }: any) => ({ kind, reversesAdjustmentId })),
+    [
+      { kind: "PAYMENT_METHOD_DISCOUNT", reversesAdjustmentId: null },
+      { kind: "REVERSAL", reversesAdjustmentId: memory.adjustments[0].id },
+    ],
+  );
+  assert.deepEqual(memory.allocations.map(({ kind }: any) => kind), ["CREDIT", "REVERSAL"]);
+});
+
+test("the selected rail locks at the first movement blockchain time even while its rate is pending", async () => {
+  const memory = createMemoryLedgerDb();
+  memory.rates.splice(0, memory.rates.length);
+  const ledger = createMovementLedger(memory.db);
+  const gram = await ledger.recordObserved(movement());
+  const pending = await ledger.creditMovement({
+    movementId: gram.id,
+    orderId: "order-1",
+    invoiceId: "invoice-1",
+    validationCode: "NATIVE_INBOUND_V1",
+  });
+
+  assert.equal(pending.outcome, "rate-pending");
+  assert.equal(memory.invoices[0].paymentSelectionLockedAsset, "GRAM");
+  assert.equal(
+    memory.invoices[0].paymentSelectionLockedAt.toISOString(),
+    "2026-08-13T10:00:00.000Z",
+  );
+});
+
+test("a legacy unlocked attempt never takes selection chronology from another attempt", async () => {
+  const memory = createMemoryLedgerDb();
+  memory.invoices.push({
+    ...structuredClone(memory.invoices[0]),
+    id: "invoice-2",
+    checkoutAsset: "USDT",
+    status: "EXPIRED",
+    paymentSelectionLockedAsset: null,
+    paymentSelectionLockedAt: null,
+    depositAddress: { id: "deposit-2" },
+  });
+  memory.deposits.push({ id: "deposit-2", status: "EXPIRED" });
+  const ledger = createMovementLedger(memory.db);
+  const current = await ledger.recordObserved(movement());
+  await ledger.recordObserved(movement({
+    fingerprint: "testnet:legacy-selection-other-attempt:incoming:0",
+    depositAddressId: "deposit-2",
+    asset: "USDT",
+    assetKind: "JETTON",
+    assetDecimals: 6,
+    amountAtomic: "1000000",
+    toAddress: "EQ_ALTERNATE_DEPOSIT",
+    jettonMasterAddress: "EQ_USDT_MASTER",
+    jettonWalletAddress: "EQ_DEPOSIT_USDT_WALLET",
+    transactionHash: "legacy-selection-other-attempt",
+    transactionLt: "12344",
+    blockchainAt: new Date("2026-08-13T09:59:30.000Z"),
+  }));
+  memory.invoices[0].paymentSelectionLockedAsset = null;
+  memory.invoices[0].paymentSelectionLockedAt = null;
+
+  const blocked = await ledger.creditMovement({
+    movementId: current.id,
+    orderId: "order-1",
+    invoiceId: "invoice-1",
+    validationCode: "NATIVE_INBOUND_V1",
+  });
+
+  assert.equal(blocked.outcome, "blocked-earlier-movement");
+  assert.equal(memory.invoices[0].paymentSelectionLockedAsset, "GRAM");
+  assert.equal(
+    memory.invoices[0].paymentSelectionLockedAt.toISOString(),
+    "2026-08-13T10:00:00.000Z",
   );
 });
 

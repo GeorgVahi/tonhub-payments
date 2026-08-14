@@ -494,7 +494,16 @@ confirmed incoming GRAM and USDT movements to the same fiat order and closes
 the order from aggregate fiat micros, regardless of the asset originally shown
 in checkout. The first credited GRAM movement locks its immutable rate snapshot
 for later GRAM partials; USDT continues to use the exact peg/cross snapshot
-policy. The first partial must cover the whole order or at least the greater of
+policy. The first valid movement also locks the currently selected payment rail
+at its blockchain time. A GRAM-selected order paid entirely in GRAM can close
+against the locked GRAM quote with an append-only adjustment for the actual
+remaining shortfall, capped by the snapshotted $1/€1 offer. Any credited USDT,
+or a rail initially selected as USD₮, keeps the full gross obligation and gets
+no GRAM discount. Known later movements on any attempt of the same order are
+settled before the adjustment is applied; a USDT credit discovered after an
+all-GRAM close first appends an exact
+discount reversal and then enters the normal post-payment recovery path. The
+first partial must cover the whole order or at least the greater of
 50% of the obligation and twice the configured full merchant network cost.
 Later movements in the same 24-hour partial window have no activation minimum.
 Late, undersized-first, late-discovered out-of-order, post-`PAID`,

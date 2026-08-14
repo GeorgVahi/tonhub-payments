@@ -26,6 +26,7 @@ const depositWallet = WalletContractV5R1.create({
 const gasWallet = WalletContractV5R1.create({ publicKey: gasPublic });
 const jettonWallet = Address.parseRaw(`0:${(suffix === "clean" ? "81" : "82").repeat(32)}`);
 const sender = Address.parseRaw(`0:${(suffix === "clean" ? "83" : "84").repeat(32)}`);
+const createdAt = new Date("2026-08-13T09:59:00.000Z");
 
 async function main() {
   const config = resolveMainnetUsdtSweepConfig({
@@ -45,6 +46,8 @@ async function main() {
       externalId: `usdt-sweep-merchant-${suffix}`,
       fiatAmountMicros: "5000000",
       fiatCurrency: "USD",
+      createdAt,
+      updatedAt: createdAt,
     },
   });
   await prisma.tonhubPaymentInvoice.create({
@@ -67,6 +70,8 @@ async function main() {
       amountNano: "5000000000",
       amountAtomic: "5000000000",
       reference: `usdt-sweep-reference-${suffix}`,
+      createdAt,
+      updatedAt: createdAt,
     },
   });
   await prisma.tonhubDepositAddress.create({
@@ -82,6 +87,8 @@ async function main() {
       walletNetworkGlobalId: -239,
       walletPublicKeyHash: config.depositPublicKeyHash,
       status: "ACTIVE",
+      createdAt,
+      updatedAt: createdAt,
     },
   });
   await prisma.tonhubDepositAssetAccount.create({

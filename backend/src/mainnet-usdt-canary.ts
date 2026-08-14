@@ -1,7 +1,7 @@
 import { resolveAllowedNetworks } from "./config";
 import { resolveCheckoutAssetPolicy } from "./checkout-assets";
 
-const requiredMigration = "20260814100000_ton_checkout_policy_foundation";
+const requiredMigration = "20260814101000_gram_discount_settlement";
 
 type CanaryDb = {
   $queryRawUnsafe: (query: string, ...values: unknown[]) => Promise<any[]>;
