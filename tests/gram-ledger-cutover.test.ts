@@ -238,6 +238,63 @@ test("GRAM ledger source persists only strict successful evidence and replays it
   assert.equal(matches[0]?.transaction.hash, "51".repeat(32));
 });
 
+test("GRAM ledger source replays a finalized non-bounce credit into an uninitialized deposit wallet", async () => {
+  const ledger = createLedgerSource();
+  const creditedUninitialized = {
+    hash: "53".repeat(32),
+    lt: "1003",
+    now: Math.floor(new Date("2026-08-13T10:10:00.000Z").getTime() / 1000),
+    description: {
+      aborted: true,
+      credit_first: true,
+      credit_ph: { credit: "1500000000" },
+      compute_ph: { skipped: true, reason: "no_state" },
+      action: null,
+    },
+    in_msg: {
+      source: sourceRaw,
+      destination: destinationRaw,
+      value: "1500000000",
+      bounce: false,
+      bounced: false,
+    },
+    orig_status: "nonexist",
+    end_status: "uninit",
+    finality: "finalized",
+  } as TonCenterTransaction;
+
+  const observed = await ledger.source.observeTransactions({
+    invoiceId: invoice().id,
+    network: "testnet",
+    notBefore: createdAt,
+    notAfter: now,
+    transactions: [creditedUninitialized],
+  });
+  const matches = await ledger.source.listMatches({
+    invoiceId: invoice().id,
+    network: "testnet",
+    notBefore: createdAt,
+    notAfter: now,
+  });
+
+  assert.equal(observed.observed, 1);
+  assert.equal(observed.rejections.length, 0);
+  assert.equal(matches.length, 1);
+  assert.equal(matches[0]?.amountNano, "1500000000");
+  assert.equal(matches[0]?.transaction.hash, "53".repeat(32));
+
+  delete ledger.movements[0].rawPayload.transaction.creditedUninitialized;
+  await assert.rejects(
+    ledger.source.listMatches({
+      invoiceId: invoice().id,
+      network: "testnet",
+      notBefore: createdAt,
+      notAfter: now,
+    }),
+    /inconsistent immutable evidence/,
+  );
+});
+
 test("GRAM ledger source resolves the deposit as scan owner and rejects invoice/deposit drift", async () => {
   const ledger = createLedgerSource();
   const resolved = await ledger.source.resolveTarget({

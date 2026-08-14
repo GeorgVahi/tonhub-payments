@@ -105,6 +105,10 @@ function normalizeMovementMatch(value: any, ownership: {
   const evidence = isRecord(rawPayload) && isRecord(rawPayload.transaction)
     ? rawPayload.transaction
     : null;
+  const hasStrictSuccessfulEvidence = evidence?.successful === true &&
+    evidence.creditedUninitialized !== true;
+  const hasStrictUninitializedCreditEvidence = evidence?.successful === false &&
+    evidence.creditedUninitialized === true;
   if (
     !evidence ||
     rawPayload.evidenceVersion !== 1 ||
@@ -112,7 +116,7 @@ function normalizeMovementMatch(value: any, ownership: {
     canonicalTonTransactionHash(evidence.hash) !== transactionHash ||
     (typeof evidence.lt !== "string" || !/^\d+$/.test(evidence.lt) || BigInt(evidence.lt).toString() !== transactionLt) ||
     evidence.now !== Math.floor(value.blockchainAt.getTime() / 1000) ||
-    evidence.successful !== true ||
+    (!hasStrictSuccessfulEvidence && !hasStrictUninitializedCreditEvidence) ||
     canonicalTonAddress(evidence.source) !== fromAddress ||
     canonicalTonAddress(evidence.destination) !== ownership.addressRaw ||
     evidence.value !== value.amountAtomic
