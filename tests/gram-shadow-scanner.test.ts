@@ -226,14 +226,25 @@ function repositoryHarness(scanTarget = target()) {
 
 test("GRAM shadow candidate selection includes a USDT checkout deposit", async () => {
   let candidateWhere: Record<string, unknown> | null = null;
+  const cursorQueries: Array<{ query: string; values: unknown[] }> = [];
+  const cursorUpdates: any[] = [];
   const cursor = {
     id: "cursor-1",
     lastHash: null,
     lastLt: null,
     lastTimestamp: null,
+    leaseOwner: null as string | null,
+    leaseExpiresAt: null as Date | null,
   };
   const db = {
     $transaction: async (handler: (tx: unknown) => Promise<unknown>) => handler(db),
+    $queryRawUnsafe: async (query: string, ...values: unknown[]) => {
+      cursorQueries.push({ query, values });
+      if (query.includes("clock_timestamp()")) {
+        return [{ now: scanNow }];
+      }
+      return [{ ...cursor }];
+    },
     tonhubPaymentInvoice: {
       findMany: async (input: { where: Record<string, unknown> }) => {
         candidateWhere = input.where;
@@ -261,7 +272,11 @@ test("GRAM shadow candidate selection includes a USDT checkout deposit", async (
     tonhubScanCursor: {
       createMany: async () => ({ count: 1 }),
       findUnique: async () => cursor,
-      updateMany: async () => ({ count: 1 }),
+      updateMany: async (input: any) => {
+        cursorUpdates.push(input);
+        Object.assign(cursor, input.data);
+        return { count: 1 };
+      },
     },
   };
   const repository = createPrismaGramShadowScannerRepository(db as any);
@@ -277,6 +292,26 @@ test("GRAM shadow candidate selection includes a USDT checkout deposit", async (
   assert.equal(Object.hasOwn(candidateWhere ?? {}, "checkoutAsset"), false);
   assert.equal(targets.length, 1);
   assert.equal(targets[0]?.invoiceId, "invoice-usdt");
+  const scannedAt = new Date("2026-08-13T10:30:00.000Z");
+  assert.equal(await repository.renewLease({
+    target: targets[0]!,
+    now: scannedAt,
+    leaseMs: 60_000,
+  }), true);
+  assert.equal(cursorUpdates.at(-1)?.data.leaseExpiresAt.toISOString(), "2026-08-13T10:31:00.000Z");
+  assert.ok(cursorQueries.some(({ query }) => query.includes("clock_timestamp()")));
+  assert.equal(await repository.completeScan({
+    target: targets[0]!,
+    scannedAt,
+    completedAt: scannedAt,
+    nextScanAt: new Date("2026-08-13T10:30:15.000Z"),
+    terminalMonitorUntil: null,
+    cursor: null,
+  }), true);
+  assert.equal(cursorUpdates.at(-1)?.data.scannedThroughAt, scannedAt);
+  assert.equal(cursorUpdates.at(-1)?.data.leaseOwner, null);
+  assert.equal(cursorUpdates.at(-1)?.data.leaseExpiresAt, null);
+  assert.equal(Object.hasOwn(cursorUpdates.at(-1)?.data ?? {}, "lastTimestamp"), false);
 });
 
 test("GRAM shadow batch paginates until its cursor and records only newer successful movements", async () => {
@@ -324,7 +359,7 @@ test("GRAM shadow batch paginates until its cursor and records only newer succes
   ]);
   assert.equal(observed.length, 1);
   assert.equal(observed[0].transactionHash, "55".repeat(32));
-  assert.equal(harness.calls.renew, 2);
+  assert.equal(harness.calls.renew, 3);
   assert.equal(harness.calls.fail.length, 0);
   assert.equal(harness.calls.complete.length, 1);
   assert.equal(harness.calls.complete[0].cursor.hash, "55".repeat(32));
@@ -512,6 +547,51 @@ test("GRAM shadow batch does not fetch or advance after losing its lease", async
   assert.equal(fetches, 0);
   assert.equal(harness.calls.complete.length, 0);
   assert.equal(harness.calls.fail.length, 1);
+});
+
+test("GRAM shadow cannot journal after its lease expires during a provider pass", async () => {
+  let renewals = 0;
+  let observations = 0;
+  let completions = 0;
+  let failures = 0;
+  const result = await runGramShadowScanBatch({
+    network: "testnet",
+    now: scanNow,
+    clock: () => scanNow,
+    repository: {
+      claimDueTargets: async () => [target({ cursor: { hash: null, lt: null, timestamp: null } })],
+      renewLease: async () => {
+        renewals += 1;
+        return renewals === 1;
+      },
+      completeScan: async () => {
+        completions += 1;
+        return true;
+      },
+      failScan: async () => {
+        failures += 1;
+        return true;
+      },
+    },
+    ledger: {
+      recordObserved: async () => {
+        observations += 1;
+      },
+    },
+    fetchTransactions: async () => ({ transactions: [transaction()] }),
+    resolveConfig: () => ({
+      network: "testnet",
+      baseUrl: "https://testnet.toncenter.com/api/v3",
+      address: destinationFriendly,
+      addressEnvName: "TON_TESTNET_DEPOSIT_ADDRESS",
+    }),
+  });
+
+  assert.equal(result.failed, 1);
+  assert.equal(renewals, 2);
+  assert.equal(observations, 0);
+  assert.equal(completions, 0);
+  assert.equal(failures, 1);
 });
 
 test("GRAM shadow terminal cadence ends exactly 30 days after the terminal transition", async () => {

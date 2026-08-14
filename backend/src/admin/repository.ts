@@ -166,6 +166,7 @@ function scopedLedger(tx: any) {
     tonhubDepositAddress: tx.tonhubDepositAddress,
     tonhubDepositAssetAccount: tx.tonhubDepositAssetAccount,
     tonhubAssetSweep: tx.tonhubAssetSweep,
+    tonhubScanCursor: tx.tonhubScanCursor,
     tonhubRecoveryCase: tx.tonhubRecoveryCase,
     tonhubRateSnapshot: tx.tonhubRateSnapshot,
   };

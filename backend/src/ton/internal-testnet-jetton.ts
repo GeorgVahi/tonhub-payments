@@ -1,7 +1,10 @@
 import { Buffer } from "node:buffer";
 import { Cell } from "@ton/core";
 import { paymentAssets } from "../../../shared/payment-assets";
-import type { PaymentMovementDraft } from "../movement-ledger";
+import type {
+  PaymentMovementDraft,
+  PaymentMovementObservationLease,
+} from "../movement-ledger";
 import {
   resolveTonApiConfig,
   type TonNetwork,
@@ -93,14 +96,17 @@ export type VerifiedJettonPrismaLike = {
 };
 
 export type VerifiedJettonMovementLedgerLike = {
-  recordObserved: (movement: PaymentMovementDraft) => Promise<unknown>;
+  recordObserved: (
+    movement: PaymentMovementDraft,
+    observationLease?: PaymentMovementObservationLease,
+  ) => Promise<unknown>;
   recordRejected: (input: {
     movement: PaymentMovementDraft;
     validationCode: string;
     reason: string;
     title: string;
     details: Record<string, unknown>;
-  }) => Promise<unknown>;
+  }, observationLease?: PaymentMovementObservationLease) => Promise<unknown>;
 };
 
 export const jettonTransferNotificationOpcode = 0x7362d09c;
@@ -708,6 +714,7 @@ export function createVerifiedJettonAdapter(
       notAfter: Date;
       limit?: number;
       offset?: number;
+      observationLease?: PaymentMovementObservationLease;
     }) => {
       if (
         !validDate(input.notBefore) ||
@@ -984,13 +991,13 @@ export function createVerifiedJettonAdapter(
               observedAssetWalletAddress: candidate.jettonWalletAddress,
               transactionHash: candidate.transactionHash,
             },
-          });
+          }, input.observationLease);
           recordedFingerprints.add(candidate.fingerprint);
           rejectionsRecorded += 1;
         }
       }
       for (const movement of parsed.movements) {
-        await dependencies.ledger.recordObserved(movement);
+        await dependencies.ledger.recordObserved(movement, input.observationLease);
       }
       return {
         account,

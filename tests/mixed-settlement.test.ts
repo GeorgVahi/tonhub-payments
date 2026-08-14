@@ -82,7 +82,7 @@ function harness(input: {
   const creditCalls: any[] = [];
   const outcomes = new Map<
     string,
-    "credited" | "rate-pending" | "held-under-minimum" | "recovery" | "blocked-earlier-movement"
+    "credited" | "rate-pending" | "held-under-minimum" | "recovery" | "blocked-earlier-movement" | "awaiting-scan-horizon"
   >();
   const depositAddress = input.depositAddress ?? { id: "deposit-1", network: current.network };
   const db = {
@@ -211,6 +211,28 @@ test("mixed settlement does not expire while an earlier movement is being settle
     movements: [movement],
   });
   testHarness.outcomes.set(movement.id, "blocked-earlier-movement");
+  const result = await testHarness.service.settleInvoice({ invoiceId: "mixed-invoice", now });
+
+  assert.equal(result.deferred, true);
+  assert.equal(result.invoice.status, "PENDING");
+  assert.equal(testHarness.expired(), 0);
+});
+
+test("mixed settlement does not expire while mainnet scanners have not crossed the movement horizon", async () => {
+  const movement = {
+    id: "movement-awaiting-horizon",
+    depositAddressId: "deposit-1",
+    direction: "INCOMING",
+    asset: "GRAM",
+    assetKind: "NATIVE",
+    assetDecimals: 9,
+    blockchainAt: new Date("2026-08-13T10:01:00.000Z"),
+  };
+  const testHarness = harness({
+    current: invoice({ expiresAt: new Date("2026-08-13T10:20:00.000Z") }),
+    movements: [movement],
+  });
+  testHarness.outcomes.set(movement.id, "awaiting-scan-horizon");
   const result = await testHarness.service.settleInvoice({ invoiceId: "mixed-invoice", now });
 
   assert.equal(result.deferred, true);

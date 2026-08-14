@@ -1,4 +1,5 @@
 import { intEnv } from "../../backend/src/config";
+import { crossScannerSettlementHorizonMs } from "../../backend/src/movement-ledger";
 import { runMixedSettlementBatch } from "./mixed-settlement";
 
 const watch = process.argv.includes("--watch");
@@ -14,6 +15,7 @@ const retrySeconds = intEnv("TON_MOVEMENT_SETTLEMENT_RETRY_SECONDS", 60, {
   min: 1,
   max: 24 * 60 * 60,
 });
+const scannerSettlementHorizonMs = crossScannerSettlementHorizonMs();
 const enabledValue = process.env.TON_MOVEMENT_SETTLEMENT_ENABLED?.trim().toLowerCase() || "false";
 if (enabledValue !== "true" && enabledValue !== "false") {
   throw new Error("TON_MOVEMENT_SETTLEMENT_ENABLED must be true or false.");
@@ -48,6 +50,7 @@ if (!enabled) {
     const result = await runMixedSettlementBatch({
       limit: batchSize,
       retryMs: retrySeconds * 1_000,
+      scannerSettlementHorizonMs,
     });
     console.log(JSON.stringify({
       event: "mixed-settlement-batch",

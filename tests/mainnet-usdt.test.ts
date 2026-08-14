@@ -248,6 +248,7 @@ test("mainnet USDT scan batch owns a separate lease, paginates fully, and advanc
   };
   const result = await runMainnetUsdtScanBatch({
     now,
+    clock: () => now,
     workerId: "worker-1",
     pageSize: 2,
     maxPages: 3,
@@ -292,9 +293,67 @@ test("mainnet USDT scan batch owns a separate lease, paginates fully, and advanc
   assert.deepEqual(calls.map(({ offset }) => offset), [0, 2]);
   assert.equal(calls[0]?.notBefore.toISOString(), "2026-08-13T10:19:00.000Z");
   assert.equal(calls[0]?.notAfter, now);
+  assert.equal(calls[0]?.observationLease?.streamType, "USDT_MAINNET_IN");
+  assert.equal(calls[0]?.observationLease?.leaseOwner, "worker-1");
+  assert.equal(calls[0]?.observationLease?.clock(), now);
   assert.equal(completions.length, 1);
   assert.equal(completions[0]?.scannedThroughAt, now);
   assert.equal(completions[0]?.nextScanAt.toISOString(), "2026-08-13T10:30:15.000Z");
+});
+
+test("mainnet USDT repository fences lease renewal and completion by expiry", async () => {
+  const checkedAt = new Date("2026-08-13T10:30:00.000Z");
+  const cursor = {
+    id: "cursor-mainnet",
+    leaseOwner: "worker-lease" as string | null,
+    leaseExpiresAt: new Date("2026-08-13T10:31:00.000Z") as Date | null,
+  };
+  const updates: any[] = [];
+  const db: any = {
+    $transaction: async (handler: (tx: any) => Promise<unknown>) => handler(db),
+    $queryRawUnsafe: async (query: string) => {
+      if (query.includes("clock_timestamp()")) {
+        return [{ now: checkedAt }];
+      }
+      return [{ ...cursor }];
+    },
+    tonhubScanCursor: {
+      updateMany: async (input: any) => {
+        updates.push(input);
+        Object.assign(cursor, input.data);
+        return { count: 1 };
+      },
+    },
+  };
+  const repository = createPrismaMainnetUsdtScannerRepository(db);
+  const target = {
+    invoiceId: "invoice-mainnet",
+    depositAddressId: "deposit-mainnet",
+    network: "mainnet" as const,
+    invoiceNetwork: "mainnet",
+    depositNetwork: "mainnet",
+    address: ownerFriendly,
+    addressRaw: ownerRaw,
+    invoiceAddress: ownerFriendly,
+    invoiceAddressRaw: ownerRaw,
+    status: "PENDING",
+    createdAt: notBefore,
+    updatedAt: notBefore,
+    terminalMonitorUntil: null,
+    cursorTimestamp: null,
+    leaseOwner: "worker-lease",
+  };
+
+  assert.equal(await repository.renewLease({ target, now: checkedAt, leaseMs: 60_000 }), true);
+  assert.equal(updates.at(-1)?.data.leaseExpiresAt.toISOString(), "2026-08-13T10:31:00.000Z");
+  assert.equal(await repository.completeScan({
+    target,
+    scannedThroughAt: checkedAt,
+    completedAt: checkedAt,
+    nextScanAt: new Date("2026-08-13T10:30:15.000Z"),
+  }), true);
+  assert.equal(updates.at(-1)?.data.scannedThroughAt, checkedAt);
+  assert.equal(updates.at(-1)?.data.leaseOwner, null);
 });
 
 test("mainnet USDT scan batch rejects invoice/deposit network drift before fetch or cursor advance", async () => {
@@ -439,13 +498,21 @@ test("mainnet USDT repository filters due rows before bounded pools and reserves
   const cursors = new Map<string, any>();
   let cursorIndex = 0;
   const claimed: string[] = [];
-  const repository = createPrismaMainnetUsdtScannerRepository({
+  const db: any = {
+    $transaction: async (handler: (tx: any) => Promise<unknown>) => handler(db),
     $queryRaw: async () => {
       const statuses = queriedStatusGroups.length === 0
         ? ["PENDING", "PARTIAL"]
         : ["PAID", "EXPIRED", "CANCELLED", "FAILED"];
       queriedStatusGroups.push(statuses);
       return (statuses[0] === "PENDING" ? activeIds : terminalIds).map((id) => ({ id }));
+    },
+    $queryRawUnsafe: async (query: string, cursorId: string) => {
+      if (query.includes("clock_timestamp()")) {
+        return [{ now: notAfter }];
+      }
+      const cursor = cursors.get(cursorId);
+      return cursor ? [{ ...cursor }] : [];
     },
     tonhubDepositAddress: {
       findMany: async ({ where }: any) => where.id.in.map((id: string) => deposits.get(id)),
@@ -479,7 +546,8 @@ test("mainnet USDT repository filters due rows before bounded pools and reserves
         return { count: 1 };
       },
     },
-  } as any);
+  };
+  const repository = createPrismaMainnetUsdtScannerRepository(db);
 
   const targets = await repository.claimDueTargets({
     workerId: "fair-worker",

@@ -16,6 +16,7 @@ type SettlementService = {
     maxRateAgeMs?: number;
     partialPaymentTtlHours?: number;
     ratePendingBefore?: Date;
+    scannerSettlementHorizonMs?: number;
   }) => Promise<MixedSettlementResult>;
 };
 
@@ -26,6 +27,7 @@ export async function runMixedSettlementBatch(input: {
   limit?: number;
   maxRateAgeMs?: number;
   partialPaymentTtlHours?: number;
+  scannerSettlementHorizonMs?: number;
   retryMs?: number;
 }) {
   const db = input.db ?? (prisma as unknown as PrismaLike);
@@ -41,6 +43,18 @@ export async function runMixedSettlementBatch(input: {
   }
   if (!Number.isInteger(retryMs) || retryMs < 1_000 || retryMs > 24 * 60 * 60 * 1_000) {
     throw new Error("Mixed settlement retryMs must be an integer between 1000 and 86400000.");
+  }
+  if (
+    input.scannerSettlementHorizonMs !== undefined &&
+    (
+      !Number.isSafeInteger(input.scannerSettlementHorizonMs) ||
+      input.scannerSettlementHorizonMs < 5_000 ||
+      input.scannerSettlementHorizonMs > 3_600_000
+    )
+  ) {
+    throw new Error(
+      "Mixed settlement scannerSettlementHorizonMs must be between 5000 and 3600000.",
+    );
   }
   const retryBefore = new Date(now.getTime() - retryMs);
   const nextAttemptAt = new Date(now.getTime() + retryMs);
@@ -103,6 +117,7 @@ export async function runMixedSettlementBatch(input: {
         maxRateAgeMs: input.maxRateAgeMs,
         partialPaymentTtlHours: input.partialPaymentTtlHours,
         ratePendingBefore: retryBefore,
+        scannerSettlementHorizonMs: input.scannerSettlementHorizonMs,
       });
       if (!outcome.ratePending && !outcome.deferred) {
         await db.tonhubDepositAddress.updateMany({

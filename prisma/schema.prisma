@@ -385,6 +385,7 @@ model TonhubScanCursor {
   lastLt         String?
   lastTimestamp  DateTime?
   lastHash       String?
+  scannedThroughAt DateTime?
   leaseOwner     String?
   leaseExpiresAt DateTime?
   createdAt      DateTime  @default(now())

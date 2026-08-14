@@ -49,6 +49,12 @@ export type PaymentMovementDraft = {
   rawPayload?: unknown;
 };
 
+export type PaymentMovementObservationLease = {
+  streamType: "GRAM_NATIVE_IN" | "USDT_MAINNET_IN";
+  leaseOwner: string;
+  clock: () => Date;
+};
+
 export type PaymentMovementRecord = PaymentMovementDraft & {
   id: string;
   status: PaymentMovementStatus;
@@ -84,9 +90,28 @@ type PrismaLike = {
   tonhubDepositAddress: any;
   tonhubDepositAssetAccount: any;
   tonhubAssetSweep: any;
+  tonhubScanCursor: any;
   tonhubRecoveryCase: any;
   tonhubRateSnapshot: any;
 };
+
+const requiredMainnetSettlementStreams = ["GRAM_NATIVE_IN", "USDT_MAINNET_IN"] as const;
+
+export function crossScannerSettlementHorizonMs(
+  env: NodeJS.ProcessEnv | Record<string, string | undefined> = process.env,
+) {
+  const raw = env.TON_CROSS_SCANNER_SETTLEMENT_HORIZON_SECONDS?.trim() || "60";
+  if (!/^\d+$/.test(raw)) {
+    throw new Error("TON_CROSS_SCANNER_SETTLEMENT_HORIZON_SECONDS must be an integer.");
+  }
+  const seconds = Number(raw);
+  if (!Number.isSafeInteger(seconds) || seconds < 5 || seconds > 3_600) {
+    throw new Error(
+      "TON_CROSS_SCANNER_SETTLEMENT_HORIZON_SECONDS must be between 5 and 3600.",
+    );
+  }
+  return seconds * 1_000;
+}
 
 export class MovementFingerprintConflictError extends Error {
   readonly code = "TON_MOVEMENT_FINGERPRINT_CONFLICT";
@@ -542,6 +567,56 @@ async function lockMovement(tx: PrismaLike, movementId: string) {
   );
 }
 
+async function mainnetScannerHorizonReady(
+  tx: PrismaLike,
+  input: {
+    depositAddressId: string;
+    movementBlockchainAt: Date;
+    horizonMs: number;
+  },
+) {
+  const requiredThroughAt = new Date(input.movementBlockchainAt.getTime() + input.horizonMs);
+  const cursors = await tx.$queryRawUnsafe<any[]>(
+    `SELECT "network", "streamType", "scopeKey", "scannedThroughAt", "leaseOwner", "leaseExpiresAt"
+     FROM "TonhubScanCursor"
+     WHERE "network" = 'mainnet'
+       AND "scopeKey" = $1
+       AND "streamType" IN ('GRAM_NATIVE_IN', 'USDT_MAINNET_IN')
+     ORDER BY "streamType"
+     FOR UPDATE`,
+    input.depositAddressId,
+  );
+  if (cursors.length !== requiredMainnetSettlementStreams.length) {
+    return false;
+  }
+  const [databaseClock] = await tx.$queryRawUnsafe<Array<{ now: Date }>>(
+    `SELECT clock_timestamp() AS "now"`,
+  );
+  if (!validDate(databaseClock?.now)) {
+    throw new Error("Database clock is unavailable for scanner settlement fencing.");
+  }
+  const cursorsByStream = new Map<string, any>(
+    cursors.map((cursor: any) => [cursor.streamType, cursor]),
+  );
+  return requiredMainnetSettlementStreams.every((streamType) => {
+    const cursor = cursorsByStream.get(streamType);
+    if (
+      !cursor ||
+      cursor.network !== "mainnet" ||
+      cursor.scopeKey !== input.depositAddressId ||
+      !validDate(cursor.scannedThroughAt) ||
+      cursor.scannedThroughAt.getTime() < requiredThroughAt.getTime()
+    ) {
+      return false;
+    }
+    if (cursor.leaseOwner !== null && cursor.leaseOwner !== undefined) {
+      return validDate(cursor.leaseExpiresAt) &&
+        cursor.leaseExpiresAt.getTime() <= databaseClock.now.getTime();
+    }
+    return true;
+  });
+}
+
 async function lockObservedMovementOrder(
   tx: PrismaLike,
   movement: PaymentMovementDraft,
@@ -558,6 +633,52 @@ async function lockObservedMovementOrder(
      FOR UPDATE OF payment_order`,
     movement.depositAddressId,
   );
+}
+
+async function assertObservedMovementLease(
+  tx: PrismaLike,
+  movement: PaymentMovementDraft,
+  lease: PaymentMovementObservationLease,
+) {
+  if (movement.direction !== "INCOMING" || !movement.depositAddressId) {
+    throw new Error("Scanner-fenced observation must be an owned incoming movement.");
+  }
+  const expectedStream = movement.asset === "GRAM" && movement.assetKind === "NATIVE"
+    ? "GRAM_NATIVE_IN"
+    : movement.network === "mainnet" && movement.asset === "USDT" && movement.assetKind === "JETTON"
+      ? "USDT_MAINNET_IN"
+      : null;
+  if (lease.streamType !== expectedStream || !lease.leaseOwner.trim()) {
+    throw new Error("Movement observation lease does not match its scanner stream.");
+  }
+  const checkedAt = lease.clock();
+  if (!validDate(checkedAt)) {
+    throw new Error("Movement observation lease clock is invalid.");
+  }
+  const rows = await tx.$queryRawUnsafe<Array<{ id: string; leaseExpiresAt: Date | null }>>(
+    `SELECT "id", "leaseExpiresAt"
+     FROM "TonhubScanCursor"
+     WHERE "network" = $1
+       AND "scopeKey" = $2
+       AND "streamType" = $3
+       AND "leaseOwner" = $4
+     FOR UPDATE`,
+    movement.network,
+    movement.depositAddressId,
+    lease.streamType,
+    lease.leaseOwner,
+  );
+  const [databaseClock] = await tx.$queryRawUnsafe<Array<{ now: Date }>>(
+    `SELECT clock_timestamp() AS "now"`,
+  );
+  if (
+    rows.length !== 1 ||
+    !validDate(rows[0]?.leaseExpiresAt) ||
+    !validDate(databaseClock?.now) ||
+    rows[0].leaseExpiresAt.getTime() <= databaseClock.now.getTime()
+  ) {
+    throw new Error("Movement observation scanner lease expired or was lost.");
+  }
 }
 
 async function lockObservedMovementSelection(
@@ -1163,10 +1284,16 @@ async function markRatePending(
 
 export function createMovementLedger(db: PrismaLike) {
   return {
-    recordObserved: async (input: PaymentMovementDraft) => {
+    recordObserved: async (
+      input: PaymentMovementDraft,
+      observationLease?: PaymentMovementObservationLease,
+    ) => {
       const draft = validateMovementDraft(input);
       return db.$transaction(async (tx) => {
         await lockObservedMovementOrder(tx, draft);
+        if (observationLease) {
+          await assertObservedMovementLease(tx, draft, observationLease);
+        }
         await tx.tonhubPaymentMovement.createMany({
           data: [{
             ...draft,
@@ -1203,13 +1330,17 @@ export function createMovementLedger(db: PrismaLike) {
       reason: string;
       title: string;
       details: Record<string, unknown>;
-    }) => {
+    }, observationLease?: PaymentMovementObservationLease) => {
       const draft = validateMovementDraft(input.movement);
       const validationCode = requiredText(input.validationCode, "Movement validationCode");
       const reason = requiredText(input.reason, "Recovery reason");
       const title = requiredText(input.title, "Recovery title");
       const details = canonicalJsonValue(input.details) as Record<string, unknown>;
       return db.$transaction(async (tx) => {
+        await lockObservedMovementOrder(tx, draft);
+        if (observationLease) {
+          await assertObservedMovementLease(tx, draft, observationLease);
+        }
         await tx.tonhubPaymentMovement.createMany({
           data: [{
             ...draft,
@@ -1283,6 +1414,8 @@ export function createMovementLedger(db: PrismaLike) {
       allocatedBy?: string;
       maxRateAgeMs?: number;
       partialPaymentTtlHours?: number;
+      scannerSettlementHorizonMs?: number;
+      settlementAt?: Date;
     }) => db.$transaction(async (tx) => {
       const orderId = requiredText(input.orderId, "Allocation orderId");
       const movementId = requiredText(input.movementId, "Allocation movementId");
@@ -1291,11 +1424,24 @@ export function createMovementLedger(db: PrismaLike) {
       const allocatedBy = requiredText(input.allocatedBy ?? "system", "Allocation allocatedBy");
       const maxRateAgeMs = input.maxRateAgeMs ?? rateSnapshotMaxAgeMs();
       const partialPaymentTtlHours = input.partialPaymentTtlHours ?? 24;
+      const scannerSettlementHorizonMs = input.scannerSettlementHorizonMs ??
+        crossScannerSettlementHorizonMs();
+      const settlementAt = input.settlementAt ?? new Date();
       if (!Number.isInteger(maxRateAgeMs) || maxRateAgeMs < 0) {
         throw new Error("Movement maxRateAgeMs must be a non-negative integer.");
       }
       if (!Number.isInteger(partialPaymentTtlHours) || partialPaymentTtlHours < 1 || partialPaymentTtlHours > 24 * 30) {
         throw new Error("Movement partialPaymentTtlHours must be an integer between 1 and 720.");
+      }
+      if (
+        !Number.isSafeInteger(scannerSettlementHorizonMs) ||
+        scannerSettlementHorizonMs < 5_000 ||
+        scannerSettlementHorizonMs > 3_600_000
+      ) {
+        throw new Error("Movement scannerSettlementHorizonMs must be between 5000 and 3600000.");
+      }
+      if (!validDate(settlementAt)) {
+        throw new Error("Movement settlementAt must be a valid date.");
       }
       const order = await lockOrder(tx, orderId);
       const baseline = await assertOrderAccountingBaseline(tx, order);
@@ -1339,15 +1485,19 @@ export function createMovementLedger(db: PrismaLike) {
       ]
         .filter((value): value is PaymentMovementRecord => Boolean(value))
         .sort(compareMovementChronology)[0];
-      invoice = await lockInvoicePaymentSelection(
-        tx,
-        invoice,
-        selectionMovement?.blockchainAt ?? movement.blockchainAt,
-      );
+      const lockSelection = async () => {
+        invoice = await lockInvoicePaymentSelection(
+          tx,
+          invoice,
+          selectionMovement?.blockchainAt ?? movement.blockchainAt,
+        );
+      };
       if (movement.status === "HELD_UNDER_MINIMUM") {
+        await lockSelection();
         throw new MovementAllocationConflictError(`Movement ${movement.id} is ${movement.status}.`);
       }
       if (movement.status === "CREDITED") {
+        await lockSelection();
         const allocation = await findCreditAllocation(tx, movement.id);
         if (!allocation) {
           throw new MovementAllocationConflictError("Credited movement has no CREDIT allocation.");
@@ -1356,8 +1506,30 @@ export function createMovementLedger(db: PrismaLike) {
         return { outcome: "credited" as const, movement, allocation, order };
       }
       if (unresolvedMovements[0]?.id !== movement.id) {
+        await lockSelection();
         return {
           outcome: "blocked-earlier-movement" as const,
+          movement,
+          allocation: null,
+          order,
+        };
+      }
+      const activationThresholdValue = nonNegativeInteger(
+        invoice.activationThresholdFiatMicros ?? "0",
+        "Invoice activationThresholdFiatMicros",
+      );
+      const scannerHorizonReady = !(
+        invoice.network === "mainnet" &&
+        BigInt(activationThresholdValue) > BigInt(0)
+      ) || await mainnetScannerHorizonReady(tx, {
+          depositAddressId: movement.depositAddressId,
+          movementBlockchainAt: movement.blockchainAt,
+          horizonMs: scannerSettlementHorizonMs,
+        });
+      await lockSelection();
+      if (!scannerHorizonReady) {
+        return {
+          outcome: "awaiting-scan-horizon" as const,
           movement,
           allocation: null,
           order,
@@ -1480,13 +1652,7 @@ export function createMovementLedger(db: PrismaLike) {
         return { outcome: "held-under-minimum" as const, movement, allocation: null, order };
       }
       const obligation = BigInt(order.fiatAmountMicros);
-      const activationThreshold = invoice.activationThresholdFiatMicros === null ||
-        invoice.activationThresholdFiatMicros === undefined
-        ? BigInt(0)
-        : BigInt(nonNegativeInteger(
-            invoice.activationThresholdFiatMicros,
-            "Invoice activationThresholdFiatMicros",
-          ));
+      const activationThreshold = BigInt(activationThresholdValue);
       if (
         !forceRecovery &&
         baseline.netCredit === BigInt(0) &&

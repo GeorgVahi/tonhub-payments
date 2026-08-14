@@ -1,6 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { Prisma } from "@prisma/client";
 import { prisma } from "../../backend/src/db";
+import type { PaymentMovementObservationLease } from "../../backend/src/movement-ledger";
 import { canonicalTonAddress } from "../../backend/src/ton/gram-shadow-scanner";
 
 const streamType = "USDT_MAINNET_IN";
@@ -8,7 +9,9 @@ const activeStatuses = ["PENDING", "PARTIAL"];
 const terminalStatuses = ["PAID", "EXPIRED", "CANCELLED", "FAILED"];
 
 type PrismaLike = {
+  $transaction: <T>(handler: (tx: PrismaLike) => Promise<T>) => Promise<T>;
   $queryRaw: <T>(query: Prisma.Sql) => Promise<T>;
+  $queryRawUnsafe: <T = unknown>(query: string, ...values: unknown[]) => Promise<T>;
   tonhubDepositAddress: any;
   tonhubScanCursor: any;
 };
@@ -50,6 +53,7 @@ export type MainnetUsdtScannerRepository = {
   completeScan: (input: {
     target: MainnetUsdtScanTarget;
     scannedThroughAt: Date;
+    completedAt: Date;
     nextScanAt: Date;
   }) => Promise<boolean>;
   failScan: (input: {
@@ -65,6 +69,7 @@ export type MainnetUsdtObserver = {
     notAfter: Date;
     limit: number;
     offset: number;
+    observationLease?: PaymentMovementObservationLease;
   }) => Promise<{
     transfersScanned: number;
     discoveryTransfersScanned: number;
@@ -101,6 +106,16 @@ function validDate(value: unknown): value is Date {
 
 function addMs(value: Date, milliseconds: number) {
   return new Date(value.getTime() + milliseconds);
+}
+
+async function readDatabaseClock(db: PrismaLike) {
+  const [row] = await db.$queryRawUnsafe<Array<{ now: Date }>>(
+    `SELECT clock_timestamp() AS "now"`,
+  );
+  if (!validDate(row?.now)) {
+    throw new Error("Mainnet USDT scanner database clock is unavailable.");
+  }
+  return row.now;
 }
 
 function normalizeTarget(deposit: any, cursor: any, workerId: string): MainnetUsdtScanTarget {
@@ -229,26 +244,41 @@ export function createPrismaMainnetUsdtScannerRepository(
         if (!cursor) {
           throw new Error("Mainnet USDT scan cursor was not created.");
         }
-        const lease = await db.tonhubScanCursor.updateMany({
-          where: {
-            id: cursor.id,
-            OR: [
-              {
-                leaseOwner: null,
-                OR: [
-                  { leaseExpiresAt: null },
-                  { leaseExpiresAt: { lte: input.now } },
-                ],
-              },
-              { leaseExpiresAt: { lte: input.now } },
-            ],
-          },
-          data: {
-            leaseOwner: input.workerId,
-            leaseExpiresAt: addMs(input.now, input.leaseMs),
-          },
+        const claimedLease = await db.$transaction(async (tx) => {
+          const [locked] = await tx.$queryRawUnsafe<Array<{
+            id: string;
+            leaseOwner: string | null;
+            leaseExpiresAt: Date | null;
+          }>>(
+            `SELECT "id", "leaseOwner", "leaseExpiresAt"
+             FROM "TonhubScanCursor"
+             WHERE "id" = $1
+             FOR UPDATE`,
+            cursor.id,
+          );
+          if (!locked) {
+            return false;
+          }
+          const databaseNow = await readDatabaseClock(tx);
+          const reclaimable = (
+            locked.leaseOwner === null && locked.leaseExpiresAt === null
+          ) || (
+            validDate(locked.leaseExpiresAt) &&
+            locked.leaseExpiresAt.getTime() <= databaseNow.getTime()
+          );
+          if (!reclaimable) {
+            return false;
+          }
+          const updated = await tx.tonhubScanCursor.updateMany({
+            where: { id: locked.id, leaseOwner: locked.leaseOwner },
+            data: {
+              leaseOwner: input.workerId,
+              leaseExpiresAt: addMs(databaseNow, input.leaseMs),
+            },
+          });
+          return updated.count === 1;
         });
-        if (lease.count !== 1) {
+        if (!claimedLease) {
           continue;
         }
         claimed.push(normalizeTarget(deposit, cursor, input.workerId));
@@ -257,34 +287,73 @@ export function createPrismaMainnetUsdtScannerRepository(
     },
 
     renewLease: async (input) => {
-      const renewed = await db.tonhubScanCursor.updateMany({
-        where: {
-          network: "mainnet",
+      return db.$transaction(async (tx) => {
+        const [locked] = await tx.$queryRawUnsafe<Array<{
+          id: string;
+          leaseExpiresAt: Date | null;
+        }>>(
+          `SELECT "id", "leaseExpiresAt"
+           FROM "TonhubScanCursor"
+           WHERE "network" = 'mainnet'
+             AND "streamType" = $1
+             AND "scopeKey" = $2
+             AND "leaseOwner" = $3
+           FOR UPDATE`,
           streamType,
-          scopeKey: input.target.depositAddressId,
-          leaseOwner: input.target.leaseOwner,
-        },
-        data: { leaseExpiresAt: addMs(input.now, input.leaseMs) },
+          input.target.depositAddressId,
+          input.target.leaseOwner,
+        );
+        const databaseNow = await readDatabaseClock(tx);
+        if (
+          !locked ||
+          !validDate(locked.leaseExpiresAt) ||
+          locked.leaseExpiresAt.getTime() <= databaseNow.getTime()
+        ) {
+          return false;
+        }
+        const renewed = await tx.tonhubScanCursor.updateMany({
+          where: { id: locked.id, leaseOwner: input.target.leaseOwner },
+          data: { leaseExpiresAt: addMs(databaseNow, input.leaseMs) },
+        });
+        return renewed.count === 1;
       });
-      return renewed.count === 1;
     },
 
-    completeScan: async (input) => {
-      const completed = await db.tonhubScanCursor.updateMany({
-        where: {
-          network: "mainnet",
-          streamType,
-          scopeKey: input.target.depositAddressId,
-          leaseOwner: input.target.leaseOwner,
-        },
+    completeScan: (input) => db.$transaction(async (tx) => {
+      const [locked] = await tx.$queryRawUnsafe<Array<{
+        id: string;
+        leaseExpiresAt: Date | null;
+      }>>(
+        `SELECT "id", "leaseExpiresAt"
+         FROM "TonhubScanCursor"
+         WHERE "network" = 'mainnet'
+           AND "streamType" = $1
+           AND "scopeKey" = $2
+           AND "leaseOwner" = $3
+         FOR UPDATE`,
+        streamType,
+        input.target.depositAddressId,
+        input.target.leaseOwner,
+      );
+      const databaseNow = await readDatabaseClock(tx);
+      if (
+        !locked ||
+        !validDate(locked.leaseExpiresAt) ||
+        locked.leaseExpiresAt.getTime() <= databaseNow.getTime()
+      ) {
+        return false;
+      }
+      const completed = await tx.tonhubScanCursor.updateMany({
+        where: { id: locked.id, leaseOwner: input.target.leaseOwner },
         data: {
           lastTimestamp: input.scannedThroughAt,
+          scannedThroughAt: input.scannedThroughAt,
           leaseOwner: null,
           leaseExpiresAt: input.nextScanAt,
         },
       });
       return completed.count === 1;
-    },
+    }),
 
     failScan: async (input) => {
       const failed = await db.tonhubScanCursor.updateMany({
@@ -382,7 +451,9 @@ export async function runMainnetUsdtScanBatch(input: {
     throw new Error("Mainnet USDT candidatePoolSize cannot be smaller than limit.");
   }
 
-  const repository = input.repository ?? createPrismaMainnetUsdtScannerRepository(prisma);
+  const repository = input.repository ?? createPrismaMainnetUsdtScannerRepository(
+    prisma as unknown as PrismaLike,
+  );
   const targets = await repository.claimDueTargets({
     workerId,
     now,
@@ -432,6 +503,11 @@ export async function runMainnetUsdtScanBatch(input: {
           notAfter: now,
           limit: pageSize,
           offset,
+          observationLease: {
+            streamType,
+            leaseOwner: target.leaseOwner,
+            clock,
+          },
         });
         totals.transfersScanned += result.transfersScanned;
         totals.discoveryTransfersScanned += result.discoveryTransfersScanned;
@@ -464,6 +540,7 @@ export async function runMainnetUsdtScanBatch(input: {
       if (!await repository.completeScan({
         target,
         scannedThroughAt: now,
+        completedAt: clock(),
         nextScanAt,
       })) {
         throw new Error("Mainnet USDT scan completion lease was lost.");

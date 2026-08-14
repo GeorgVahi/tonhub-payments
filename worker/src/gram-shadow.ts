@@ -1,6 +1,10 @@
 import { randomUUID } from "node:crypto";
 import { prisma } from "../../backend/src/db";
-import { movementLedger, type PaymentMovementDraft } from "../../backend/src/movement-ledger";
+import {
+  movementLedger,
+  type PaymentMovementDraft,
+  type PaymentMovementObservationLease,
+} from "../../backend/src/movement-ledger";
 import {
   fetchTonTransactions,
   resolveTonApiConfig,
@@ -21,6 +25,7 @@ const terminalStatuses = ["PAID", "EXPIRED", "CANCELLED", "FAILED"];
 
 type PrismaLike = {
   $transaction: <T>(handler: (tx: PrismaLike) => Promise<T>) => Promise<T>;
+  $queryRawUnsafe: <T = unknown>(query: string, ...values: unknown[]) => Promise<T>;
   tonhubPaymentInvoice: any;
   tonhubScanCursor: any;
 };
@@ -63,6 +68,7 @@ export type GramShadowScannerRepository = {
   completeScan: (input: {
     target: GramShadowScanTarget;
     scannedAt: Date;
+    completedAt: Date;
     nextScanAt: Date | null;
     terminalMonitorUntil: Date | null;
     cursor: { hash: string; lt: string; timestamp: Date } | null;
@@ -74,7 +80,10 @@ export type GramShadowScannerRepository = {
 };
 
 type GramShadowLedger = {
-  recordObserved: (input: PaymentMovementDraft) => Promise<unknown>;
+  recordObserved: (
+    input: PaymentMovementDraft,
+    observationLease?: PaymentMovementObservationLease,
+  ) => Promise<unknown>;
 };
 
 export type GramShadowScanOutcome = {
@@ -92,6 +101,16 @@ function validDate(value: unknown): value is Date {
 
 function addMs(date: Date, ms: number) {
   return new Date(date.getTime() + ms);
+}
+
+async function readDatabaseClock(db: PrismaLike) {
+  const [row] = await db.$queryRawUnsafe<Array<{ now: Date }>>(
+    `SELECT clock_timestamp() AS "now"`,
+  );
+  if (!validDate(row?.now)) {
+    throw new Error("GRAM scanner database clock is unavailable.");
+  }
+  return row.now;
 }
 
 function normalizeTarget(invoice: any, cursor: any, workerId: string): GramShadowScanTarget {
@@ -224,21 +243,39 @@ export function createPrismaGramShadowScannerRepository(
         if (!cursor) {
           throw new Error("GRAM scan cursor was not created.");
         }
-        const lease = await db.tonhubScanCursor.updateMany({
-          where: {
-            id: cursor.id,
-            OR: [
-              { leaseOwner: input.workerId },
-              { leaseOwner: null },
-              { leaseExpiresAt: { lte: input.now } },
-            ],
-          },
-          data: {
-            leaseOwner: input.workerId,
-            leaseExpiresAt: addMs(input.now, input.leaseMs),
-          },
+        const claimedLease = await db.$transaction(async (tx) => {
+          const [locked] = await tx.$queryRawUnsafe<Array<{
+            id: string;
+            leaseOwner: string | null;
+            leaseExpiresAt: Date | null;
+          }>>(
+            `SELECT "id", "leaseOwner", "leaseExpiresAt"
+             FROM "TonhubScanCursor"
+             WHERE "id" = $1
+             FOR UPDATE`,
+            cursor.id,
+          );
+          if (!locked) {
+            return false;
+          }
+          const databaseNow = await readDatabaseClock(tx);
+          const reclaimable = locked.leaseOwner === input.workerId ||
+            locked.leaseOwner === null ||
+            (validDate(locked.leaseExpiresAt) &&
+              locked.leaseExpiresAt.getTime() <= databaseNow.getTime());
+          if (!reclaimable) {
+            return false;
+          }
+          const updated = await tx.tonhubScanCursor.updateMany({
+            where: { id: locked.id, leaseOwner: locked.leaseOwner },
+            data: {
+              leaseOwner: input.workerId,
+              leaseExpiresAt: addMs(databaseNow, input.leaseMs),
+            },
+          });
+          return updated.count === 1;
         });
-        if (lease.count !== 1) {
+        if (!claimedLease) {
           continue;
         }
         const currentCursor = await db.tonhubScanCursor.findUnique({ where: { id: cursor.id } });
@@ -248,20 +285,66 @@ export function createPrismaGramShadowScannerRepository(
     },
 
     renewLease: async (input) => {
-      const result = await db.tonhubScanCursor.updateMany({
-        where: {
-          network: input.target.network,
+      return db.$transaction(async (tx) => {
+        const [locked] = await tx.$queryRawUnsafe<Array<{
+          id: string;
+          leaseExpiresAt: Date | null;
+        }>>(
+          `SELECT "id", "leaseExpiresAt"
+           FROM "TonhubScanCursor"
+           WHERE "network" = $1
+             AND "streamType" = $2
+             AND "scopeKey" = $3
+             AND "leaseOwner" = $4
+           FOR UPDATE`,
+          input.target.network,
           streamType,
-          scopeKey: input.target.depositAddressId,
-          leaseOwner: input.target.leaseOwner,
-        },
-        data: { leaseExpiresAt: addMs(input.now, input.leaseMs) },
+          input.target.depositAddressId,
+          input.target.leaseOwner,
+        );
+        const databaseNow = await readDatabaseClock(tx);
+        if (
+          !locked ||
+          !validDate(locked.leaseExpiresAt) ||
+          locked.leaseExpiresAt.getTime() <= databaseNow.getTime()
+        ) {
+          return false;
+        }
+        const renewed = await tx.tonhubScanCursor.updateMany({
+          where: { id: locked.id, leaseOwner: input.target.leaseOwner },
+          data: { leaseExpiresAt: addMs(databaseNow, input.leaseMs) },
+        });
+        return renewed.count === 1;
       });
-      return result.count === 1;
     },
 
     completeScan: (input) => db.$transaction(async (tx) => {
+      const [locked] = await tx.$queryRawUnsafe<Array<{
+        id: string;
+        leaseExpiresAt: Date | null;
+      }>>(
+        `SELECT "id", "leaseExpiresAt"
+         FROM "TonhubScanCursor"
+         WHERE "network" = $1
+           AND "streamType" = $2
+           AND "scopeKey" = $3
+           AND "leaseOwner" = $4
+         FOR UPDATE`,
+        input.target.network,
+        streamType,
+        input.target.depositAddressId,
+        input.target.leaseOwner,
+      );
+      const databaseNow = await readDatabaseClock(tx);
+      if (
+        !locked ||
+        !validDate(locked.leaseExpiresAt) ||
+        locked.leaseExpiresAt.getTime() <= databaseNow.getTime()
+      ) {
+        return false;
+      }
       const cursorData: Record<string, unknown> = {
+        scannedThroughAt: input.scannedAt,
         leaseOwner: null,
         leaseExpiresAt: null,
       };
@@ -271,12 +354,7 @@ export function createPrismaGramShadowScannerRepository(
         cursorData.lastTimestamp = input.cursor.timestamp;
       }
       const released = await tx.tonhubScanCursor.updateMany({
-        where: {
-          network: input.target.network,
-          streamType,
-          scopeKey: input.target.depositAddressId,
-          leaseOwner: input.target.leaseOwner,
-        },
+        where: { id: locked.id, leaseOwner: input.target.leaseOwner },
         data: cursorData,
       });
       if (released.count !== 1) {
@@ -455,7 +533,19 @@ async function scanTarget(input: {
       throw new Error(`GRAM shadow fingerprint ${movement.fingerprint} has conflicting page evidence.`);
     }
     observedIdentities.set(movement.fingerprint, identity);
-    await input.ledger.recordObserved(movement);
+    const leaseNow = input.clock();
+    if (!await input.repository.renewLease({
+      target: input.target,
+      now: leaseNow,
+      leaseMs: input.leaseMs,
+    })) {
+      throw new Error("GRAM shadow scan lease expired before movement journaling.");
+    }
+    await input.ledger.recordObserved(movement, {
+      streamType,
+      leaseOwner: input.target.leaseOwner,
+      clock: input.clock,
+    });
     movementsObserved += 1;
   }
   return {
@@ -559,6 +649,7 @@ export async function runGramShadowScanBatch(input: {
       if (!await repository.completeScan({
         target,
         scannedAt: now,
+        completedAt: clock(),
         nextScanAt,
         terminalMonitorUntil,
         cursor: result.newestCursor,

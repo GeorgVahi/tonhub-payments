@@ -12,6 +12,7 @@ import {
   officialMainnetUsdtMasterAddress,
   resolveMainnetUsdtAdapterConfig,
 } from "../backend/src/ton/mainnet-usdt";
+import { createPrismaGramShadowScannerRepository } from "../worker/src/gram-shadow";
 import { createPrismaMainnetUsdtScannerRepository } from "../worker/src/mainnet-usdt";
 
 const prisma = new PrismaClient();
@@ -27,6 +28,10 @@ const ids = {
   address: `ledger-address-${suffix}`,
   rawAddress: `0:ledger-address-${suffix}`,
 };
+
+function delay(milliseconds: number) {
+  return new Promise((resolve) => setTimeout(resolve, milliseconds));
+}
 
 try {
   await prisma.tonhubPaymentOrder.create({
@@ -700,6 +705,7 @@ try {
   assert.equal(await scannerRepository.completeScan({
     target: claimedMainnetTarget,
     scannedThroughAt: new Date("2026-08-13T10:30:00.000Z"),
+    completedAt: new Date("2026-08-13T10:30:00.000Z"),
     nextScanAt: new Date("2026-08-13T10:30:15.000Z"),
   }), true);
   const storedMainnetCursor = await prisma.tonhubScanCursor.findUniqueOrThrow({
@@ -712,8 +718,328 @@ try {
     },
   });
   assert.equal(storedMainnetCursor.lastTimestamp?.toISOString(), "2026-08-13T10:30:00.000Z");
+  assert.equal(storedMainnetCursor.scannedThroughAt?.toISOString(), "2026-08-13T10:30:00.000Z");
   assert.equal(storedMainnetCursor.leaseOwner, null);
   assert.equal(storedMainnetCursor.leaseExpiresAt?.toISOString(), "2026-08-13T10:30:15.000Z");
+
+  const waitingForGramHorizon = await ledger.creditMovement({
+    movementId: mainnetMovement.id,
+    orderId: mainnetOrderId,
+    invoiceId: mainnetInvoiceId,
+    validationCode: "JETTON_INBOUND_V1",
+    maxRateAgeMs: 3_600_000,
+    scannerSettlementHorizonMs: 60_000,
+    settlementAt: new Date("2026-08-13T10:30:00.000Z"),
+  });
+  assert.equal(waitingForGramHorizon.outcome, "awaiting-scan-horizon");
+  assert.equal(await prisma.tonhubMovementAllocation.count({
+    where: { movementId: mainnetMovement.id },
+  }), 0);
+  const gramMainnetCursor = await prisma.tonhubScanCursor.create({
+    data: {
+      network: "mainnet",
+      streamType: "GRAM_NATIVE_IN",
+      scopeKey: mainnetDepositId,
+      scannedThroughAt: new Date("2026-08-13T10:30:00.000Z"),
+      leaseOwner: `gram-horizon-${suffix}`,
+      leaseExpiresAt: new Date(Date.now() + 60_000),
+    },
+  });
+  await assert.rejects(prisma.tonhubScanCursor.update({
+    where: { id: gramMainnetCursor.id },
+    data: { scannedThroughAt: new Date("2026-08-13T10:29:59.999Z") },
+  }));
+  await assert.rejects(prisma.tonhubScanCursor.update({
+    where: { id: gramMainnetCursor.id },
+    data: { scannedThroughAt: null },
+  }));
+  assert.equal((await ledger.creditMovement({
+    movementId: mainnetMovement.id,
+    orderId: mainnetOrderId,
+    invoiceId: mainnetInvoiceId,
+    validationCode: "JETTON_INBOUND_V1",
+    maxRateAgeMs: 3_600_000,
+    scannerSettlementHorizonMs: 60_000,
+    settlementAt: new Date("2026-08-13T10:30:00.000Z"),
+  })).outcome, "awaiting-scan-horizon");
+  await prisma.tonhubScanCursor.update({
+    where: { id: gramMainnetCursor.id },
+    data: { leaseOwner: null, leaseExpiresAt: null },
+  });
+  await prisma.$executeRawUnsafe(`
+    CREATE OR REPLACE FUNCTION tonhub_verify_horizon_lock_pause()
+    RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+    BEGIN
+      IF OLD."status" IS DISTINCT FROM 'CREDITED' AND NEW."status" = 'CREDITED' THEN
+        PERFORM pg_sleep(1);
+      END IF;
+      RETURN NEW;
+    END;
+    $$
+  `);
+  await prisma.$executeRawUnsafe(`
+    CREATE TRIGGER "TonhubPaymentMovement_verify_horizon_lock_pause"
+    BEFORE UPDATE OF "status" ON "TonhubPaymentMovement"
+    FOR EACH ROW EXECUTE FUNCTION tonhub_verify_horizon_lock_pause()
+  `);
+  const creditPromise = ledger.creditMovement({
+    movementId: mainnetMovement.id,
+    orderId: mainnetOrderId,
+    invoiceId: mainnetInvoiceId,
+    validationCode: "JETTON_INBOUND_V1",
+    maxRateAgeMs: 3_600_000,
+    scannerSettlementHorizonMs: 60_000,
+    settlementAt: new Date("2026-08-13T10:30:00.000Z"),
+  });
+  let creditPausedWithCursorLocks = false;
+  for (let index = 0; index < 40; index += 1) {
+    const [activity] = await prisma.$queryRawUnsafe<Array<{ paused: boolean }>>(
+      `SELECT EXISTS (
+         SELECT 1 FROM pg_stat_activity
+         WHERE datname = current_database()
+           AND pid <> pg_backend_pid()
+           AND wait_event = 'PgSleep'
+       ) AS paused`,
+    );
+    if (activity?.paused) {
+      creditPausedWithCursorLocks = true;
+      break;
+    }
+    await delay(25);
+  }
+  assert.equal(creditPausedWithCursorLocks, true);
+  let claimCompleted = false;
+  const concurrentClaim = prisma.tonhubScanCursor.updateMany({
+    where: {
+      id: gramMainnetCursor.id,
+      leaseOwner: null,
+      OR: [
+        { leaseExpiresAt: null },
+        { leaseExpiresAt: { lte: new Date("2026-08-13T10:30:00.000Z") } },
+      ],
+    },
+    data: {
+      leaseOwner: `concurrent-claim-${suffix}`,
+      leaseExpiresAt: new Date("2026-08-13T10:31:00.000Z"),
+    },
+  }).finally(() => {
+    claimCompleted = true;
+  });
+  await delay(100);
+  assert.equal(claimCompleted, false);
+  const creditedMainnetMovement = await creditPromise;
+  assert.equal((await concurrentClaim).count, 1);
+  await prisma.$executeRawUnsafe(
+    `DROP TRIGGER "TonhubPaymentMovement_verify_horizon_lock_pause" ON "TonhubPaymentMovement"`,
+  );
+  await prisma.$executeRawUnsafe(`DROP FUNCTION tonhub_verify_horizon_lock_pause()`);
+  assert.equal(creditedMainnetMovement.outcome, "credited");
+  assert.equal(creditedMainnetMovement.order.status, "PAID");
+
+  const rolloutOrderId = `ledger-rollout-lock-order-${suffix}`;
+  const rolloutInvoiceId = `ledger-rollout-lock-invoice-${suffix}`;
+  const rolloutDepositId = `ledger-rollout-lock-deposit-${suffix}`;
+  const rolloutOwnerRaw = `0:${"54".repeat(32)}`;
+  const rolloutAddress = mainnetFriendly(rolloutOwnerRaw);
+  await prisma.tonhubPaymentOrder.create({
+    data: {
+      id: rolloutOrderId,
+      externalId: `ledger-rollout-lock-external-${suffix}`,
+      fiatAmountMicros: "5000000",
+      fiatCurrency: "USD",
+      expiresAt: new Date("2026-08-13T11:00:00.000Z"),
+    },
+  });
+  const rolloutInvoice = await prisma.tonhubPaymentInvoice.create({
+    data: {
+      id: rolloutInvoiceId,
+      orderId: rolloutOrderId,
+      network: "mainnet",
+      checkoutAsset: "GRAM",
+      asset: "GRAM",
+      assetKind: "NATIVE",
+      assetDecimals: 9,
+      fiatAmountCents: 500,
+      fiatAmountMicros: "5000000",
+      remainingFiatMicros: "5000000",
+      activationThresholdFiatMicros: "2500000",
+      fiatCurrency: "USD",
+      address: rolloutAddress,
+      addressRaw: rolloutOwnerRaw,
+      walletVersion: "v5r1",
+      walletWorkchain: 0,
+      walletContext: suffix === "clean" ? 810_041 : 810_042,
+      walletNetworkGlobalId: -239,
+      walletPublicKeyHash: `ledger-rollout-lock-key-${suffix}`,
+      amountNano: "2000000000",
+      amountAtomic: "2000000000",
+      reference: `ledger-rollout-lock-reference-${suffix}`,
+      expiresAt: new Date("2026-08-13T11:00:00.000Z"),
+      priceLockedAt: new Date("2026-08-13T10:00:00.000Z"),
+      priceLockedUntil: new Date("2026-08-13T11:00:00.000Z"),
+      scanPriorityAt: new Date("2026-08-13T10:30:00.000Z"),
+      createdAt: new Date("2026-08-13T10:00:00.000Z"),
+      updatedAt: new Date("2026-08-13T10:00:00.000Z"),
+    },
+  });
+  await prisma.tonhubDepositAddress.create({
+    data: {
+      id: rolloutDepositId,
+      invoiceId: rolloutInvoiceId,
+      network: "mainnet",
+      address: rolloutAddress,
+      addressRaw: rolloutOwnerRaw,
+      walletVersion: "v5r1",
+      walletWorkchain: 0,
+      walletContext: suffix === "clean" ? 810_041 : 810_042,
+      walletNetworkGlobalId: -239,
+      walletPublicKeyHash: `ledger-rollout-lock-key-${suffix}`,
+      status: "ACTIVE",
+    },
+  });
+  const rolloutMovement = await prisma.tonhubPaymentMovement.create({
+    data: {
+      fingerprint: `ton:mainnet:native-in:rollout-lock-${suffix}:0`,
+      depositAddressId: rolloutDepositId,
+      network: "mainnet",
+      direction: "INCOMING",
+      asset: "GRAM",
+      assetKind: "NATIVE",
+      assetDecimals: 9,
+      amountAtomic: "2000000000",
+      fromAddress: mainnetSenderRaw,
+      toAddress: rolloutOwnerRaw,
+      transactionHash: `rollout-lock-${suffix}`,
+      transactionLt: "930001",
+      blockchainAt: new Date("2026-08-13T10:10:00.000Z"),
+      rawPayload: { verifier: "rollout-null-selection" },
+    },
+  });
+  const rolloutGramCursor = await prisma.tonhubScanCursor.create({
+    data: {
+      network: "mainnet",
+      streamType: "GRAM_NATIVE_IN",
+      scopeKey: rolloutDepositId,
+      scannedThroughAt: new Date("2026-08-13T10:30:00.000Z"),
+      leaseOwner: `rollout-completion-${suffix}`,
+      leaseExpiresAt: new Date(Date.now() + 60_000),
+    },
+  });
+  await prisma.tonhubScanCursor.create({
+    data: {
+      network: "mainnet",
+      streamType: "USDT_MAINNET_IN",
+      scopeKey: rolloutDepositId,
+      scannedThroughAt: new Date("2026-08-13T10:30:00.000Z"),
+    },
+  });
+  await prisma.$executeRawUnsafe(`
+    CREATE OR REPLACE FUNCTION tonhub_verify_rollout_completion_pause()
+    RETURNS trigger
+    LANGUAGE plpgsql
+    AS $$
+    BEGIN
+      IF OLD."leaseOwner" LIKE 'rollout-completion-%' AND NEW."leaseOwner" IS NULL THEN
+        PERFORM pg_sleep(1);
+      END IF;
+      RETURN NEW;
+    END;
+    $$
+  `);
+  await prisma.$executeRawUnsafe(`
+    CREATE TRIGGER "TonhubScanCursor_verify_rollout_completion_pause"
+    BEFORE UPDATE ON "TonhubScanCursor"
+    FOR EACH ROW EXECUTE FUNCTION tonhub_verify_rollout_completion_pause()
+  `);
+  const gramScannerRepository = createPrismaGramShadowScannerRepository(prisma as any);
+  const completionPromise = gramScannerRepository.completeScan({
+    target: {
+      invoiceId: rolloutInvoiceId,
+      depositAddressId: rolloutDepositId,
+      network: "mainnet",
+      depositNetwork: "mainnet",
+      address: rolloutAddress,
+      addressRaw: rolloutOwnerRaw,
+      invoiceAddress: rolloutAddress,
+      invoiceAddressRaw: rolloutOwnerRaw,
+      status: "PENDING",
+      createdAt: rolloutInvoice.createdAt,
+      updatedAt: rolloutInvoice.updatedAt,
+      terminalMonitorUntil: null,
+      cursor: { hash: null, lt: null, timestamp: null },
+      leaseOwner: `rollout-completion-${suffix}`,
+    },
+    scannedAt: new Date("2026-08-13T10:30:00.000Z"),
+    completedAt: new Date(),
+    nextScanAt: new Date("2026-08-13T10:30:15.000Z"),
+    terminalMonitorUntil: null,
+    cursor: null,
+  });
+  let completionPausedWithCursorLock = false;
+  for (let index = 0; index < 40; index += 1) {
+    const [activity] = await prisma.$queryRawUnsafe<Array<{ paused: boolean }>>(
+      `SELECT EXISTS (
+         SELECT 1 FROM pg_stat_activity
+         WHERE datname = current_database()
+           AND pid <> pg_backend_pid()
+           AND wait_event = 'PgSleep'
+       ) AS paused`,
+    );
+    if (activity?.paused) {
+      completionPausedWithCursorLock = true;
+      break;
+    }
+    await delay(25);
+  }
+  assert.equal(completionPausedWithCursorLock, true);
+  const rolloutCreditPromise = ledger.creditMovement({
+    movementId: rolloutMovement.id,
+    orderId: rolloutOrderId,
+    invoiceId: rolloutInvoiceId,
+    validationCode: "NATIVE_INBOUND_V1",
+    maxRateAgeMs: 3_600_000,
+    scannerSettlementHorizonMs: 60_000,
+    settlementAt: new Date("2026-08-13T10:30:00.000Z"),
+  });
+  let settlementWaitingForCursor = false;
+  for (let index = 0; index < 40; index += 1) {
+    const [activity] = await prisma.$queryRawUnsafe<Array<{ waiting: boolean }>>(
+      `SELECT EXISTS (
+         SELECT 1 FROM pg_stat_activity
+         WHERE datname = current_database()
+           AND pid <> pg_backend_pid()
+           AND wait_event_type = 'Lock'
+       ) AS waiting`,
+    );
+    if (activity?.waiting) {
+      settlementWaitingForCursor = true;
+      break;
+    }
+    await delay(25);
+  }
+  assert.equal(settlementWaitingForCursor, true);
+  const [rolloutCompletion, rolloutCredit] = await Promise.all([
+    completionPromise,
+    rolloutCreditPromise,
+  ]);
+  await prisma.$executeRawUnsafe(
+    `DROP TRIGGER "TonhubScanCursor_verify_rollout_completion_pause" ON "TonhubScanCursor"`,
+  );
+  await prisma.$executeRawUnsafe(`DROP FUNCTION tonhub_verify_rollout_completion_pause()`);
+  assert.equal(rolloutCompletion, true);
+  assert.equal(rolloutCredit.outcome, "credited");
+  assert.equal(
+    (await prisma.tonhubPaymentInvoice.findUniqueOrThrow({ where: { id: rolloutInvoiceId } }))
+      .paymentSelectionLockedAsset,
+    "GRAM",
+  );
+  assert.equal(
+    (await prisma.tonhubScanCursor.findUniqueOrThrow({ where: { id: rolloutGramCursor.id } }))
+      .leaseOwner,
+    null,
+  );
 
   const rejectedJettonDraft = {
     fingerprint: `ton:testnet:jetton-rejected:${"d4".repeat(32)}:85:${internalMasterRaw}:${internalWalletRaw}`,

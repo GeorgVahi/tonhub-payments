@@ -25,6 +25,9 @@ const ids = {
   reference: `gram-shadow-reference-${suffix}`,
 };
 const transactionHash = (suffix === "clean" ? "bc" : "cd").repeat(32);
+const delay = (milliseconds: number) => new Promise<void>((resolve) => {
+  setTimeout(resolve, milliseconds);
+});
 
 try {
   await prisma.tonhubPaymentInvoice.updateMany({
@@ -104,6 +107,63 @@ try {
   assert.ok(claimed);
   assert.equal(await repository.failScan({ target: claimed, retryAt: now }), true);
 
+  const expiringTarget = (await repository.claimDueTargets({
+    ...claimInput,
+    workerId: `expiring-${suffix}`,
+    leaseMs: 500,
+  }))[0];
+  assert.ok(expiringTarget);
+  let confirmCursorLocked!: () => void;
+  const cursorLocked = new Promise<void>((resolve) => {
+    confirmCursorLocked = resolve;
+  });
+  let releaseCursor!: () => void;
+  const cursorRelease = new Promise<void>((resolve) => {
+    releaseCursor = resolve;
+  });
+  const cursorBlocker = prisma.$transaction(async (tx) => {
+    await tx.$queryRawUnsafe(
+      `SELECT "id"
+       FROM "TonhubScanCursor"
+       WHERE "network" = 'testnet'
+         AND "streamType" = 'GRAM_NATIVE_IN'
+         AND "scopeKey" = $1
+       FOR UPDATE`,
+      ids.deposit,
+    );
+    confirmCursorLocked();
+    await cursorRelease;
+  });
+  await cursorLocked;
+  const staleApplicationTime = new Date();
+  const delayedRenew = repository.renewLease({
+    target: expiringTarget,
+    now: staleApplicationTime,
+    leaseMs: 60_000,
+  });
+  const delayedCompletion = repository.completeScan({
+    target: expiringTarget,
+    scannedAt: now,
+    completedAt: staleApplicationTime,
+    nextScanAt: new Date(now.getTime() + 15_000),
+    terminalMonitorUntil: null,
+    cursor: null,
+  });
+  await delay(700);
+  const [leaseState] = await prisma.$queryRawUnsafe<Array<{ expired: boolean }>>(
+    `SELECT clock_timestamp() >= "leaseExpiresAt" AS "expired"
+     FROM "TonhubScanCursor"
+     WHERE "network" = 'testnet'
+       AND "streamType" = 'GRAM_NATIVE_IN'
+       AND "scopeKey" = $1`,
+    ids.deposit,
+  );
+  assert.equal(leaseState?.expired, true);
+  releaseCursor();
+  await cursorBlocker;
+  assert.deepEqual(await Promise.all([delayedRenew, delayedCompletion]), [false, false]);
+  assert.equal(await repository.failScan({ target: expiringTarget, retryAt: now }), true);
+
   const fetchTransactions = async () => ({
     transactions: [
       {
@@ -179,6 +239,7 @@ try {
     },
   });
   assert.equal(cursor?.lastHash, transactionHash);
+  assert.equal(cursor?.scannedThroughAt?.toISOString(), "2026-08-13T10:30:00.000Z");
   assert.equal(cursor?.leaseOwner, null);
   assert.equal(cursor?.leaseExpiresAt, null);
 
@@ -227,6 +288,7 @@ try {
   assert.equal(await repository.completeScan({
     target: staleTarget,
     scannedAt: new Date(terminalAt.getTime() + 1_000),
+    completedAt: new Date(terminalAt.getTime() + 1_000),
     nextScanAt: new Date(terminalAt.getTime() + 15_000),
     terminalMonitorUntil: null,
     cursor: {

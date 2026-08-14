@@ -115,6 +115,11 @@ covering invoices created by an old process near the migration boundary.
   order at the database boundary, and recovery cases are idempotent per
   movement/reason. Deposit addresses carry a dedicated settlement retry time so
   worker backoff and queue fairness do not reuse scanner or sweep timestamps.
+- Each scanner cursor records a separate monotonic `scannedThroughAt` proof.
+  Mainnet automatic credit waits for both the native-GRAM and official-USDT
+  streams to cross the configured post-movement horizon and for their active
+  leases to finish. Empty successful scans advance the proof; failures and
+  capped pagination do not.
 - New TON orders snapshot their minimum-order, GRAM-discount, intermediate-sweep,
   and automatic-sweep-count policies. Those terms and the gross fiat obligation
   are immutable; legacy orders retain zero-valued compatibility defaults.

@@ -200,6 +200,8 @@ async function main() {
       assetDecimals: 6,
       fiatAmountCents: 500,
       fiatAmountMicros: "5000000",
+      remainingFiatMicros: "5000000",
+      activationThresholdFiatMicros: "2500000",
       fiatCurrency: "USD",
       address: mainnetOwner.toString(),
       addressRaw: mainnetOwner.toRawString(),
@@ -211,6 +213,8 @@ async function main() {
       amountNano: "5000000",
       amountAtomic: "5000000",
       reference: `admin-usdt-reference-${suffix}`,
+      createdAt: baseTime,
+      updatedAt: baseTime,
     },
   });
   await prisma.tonhubDepositAddress.create({
@@ -241,6 +245,47 @@ async function main() {
       verifiedAt: baseTime,
     },
   });
+  const mainnetAttachMovementId = `admin-mainnet-attach-${suffix}`;
+  await prisma.tonhubPaymentMovement.create({
+    data: {
+      id: mainnetAttachMovementId,
+      fingerprint: `admin-mainnet-gram-in:${suffix}`,
+      depositAddressId: usdtDepositId,
+      network: "mainnet",
+      direction: "INCOMING",
+      asset: "GRAM",
+      assetKind: "NATIVE",
+      assetDecimals: 9,
+      amountAtomic: "5000000000",
+      fromAddress: refundRecipient.toRawString(),
+      toAddress: mainnetOwner.toRawString(),
+      ownerAddress: mainnetOwner.toRawString(),
+      transactionHash: (suffix === "clean" ? "d3" : "d4").repeat(32),
+      transactionLt: "960002",
+      blockchainAt: baseTime,
+      status: "OBSERVED",
+    },
+  });
+  assert.equal((await repository.attachMovement({
+    adminUsername: "merchant",
+    movementId: mainnetAttachMovementId,
+    orderId: usdtOrderId,
+    invoiceId: usdtInvoiceId,
+  })).outcome, "awaiting-scan-horizon");
+  await prisma.tonhubScanCursor.createMany({
+    data: ["GRAM_NATIVE_IN", "USDT_MAINNET_IN"].map((streamType) => ({
+      network: "mainnet",
+      streamType,
+      scopeKey: usdtDepositId,
+      scannedThroughAt: new Date(baseTime.getTime() + 60_000),
+    })),
+  });
+  assert.equal((await repository.attachMovement({
+    adminUsername: "merchant",
+    movementId: mainnetAttachMovementId,
+    orderId: usdtOrderId,
+    invoiceId: usdtInvoiceId,
+  })).outcome, "credited");
   const queued = await repository.queueSweep({
     adminUsername: "merchant",
     depositAddressId: usdtDepositId,

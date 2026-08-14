@@ -62,6 +62,11 @@ GRAM-only. A production USDT rollout therefore runs the rate, USDT observer,
 GRAM shadow observer, settlement, native-sweep, and asset-sweep workers before
 enabling the public switch. The GRAM observer must include mainnet so a native
 transfer sent to a USDT checkout is still discovered and valued in fiat.
+Mainnet fiat settlement waits until both deposit scanners have completed a
+successful pass through the movement time plus
+`TON_CROSS_SCANNER_SETTLEMENT_HORIZON_SECONDS` (default `60`, allowed `5..3600`)
+and neither scanner still holds an active lease. Failed or pagination-capped
+passes do not advance this durable horizon.
 
 ### Small mainnet USDT canary
 
@@ -118,6 +123,8 @@ paid deposit-wallet balances to move to `TON_*_SWEEP_RECIPIENT_ADDRESS`.
 - `TON_TESTNET_DEPOSIT_SECRET_KEY`, `TON_MAINNET_DEPOSIT_SECRET_KEY`
 - `TON_TESTNET_SWEEP_RECIPIENT_ADDRESS`, `TON_MAINNET_SWEEP_RECIPIENT_ADDRESS`
 - `TON_MAINNET_GAS_SERVICE_SECRET_KEY` (USDT sweep worker only)
+- `TON_CROSS_SCANNER_SETTLEMENT_HORIZON_SECONDS` (default `60`; mainnet
+  cross-asset indexing safety delay)
 
 Keep `TON_*_DEPOSIT_SECRET_KEY` only in the worker environment. The backend
 derives unique deposit addresses from public keys and does not need signing

@@ -14,7 +14,7 @@ type PrismaLike = {
 };
 
 type MovementCreditResult = {
-  outcome: "credited" | "rate-pending" | "held-under-minimum" | "recovery" | "blocked-earlier-movement";
+  outcome: "credited" | "rate-pending" | "held-under-minimum" | "recovery" | "blocked-earlier-movement" | "awaiting-scan-horizon";
   movement: { id: string };
 };
 
@@ -27,6 +27,8 @@ type MovementCreditor = {
     allocatedBy?: string;
     maxRateAgeMs?: number;
     partialPaymentTtlHours?: number;
+    scannerSettlementHorizonMs?: number;
+    settlementAt?: Date;
   }) => Promise<MovementCreditResult>;
 };
 
@@ -131,6 +133,7 @@ export function createMixedAssetSettlement(
       maxRateAgeMs?: number;
       partialPaymentTtlHours?: number;
       ratePendingBefore?: Date;
+      scannerSettlementHorizonMs?: number;
     }): Promise<MixedSettlementResult> => {
       if (!validDate(input.now)) {
         throw new Error("Mixed settlement now must be a valid date.");
@@ -199,13 +202,18 @@ export function createMixedAssetSettlement(
           validationCode: validationCodeForMovement(movement, invoice),
           maxRateAgeMs: input.maxRateAgeMs,
           partialPaymentTtlHours: input.partialPaymentTtlHours,
+          scannerSettlementHorizonMs: input.scannerSettlementHorizonMs,
+          settlementAt: input.now,
         });
         outcomes.push(outcome);
         if (outcome.outcome === "rate-pending") {
           ratePending = true;
           break;
         }
-        if (outcome.outcome === "blocked-earlier-movement") {
+        if (
+          outcome.outcome === "blocked-earlier-movement" ||
+          outcome.outcome === "awaiting-scan-horizon"
+        ) {
           deferred = true;
           break;
         }

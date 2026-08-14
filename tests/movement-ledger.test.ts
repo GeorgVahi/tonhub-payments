@@ -4,6 +4,7 @@ import { Address } from "@ton/core";
 import {
   calculateActivationThresholdFiatMicros,
   calculateMovementFiatMicros,
+  crossScannerSettlementHorizonMs,
   createMovementLedger,
   MovementFingerprintConflictError,
   type PaymentMovementDraft,
@@ -80,6 +81,7 @@ function createMemoryLedgerDb() {
   const recoveryCases: any[] = [];
   const assetAccounts: any[] = [];
   const sweeps: any[] = [];
+  const scanCursors: any[] = [];
   const rates: any[] = [
     {
       id: "rate-gram-usd",
@@ -122,6 +124,7 @@ function createMemoryLedgerDb() {
         recoveryCases,
         assetAccounts,
         sweeps,
+        scanCursors,
       });
       try {
         return await handler(db);
@@ -135,10 +138,30 @@ function createMemoryLedgerDb() {
         recoveryCases.splice(0, recoveryCases.length, ...snapshot.recoveryCases);
         assetAccounts.splice(0, assetAccounts.length, ...snapshot.assetAccounts);
         sweeps.splice(0, sweeps.length, ...snapshot.sweeps);
+        scanCursors.splice(0, scanCursors.length, ...snapshot.scanCursors);
         throw error;
       }
     },
-    $queryRawUnsafe: async () => [],
+    $queryRawUnsafe: async (query: string, ...values: unknown[]) => {
+      const databaseClock = new Date("2026-08-13T10:00:05.000Z");
+      if (query.includes("clock_timestamp()")) {
+        return [{ now: databaseClock }];
+      }
+      if (!query.includes("TonhubScanCursor")) {
+        return [];
+      }
+      if (query.includes('"leaseOwner" = $4')) {
+        return scanCursors.filter((row) =>
+          row.network === values[0] &&
+          row.scopeKey === values[1] &&
+          row.streamType === values[2] &&
+          row.leaseOwner === values[3]);
+      }
+      return scanCursors.filter((row) =>
+        row.network === "mainnet" &&
+        row.scopeKey === values[0] &&
+        ["GRAM_NATIVE_IN", "USDT_MAINNET_IN"].includes(row.streamType));
+    },
     tonhubPaymentMovement: {
       createMany: async ({ data, skipDuplicates }: any) => {
         let count = 0;
@@ -329,6 +352,9 @@ function createMemoryLedgerDb() {
       findFirst: async ({ where }: any) => sweeps.find((row) =>
         row.depositAddressId === where.depositAddressId && row.asset === where.asset) ?? null,
     },
+    tonhubScanCursor: {
+      findMany: async ({ where }: any) => scanCursors.filter((row) => matches(row, where)),
+    },
     tonhubRecoveryCase: {
       findUnique: async ({ where }: any) => recoveryCases.find((row) => matches(row, where)) ?? null,
       createMany: async ({ data, skipDuplicates }: any) => {
@@ -364,6 +390,7 @@ function createMemoryLedgerDb() {
     recoveryCases,
     assetAccounts,
     sweeps,
+    scanCursors,
     rates,
   };
 }
@@ -404,6 +431,22 @@ test("movement valuation floors exact atomic asset value to fiat micros", () => 
     assetDecimals: 6,
     price: "1",
   }), /positive atomic integer/);
+});
+
+test("cross-scanner settlement horizon config is strict and bounded", () => {
+  assert.equal(crossScannerSettlementHorizonMs({}), 60_000);
+  assert.equal(crossScannerSettlementHorizonMs({
+    TON_CROSS_SCANNER_SETTLEMENT_HORIZON_SECONDS: "90",
+  }), 90_000);
+  assert.throws(() => crossScannerSettlementHorizonMs({
+    TON_CROSS_SCANNER_SETTLEMENT_HORIZON_SECONDS: "60seconds",
+  }), /must be an integer/);
+  assert.throws(() => crossScannerSettlementHorizonMs({
+    TON_CROSS_SCANNER_SETTLEMENT_HORIZON_SECONDS: "4",
+  }), /between 5 and 3600/);
+  assert.throws(() => crossScannerSettlementHorizonMs({
+    TON_CROSS_SCANNER_SETTLEMENT_HORIZON_SECONDS: "3601",
+  }), /between 5 and 3600/);
 });
 
 test("a rejected unsupported jetton is journaled once for recovery and can never credit an order", async () => {
@@ -1239,6 +1282,113 @@ test("an undersized first partial is held for recovery while later partials bypa
   assert.equal(memory.orders[0].creditedFiatMicros, "2750000");
   assert.equal(memory.invoices[0].partialPaymentStartedAt.toISOString(), "2026-08-13T10:01:00.000Z");
   assert.equal(memory.invoices[0].partialPaymentExpiresAt.toISOString(), "2026-08-14T10:01:00.000Z");
+});
+
+test("mainnet credit waits for both scanner horizons and any active scanner lease", async () => {
+  const memory = createMemoryLedgerDb();
+  memory.invoices[0].network = "mainnet";
+  memory.invoices[0].activationThresholdFiatMicros = "2500000";
+  memory.deposits[0].network = "mainnet";
+  const ledger = createMovementLedger(memory.db);
+  const observed = await ledger.recordObserved(movement({ network: "mainnet" }));
+  const settlementAt = new Date("2099-01-01T00:00:00.000Z");
+  const credit = () => ledger.creditMovement({
+    movementId: observed.id,
+    orderId: "order-1",
+    invoiceId: "invoice-1",
+    validationCode: "NATIVE_INBOUND_V1",
+    maxRateAgeMs: 300_000,
+    scannerSettlementHorizonMs: 60_000,
+    settlementAt,
+  });
+
+  assert.equal((await credit()).outcome, "awaiting-scan-horizon");
+  memory.scanCursors.push({
+    id: "cursor-gram",
+    network: "mainnet",
+    streamType: "GRAM_NATIVE_IN",
+    scopeKey: "deposit-1",
+    scannedThroughAt: new Date("2026-08-13T10:01:00.000Z"),
+    leaseOwner: null,
+    leaseExpiresAt: null,
+  });
+  assert.equal((await credit()).outcome, "awaiting-scan-horizon");
+  memory.scanCursors.push({
+    id: "cursor-usdt",
+    network: "mainnet",
+    streamType: "USDT_MAINNET_IN",
+    scopeKey: "deposit-1",
+    scannedThroughAt: new Date("2026-08-13T10:00:59.999Z"),
+    leaseOwner: null,
+    leaseExpiresAt: null,
+  });
+  assert.equal((await credit()).outcome, "awaiting-scan-horizon");
+  memory.scanCursors[1].scannedThroughAt = new Date("2026-08-13T10:01:00.000Z");
+  memory.scanCursors[1].leaseOwner = "usdt-scanner";
+  memory.scanCursors[1].leaseExpiresAt = new Date("2026-08-13T10:00:05.001Z");
+  assert.equal((await credit()).outcome, "awaiting-scan-horizon");
+  assert.equal(memory.allocations.length, 0);
+
+  memory.scanCursors[1].leaseExpiresAt = new Date("2026-08-13T10:00:05.000Z");
+  const credited = await credit();
+  assert.equal(credited.outcome, "credited");
+  assert.equal(memory.allocations.length, 1);
+});
+
+test("an expired autonomous scanner lease cannot journal another movement", async () => {
+  const memory = createMemoryLedgerDb();
+  memory.invoices[0].network = "mainnet";
+  memory.deposits[0].network = "mainnet";
+  memory.scanCursors.push({
+    id: "cursor-expired",
+    network: "mainnet",
+    streamType: "GRAM_NATIVE_IN",
+    scopeKey: "deposit-1",
+    scannedThroughAt: null,
+    leaseOwner: "expired-scanner",
+    leaseExpiresAt: new Date("2026-08-13T10:00:05.000Z"),
+  });
+  const ledger = createMovementLedger(memory.db);
+
+  await assert.rejects(ledger.recordObserved(
+    movement({ network: "mainnet" }),
+    {
+      streamType: "GRAM_NATIVE_IN",
+      leaseOwner: "expired-scanner",
+      clock: () => new Date("2026-08-13T10:00:05.000Z"),
+    },
+  ), /scanner lease expired or was lost/);
+  assert.equal(memory.movements.length, 0);
+  assert.equal(memory.invoices[0].paymentSelectionLockedAsset, null);
+});
+
+test("an active autonomous scanner lease journals with the database clock fence", async () => {
+  const memory = createMemoryLedgerDb();
+  memory.invoices[0].network = "mainnet";
+  memory.deposits[0].network = "mainnet";
+  memory.scanCursors.push({
+    id: "cursor-active",
+    network: "mainnet",
+    streamType: "GRAM_NATIVE_IN",
+    scopeKey: "deposit-1",
+    scannedThroughAt: null,
+    leaseOwner: "active-scanner",
+    leaseExpiresAt: new Date("2026-08-13T10:00:05.001Z"),
+  });
+  const ledger = createMovementLedger(memory.db);
+
+  const observed = await ledger.recordObserved(
+    movement({ network: "mainnet" }),
+    {
+      streamType: "GRAM_NATIVE_IN",
+      leaseOwner: "active-scanner",
+      clock: () => new Date("2026-08-13T09:00:00.000Z"),
+    },
+  );
+
+  assert.equal(observed.status, "OBSERVED");
+  assert.equal(memory.movements.length, 1);
+  assert.equal(memory.invoices[0].paymentSelectionLockedAsset, "GRAM");
 });
 
 test("a movement after the active payment window is accounted only in recovery", async () => {
