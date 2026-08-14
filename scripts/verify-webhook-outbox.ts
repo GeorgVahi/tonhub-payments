@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { Address } from "@ton/core";
 import { prisma } from "../backend/src/db";
 import { createPrismaAdminRepository } from "../backend/src/admin/repository";
+import { createPrismaTonhubPaymentRepository } from "../backend/src/repository";
 import { createPrismaWebhookRepository } from "../worker/src/webhooks";
 
 const suffix = process.env.TONHUB_WEBHOOK_VERIFY_SUFFIX ?? "default";
@@ -42,7 +43,10 @@ async function main() {
   });
   await prisma.tonhubPaymentInvoice.create({ data: invoiceData(invoiceId, suffix === "clean" ? 970001 : 970002) });
   await prisma.tonhubPaymentInvoice.create({
-    data: invoiceData(expiredInvoiceId, suffix === "clean" ? 970003 : 970004, expiredOrderId),
+    data: {
+      ...invoiceData(expiredInvoiceId, suffix === "clean" ? 970003 : 970004, expiredOrderId),
+      observedPayments: { legacyMalformedShape: true },
+    },
   });
   await prisma.tonhubDepositAddress.create({
     data: {
@@ -56,18 +60,43 @@ async function main() {
       walletContext: suffix === "clean" ? 970001 : 970002,
       walletNetworkGlobalId: -3,
       walletPublicKeyHash: `webhook-key-${suffix}-${suffix === "clean" ? 970001 : 970002}`,
-      status: "PAID",
-      paidAt: base,
+      status: "ACTIVE",
     },
   });
 
-  await prisma.tonhubPaymentInvoice.update({
-    where: { id: invoiceId },
-    data: { status: "PARTIAL", creditedFiatMicros: "400000", remainingFiatMicros: "600000", observedAt: base, version: { increment: 1 } },
+  const paymentRepository = createPrismaTonhubPaymentRepository(prisma as any);
+  const observedPayment = (transactionId: string, amountAtomic: string, createdAt: Date) => ({
+    transactionId,
+    asset: "GRAM" as const,
+    assetDecimals: 9,
+    amountAtomic,
+    amountNano: amountAtomic,
+    amountFormatted: (Number(amountAtomic) / 1_000_000_000).toString(),
+    createdAt: createdAt.toISOString(),
+    status: "observed" as const,
+    comment: "",
   });
-  await prisma.tonhubPaymentInvoice.update({
-    where: { id: invoiceId },
-    data: { creditedFiatMicros: "700000", remainingFiatMicros: "300000", version: { increment: 1 } },
+  const firstObservedAt = base;
+  const secondObservedAt = new Date(base.getTime() + 500);
+  const paidAt = new Date(base.getTime() + 1_000);
+  await paymentRepository.markInvoicePartial({
+    invoiceId,
+    paidNano: "400000000",
+    partialPaymentStartedAt: firstObservedAt,
+    partialPaymentExpiresAt: new Date(base.getTime() + 24 * 60 * 60 * 1000),
+    observedPayments: [observedPayment(`webhook-gram-1-${suffix}`, "400000000", firstObservedAt)],
+    observedAt: firstObservedAt,
+  });
+  await paymentRepository.markInvoicePartial({
+    invoiceId,
+    paidNano: "700000000",
+    partialPaymentStartedAt: firstObservedAt,
+    partialPaymentExpiresAt: new Date(base.getTime() + 24 * 60 * 60 * 1000),
+    observedPayments: [
+      observedPayment(`webhook-gram-1-${suffix}`, "400000000", firstObservedAt),
+      observedPayment(`webhook-gram-2-${suffix}`, "300000000", secondObservedAt),
+    ],
+    observedAt: secondObservedAt,
   });
   await assert.rejects(prisma.$transaction(async (tx) => {
     await tx.tonhubPaymentInvoice.update({
@@ -77,13 +106,20 @@ async function main() {
     throw new Error("rollback webhook transition");
   }));
   assert.equal((await prisma.tonhubPaymentInvoice.findUniqueOrThrow({ where: { id: invoiceId } })).creditedFiatMicros, "700000");
-  await prisma.tonhubPaymentInvoice.update({
-    where: { id: invoiceId },
-    data: { status: "PAID", creditedFiatMicros: "1000000", remainingFiatMicros: "0", observedAt: new Date(base.getTime() + 1_000), version: { increment: 1 } },
+  await paymentRepository.markInvoicePaid({
+    invoiceId,
+    transactionId: `webhook-gram-3-${suffix}`,
+    paidNano: "1000000000",
+    observedPayments: [
+      observedPayment(`webhook-gram-1-${suffix}`, "400000000", firstObservedAt),
+      observedPayment(`webhook-gram-2-${suffix}`, "300000000", secondObservedAt),
+      observedPayment(`webhook-gram-3-${suffix}`, "300000000", paidAt),
+    ],
+    paidAt,
   });
-  await prisma.tonhubPaymentInvoice.update({
-    where: { id: expiredInvoiceId },
-    data: { status: "EXPIRED", observedAt: new Date(base.getTime() + 2_000), version: { increment: 1 } },
+  await paymentRepository.markInvoiceExpired({
+    invoiceId: expiredInvoiceId,
+    expiredAt: new Date(base.getTime() + 2_000),
   });
 
   const recoveryId = `webhook-recovery-${suffix}`;
@@ -130,6 +166,21 @@ async function main() {
   assert.equal(events.some((event) => (
     event.topic === "invoice.partial" && (event.payload as any).creditedFiatMicros === "800000"
   )), false);
+  const paidPayload = events.find((event) => event.topic === "invoice.paid")?.payload as any;
+  assert.equal(paidPayload.schemaVersion, 2);
+  assert.equal(paidPayload.grossFiatMicros, "1000000");
+  assert.equal(paidPayload.discountFiatMicros, "0");
+  assert.equal(paidPayload.netFiatMicros, "1000000");
+  assert.equal(paidPayload.orderStatus, "PAID");
+  assert.equal(paidPayload.orderCreditedFiatMicros, "1000000");
+  assert.deepEqual(paidPayload.creditedAssets, ["GRAM"]);
+  const expiredPayload = events.find((event) => event.topic === "invoice.expired")?.payload as any;
+  assert.equal(expiredPayload.orderStatus, "EXPIRED");
+  assert.deepEqual(expiredPayload.creditedAssets, []);
+  const assetSweepFailure = events.find((event) =>
+    event.topic === "sweep.failed" && event.aggregateType === "TonhubAssetSweep");
+  assert.equal((assetSweepFailure?.payload as any).schemaVersion, 2);
+  assert.equal((assetSweepFailure?.payload as any).automaticSequence, null);
 
   const repository = createPrismaWebhookRepository(prisma as any);
   const partialEvent = events.find((event) => event.topic === "invoice.partial")!;

@@ -362,7 +362,10 @@ and every operator mutation enter the append-only admin audit log.
 The console shows orders and their attempts, incoming/outgoing movements with
 addresses, asset identity, hash/LT, fiat credit and rate, recovery/rate-pending/
 held states, gas top-ups, native and jetton sweeps, webhook outbox state, and
-audit history. Operators can validate and attach an owned movement through the
+audit history. Order details include the immutable USD₮/GRAM quotes, selected
+and blockchain-locked rail, gross/discount/net accounting, append-only discount
+adjustments, snapshotted activation/sweep policy, and automatic sweep trigger
+sequence, fiat currency, and fiat evidence. Operators can validate and attach an owned movement through the
 normal ledger, mark recovery reviewed, create or retry a durable sweep job, and
 register immutable evidence for an already executed refund. These actions never
 sign or broadcast. `TON_DEPOSIT_SECRET_KEY`, network-specific deposit secret
@@ -389,6 +392,14 @@ attempt is journaled before the HTTP request, including stale attempts left by a
 worker crash.
 
 The request body is UTF-8 JSON with `id`, `type`, `createdAt`, and `data`.
+New invoice and asset-sweep events use additive `data.schemaVersion = 2`.
+Invoice events retain the original fields and additionally identify the selected
+rail, actual credited assets, blockchain selection lock, gross/discount/net
+obligation, order-level credit and overpayment. Asset-sweep failures additionally
+carry the immutable automatic sequence, trigger currency, and trigger evidence. Invoice
+events are deferred until transaction commit so their order-level fields describe the
+same committed state as the invoice transition. Existing queued
+schema-v1 events remain unchanged and must still be accepted by receivers.
 `X-Tonhub-Timestamp` is the Unix timestamp used to sign it and
 `X-Tonhub-Signature` is `v1=` followed by lowercase hex HMAC-SHA256 over
 `timestamp + "." + exactRawBody`. Receivers should use a timing-safe comparison,

@@ -156,3 +156,11 @@ covering invoices created by an old process near the migration boundary.
   pre-rollout quote-backed invoice has already drifted from its quote or linked
   deposit. Direct SQL writers therefore cannot manufacture or redirect a
   checkout rail.
+- `20260814105000_operational_payment_visibility` keeps the existing global
+  outbox topics and delivery protocol while making new invoice events explain
+  selected versus actually credited assets, immutable rail lock, and
+  gross/discount/net order accounting. New asset-sweep failure events expose
+  their immutable automatic trigger sequence, fiat currency, and fiat evidence.
+  Invoice events are deferred to the transaction boundary so invoice and order
+  accounting are read from the same final committed state. Existing
+  append-only schema-v1 outbox rows are not rewritten.

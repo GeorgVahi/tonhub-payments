@@ -347,6 +347,113 @@ test("admin movement view exposes immutable chain and fiat-rate evidence without
   assert.doesNotMatch(html, /rawPayload/);
 });
 
+test("admin order view explains immutable rails, discount provenance, and snapshotted sweep policy", async () => {
+  const repository = createPrismaAdminRepository({
+    tonhubPaymentOrder: {
+      count: async () => 1,
+      findMany: async () => [{
+        id: "order-1",
+        externalId: "merchant-order-1",
+        fiatAmountMicros: "100000000",
+        fiatCurrency: "USD",
+        creditedFiatMicros: "99000000",
+        discountFiatMicros: "1000000",
+        overpaymentFiatMicros: "0",
+        minimumOrderFiatMicros: "10000000",
+        gramDiscountMaxFiatMicros: "1000000",
+        intermediateSweepTriggerBps: 9000,
+        intermediateSweepMinFiatMicros: "100000000",
+        maxAutomaticSweepsPerAsset: 2,
+        status: "PAID",
+        createdAt: new Date("2026-08-13T10:00:00.000Z"),
+        updatedAt: new Date("2026-08-13T10:01:00.000Z"),
+        adjustments: [{
+          id: "adjustment-1",
+          kind: "PAYMENT_METHOD_DISCOUNT",
+          fiatAmountMicros: "1000000",
+          fiatCurrency: "USD",
+          reason: "FULL_GRAM_PAYMENT",
+          reversesAdjustmentId: null,
+          createdAt: new Date("2026-08-13T10:01:00.000Z"),
+        }, {
+          id: "adjustment-2",
+          kind: "REVERSAL",
+          fiatAmountMicros: "1000000",
+          fiatCurrency: "USD",
+          reason: "USDT_CREDITED_AFTER_DISCOUNT",
+          reversesAdjustmentId: "adjustment-1",
+          createdAt: new Date("2026-08-13T10:01:30.000Z"),
+        }, {
+          id: "adjustment-3",
+          kind: "PAYMENT_METHOD_DISCOUNT",
+          fiatAmountMicros: "1000000",
+          fiatCurrency: "USD",
+          reason: "FULL_GRAM_PAYMENT",
+          reversesAdjustmentId: null,
+          createdAt: new Date("2026-08-13T10:02:00.000Z"),
+        }],
+        invoices: [{
+          id: "invoice-1",
+          network: "mainnet",
+          checkoutAsset: "GRAM",
+          amountAtomic: "49500000000",
+          creditedFiatMicros: "99000000",
+          remainingFiatMicros: "0",
+          activationThresholdFiatMicros: "50000000",
+          paymentSelectionLockedAsset: "GRAM",
+          paymentSelectionLockedAt: new Date("2026-08-13T10:00:30.000Z"),
+          firstMovementAt: new Date("2026-08-13T10:00:30.000Z"),
+          status: "PAID",
+          address: "0:deposit",
+          createdAt: new Date("2026-08-13T10:00:00.000Z"),
+          quotes: [{
+            id: "quote-gram",
+            asset: "GRAM",
+            assetKind: "NATIVE",
+            assetDecimals: 9,
+            grossFiatMicros: "100000000",
+            discountFiatMicros: "1000000",
+            netFiatMicros: "99000000",
+            amountAtomic: "49500000000",
+            quotedAt: new Date("2026-08-13T10:00:00.000Z"),
+            expiresAt: new Date("2026-08-13T11:00:00.000Z"),
+            rateSnapshot: {
+              id: "rate-gram-1",
+              price: "2",
+              quoteCurrency: "USD",
+              source: "coingecko",
+              observedAt: new Date("2026-08-13T09:59:30.000Z"),
+            },
+          }],
+        }],
+      }],
+    },
+  } as any);
+  const page = await repository.page("orders", 1);
+  assert.equal(page.records[0].netFiatMicros, "99000000");
+  assert.equal(page.records[0].invoices[0].quotes[0].rate.price, "2");
+  assert.equal(page.records[0].adjustments[0].reason, "FULL_GRAM_PAYMENT");
+
+  const html = renderAdminSection({ username: "merchant", csrfToken: "csrf", page });
+  for (const evidence of [
+    "99000000",
+    "PAYMENT METHOD DISCOUNT",
+    "FULL_GRAM_PAYMENT",
+    "Activation threshold 50000000 µUSD",
+    "Locked rail",
+    "locked at 2026-08-13T10:00:30.000Z",
+    "9000 bps",
+    "coingecko",
+    "rate-gram-1",
+    "observed 2026-08-13T09:59:30.000Z",
+    "adjustment-2",
+    "reverses adjustment-1",
+    "2026-08-13T10:01:30.000Z",
+  ]) {
+    assert.match(html, new RegExp(evidence));
+  }
+});
+
 test("admin sweep view exposes retry provenance and independently paginates native sweeps", () => {
   const html = renderAdminSection({
     username: "merchant",
@@ -361,6 +468,11 @@ test("admin sweep view exposes retry provenance and independently paginates nati
         id: "sweep-1",
         asset: "USDT",
         status: "FAILED",
+        automaticSequence: 2,
+        triggerReason: "TERMINAL_FINAL",
+        triggerFiatMicros: "10000000",
+        triggerCreditedFiatMicros: "100000000",
+        fiatCurrency: "USD",
         seqno: 17,
         queryId: "1800000000000000017",
         sentAt: "2026-08-13T10:00:00.000Z",
@@ -375,7 +487,7 @@ test("admin sweep view exposes retry provenance and independently paginates nati
       }],
     },
   });
-  for (const evidence of ["1800000000000000017", "2026-08-13T10:00:00.000Z", "Seqno", "Native sweeps: page 2 of 2", "23"]) {
+  for (const evidence of ["1800000000000000017", "2026-08-13T10:00:00.000Z", "Seqno", "Native sweeps: page 2 of 2", "23", "TERMINAL_FINAL", "100000000", "Trigger fiat currency", "USD"]) {
     assert.match(html, new RegExp(evidence));
   }
 });
@@ -386,7 +498,7 @@ test("admin repository paginates native sweep history independently from jetton 
     tonhubAssetSweep: {
       count: async () => 3,
       findMany: async (input: any) => {
-        calls.push(["asset", input.skip, input.take]);
+        calls.push(["asset", input.skip, input.take, input.include]);
         return [];
       },
     },
@@ -399,10 +511,39 @@ test("admin repository paginates native sweep history independently from jetton 
     },
   } as any);
   const page = await repository.page("sweeps", 1, 2);
-  assert.deepEqual(calls, [["asset", 0, 50], ["native", 50, 50]]);
+  assert.deepEqual(calls, [["asset", 0, 50, { depositAddress: true, order: true }], ["native", 50, 50]]);
   assert.equal(page.total, 3);
   assert.equal(page.secondaryTotal, 72);
   assert.equal(page.secondaryPage, 2);
+});
+
+test("admin overview counts reviewed recovery and native sweep failures as unresolved operations", async () => {
+  const recoveryQueries: any[] = [];
+  const repository = createPrismaAdminRepository({
+    tonhubPaymentOrder: { count: async () => 7 },
+    tonhubRecoveryCase: {
+      count: async (input: any) => {
+        recoveryQueries.push(input);
+        return 2;
+      },
+      findMany: async (input: any) => {
+        recoveryQueries.push(input);
+        return [];
+      },
+    },
+    tonhubAssetSweep: { count: async () => 3, findMany: async () => [] },
+    tonhubDepositAddress: { count: async () => 4 },
+    tonhubOutboxEvent: { count: async () => 5 },
+  } as any);
+  const overview = await repository.overview();
+  assert.deepEqual(overview.counts, {
+    orders: 7,
+    openRecovery: 2,
+    failedSweeps: 7,
+    pendingWebhooks: 5,
+  });
+  assert.ok(recoveryQueries.every((query) =>
+    query.where.status.in.includes("OPEN") && query.where.status.in.includes("REVIEWED")));
 });
 
 test("admin native initiate cannot reopen failed, sweeping, or sent deposits", async () => {
@@ -525,6 +666,7 @@ test("admin webhook view keeps failed delivery retry and full attempt pagination
         aggregateId: "invoice-1",
         status: "FAILED",
         attempts: 2,
+        payload: { schemaVersion: 2, creditedAssets: ["GRAM", "USDT"] },
         deliveryAttempts: [],
       }],
       secondaryRecords: [{
@@ -543,4 +685,6 @@ test("admin webhook view keeps failed delivery retry and full attempt pagination
   assert.match(html, /name="csrfToken" value="csrf"/);
   assert.match(html, /Delivery attempts: page 2 of 2/);
   assert.match(html, /HTTP 503/);
+  assert.match(html, /creditedAssets/);
+  assert.match(html, /GRAM/);
 });

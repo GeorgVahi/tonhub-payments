@@ -176,24 +176,68 @@ function scopedLedger(tx: any) {
 }
 
 function serializeOrder(value: any) {
+  const grossFiatMicros = BigInt(value.fiatAmountMicros);
+  const discountFiatMicros = BigInt(value.discountFiatMicros ?? "0");
   return {
     id: value.id,
     externalId: value.externalId,
     fiatAmountMicros: value.fiatAmountMicros,
+    grossFiatMicros: grossFiatMicros.toString(),
+    discountFiatMicros: discountFiatMicros.toString(),
+    netFiatMicros: (grossFiatMicros - discountFiatMicros).toString(),
     fiatCurrency: value.fiatCurrency,
     creditedFiatMicros: value.creditedFiatMicros,
     overpaymentFiatMicros: value.overpaymentFiatMicros,
+    minimumOrderFiatMicros: value.minimumOrderFiatMicros,
+    gramDiscountMaxFiatMicros: value.gramDiscountMaxFiatMicros,
+    intermediateSweepTriggerBps: value.intermediateSweepTriggerBps,
+    intermediateSweepMinFiatMicros: value.intermediateSweepMinFiatMicros,
+    maxAutomaticSweepsPerAsset: value.maxAutomaticSweepsPerAsset,
     status: value.status,
     createdAt: iso(value.createdAt),
     updatedAt: iso(value.updatedAt),
+    adjustments: (value.adjustments ?? []).map((adjustment: any) => ({
+      id: adjustment.id,
+      kind: adjustment.kind,
+      reversesAdjustmentId: adjustment.reversesAdjustmentId,
+      fiatAmountMicros: adjustment.fiatAmountMicros,
+      fiatCurrency: adjustment.fiatCurrency,
+      reason: adjustment.reason,
+      createdAt: iso(adjustment.createdAt),
+    })),
     invoices: (value.invoices ?? []).map((invoice: any) => ({
       id: invoice.id,
       network: invoice.network,
       asset: invoice.checkoutAsset ?? invoice.asset,
       amountAtomic: invoice.amountAtomic ?? invoice.amountNano,
+      creditedFiatMicros: invoice.creditedFiatMicros,
+      remainingFiatMicros: invoice.remainingFiatMicros,
+      activationThresholdFiatMicros: invoice.activationThresholdFiatMicros,
+      paymentSelectionLockedAsset: invoice.paymentSelectionLockedAsset,
+      paymentSelectionLockedAt: iso(invoice.paymentSelectionLockedAt),
+      firstMovementAt: iso(invoice.firstMovementAt),
       status: invoice.status,
       address: invoice.address,
       createdAt: iso(invoice.createdAt),
+      quotes: (invoice.quotes ?? []).map((quote: any) => ({
+        id: quote.id,
+        asset: quote.asset,
+        assetKind: quote.assetKind,
+        assetDecimals: quote.assetDecimals,
+        grossFiatMicros: quote.grossFiatMicros,
+        discountFiatMicros: quote.discountFiatMicros,
+        netFiatMicros: quote.netFiatMicros,
+        amountAtomic: quote.amountAtomic,
+        quotedAt: iso(quote.quotedAt),
+        expiresAt: iso(quote.expiresAt),
+        rate: quote.rateSnapshot ? {
+          id: quote.rateSnapshot.id,
+          price: String(quote.rateSnapshot.price),
+          quoteCurrency: quote.rateSnapshot.quoteCurrency,
+          source: quote.rateSnapshot.source,
+          observedAt: iso(quote.rateSnapshot.observedAt),
+        } : null,
+      })),
     })),
   };
 }
@@ -263,6 +307,12 @@ function serializeSweep(value: any) {
     invoiceId: value.invoiceId,
     asset: value.asset,
     assetKind: value.assetKind,
+    automaticSequence: value.automaticSequence,
+    triggerReason: value.triggerReason,
+    triggerFiatMicros: value.triggerFiatMicros,
+    triggerCreditedFiatMicros: value.triggerCreditedFiatMicros,
+    fiatCurrency: value.order?.fiatCurrency ?? null,
+    triggeredAt: iso(value.triggeredAt),
     status: value.status,
     amountAtomic: value.amountAtomic,
     recipientAddress: value.recipientAddress,
@@ -315,6 +365,7 @@ function serializeOutbox(value: any) {
     topic: value.topic,
     aggregateType: value.aggregateType,
     aggregateId: value.aggregateId,
+    payload: value.payload,
     status: value.status,
     attempts: value.attempts,
     availableAt: iso(value.availableAt),
@@ -357,26 +408,27 @@ function serializeWebhookAttempt(attempt: any) {
 export function createPrismaAdminRepository(db: any = prisma): AdminRepository {
   return {
     overview: async () => {
-      const [orders, openRecovery, failedSweeps, pendingWebhooks, recovery, sweeps] = await Promise.all([
+      const [orders, openRecovery, failedAssetSweeps, failedNativeSweeps, pendingWebhooks, recovery, sweeps] = await Promise.all([
         db.tonhubPaymentOrder.count(),
-        db.tonhubRecoveryCase.count({ where: { status: "OPEN" } }),
+        db.tonhubRecoveryCase.count({ where: { status: { in: ["OPEN", "REVIEWED"] } } }),
         db.tonhubAssetSweep.count({ where: { status: "FAILED" } }),
+        db.tonhubDepositAddress.count({ where: { sweepStatus: "FAILED" } }),
         db.tonhubOutboxEvent.count({ where: { status: { in: ["PENDING", "FAILED"] } } }),
         db.tonhubRecoveryCase.findMany({
-          where: { status: "OPEN" },
+          where: { status: { in: ["OPEN", "REVIEWED"] } },
           include: { movement: { include: { rateSnapshot: true, allocations: true } } },
           orderBy: [{ createdAt: "asc" }, { id: "asc" }],
           take: 10,
         }),
         db.tonhubAssetSweep.findMany({
           where: { status: "FAILED" },
-          include: { depositAddress: true },
+          include: { depositAddress: true, order: true },
           orderBy: [{ updatedAt: "asc" }, { id: "asc" }],
           take: 10,
         }),
       ]);
       return {
-        counts: { orders, openRecovery, failedSweeps, pendingWebhooks },
+        counts: { orders, openRecovery, failedSweeps: failedAssetSweeps + failedNativeSweeps, pendingWebhooks },
         recovery: recovery.map(serializeRecovery),
         sweeps: sweeps.map(serializeSweep),
       };
@@ -389,7 +441,13 @@ export function createPrismaAdminRepository(db: any = prisma): AdminRepository {
         const [total, records] = await Promise.all([
           db.tonhubPaymentOrder.count(),
           db.tonhubPaymentOrder.findMany({
-            include: { invoices: { orderBy: [{ createdAt: "asc" }, { id: "asc" }] } },
+            include: {
+              adjustments: { orderBy: [{ createdAt: "asc" }, { id: "asc" }] },
+              invoices: {
+                include: { quotes: { include: { rateSnapshot: true } } },
+                orderBy: [{ createdAt: "asc" }, { id: "asc" }],
+              },
+            },
             orderBy: [{ createdAt: "desc" }, { id: "desc" }],
             skip,
             take: adminPageSize,
@@ -439,7 +497,7 @@ export function createPrismaAdminRepository(db: any = prisma): AdminRepository {
         const [total, records, secondaryTotal, native] = await Promise.all([
           db.tonhubAssetSweep.count(),
           db.tonhubAssetSweep.findMany({
-            include: { depositAddress: true },
+            include: { depositAddress: true, order: true },
             orderBy: [{ createdAt: "desc" }, { id: "desc" }],
             skip,
             take: adminPageSize,

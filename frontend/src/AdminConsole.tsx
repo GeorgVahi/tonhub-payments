@@ -136,6 +136,12 @@ function SweepCard({ record, csrfToken }: { record: any; csrfToken: string }) {
       <dl className="field-grid">
         <Field label="Deposit" value={record.depositAddress ?? record.depositAddressId} mono />
         <Field label="Order" value={record.orderId} mono />
+        <Field label="Automatic sequence" value={record.automaticSequence} />
+        <Field label="Trigger reason" value={record.triggerReason} />
+        <Field label="Trigger delta fiat" value={record.triggerFiatMicros} mono />
+        <Field label="Trigger credited fiat" value={record.triggerCreditedFiatMicros} mono />
+        <Field label="Trigger fiat currency" value={record.fiatCurrency} />
+        <Field label="Triggered" value={record.triggeredAt} />
         <Field label="Amount atomic" value={record.amountAtomic} mono />
         <Field label="Recipient" value={record.recipientAddress} mono />
         <Field label="Tx hash" value={record.transactionHash} mono />
@@ -174,9 +180,15 @@ function OrderCard({ record }: { record: any }) {
       </div>
       <dl className="field-grid">
         <Field label="Order ID" value={record.id} mono />
-        <Field label="Fiat obligation" value={`${record.fiatAmountMicros} µ${record.fiatCurrency}`} mono />
+        <Field label="Gross obligation" value={`${record.grossFiatMicros} µ${record.fiatCurrency}`} mono />
+        <Field label="Payment discount" value={`${record.discountFiatMicros} µ${record.fiatCurrency}`} mono />
+        <Field label="Net obligation" value={`${record.netFiatMicros} µ${record.fiatCurrency}`} mono />
         <Field label="Credited" value={`${record.creditedFiatMicros} µ${record.fiatCurrency}`} mono />
         <Field label="Overpayment" value={`${record.overpaymentFiatMicros} µ${record.fiatCurrency}`} mono />
+        <Field label="Minimum order" value={`${record.minimumOrderFiatMicros} µ${record.fiatCurrency}`} mono />
+        <Field label="GRAM saving cap" value={`${record.gramDiscountMaxFiatMicros} µ${record.fiatCurrency}`} mono />
+        <Field label="Intermediate sweep" value={`${record.intermediateSweepTriggerBps} bps or ${record.intermediateSweepMinFiatMicros} µ${record.fiatCurrency}`} mono />
+        <Field label="Automatic sweep cap" value={record.maxAutomaticSweepsPerAsset} />
         <Field label="Created" value={record.createdAt} />
         <Field label="Updated" value={record.updatedAt} />
       </dl>
@@ -186,11 +198,30 @@ function OrderCard({ record }: { record: any }) {
             <div><strong>{invoice.asset}</strong> · {invoice.network}</div>
             <Status value={invoice.status} />
             <span className="mono">{invoice.amountAtomic} atomic</span>
+            <span className="mono">Credit {invoice.creditedFiatMicros} µ · remaining {invoice.remainingFiatMicros} µ</span>
+            <span className="mono">Activation threshold {invoice.activationThresholdFiatMicros} µ{record.fiatCurrency}</span>
+            <span className="mono">Locked rail: {invoice.paymentSelectionLockedAsset ?? "not locked"} · locked at {invoice.paymentSelectionLockedAt ?? "—"}</span>
+            <span className="mono muted">First movement {invoice.firstMovementAt ?? "—"}</span>
             <span className="mono muted">{invoice.address}</span>
             <span className="mono muted">{invoice.id}</span>
+            {(invoice.quotes ?? []).map((quote: any) => (
+              <span className="mono muted" key={quote.id}>
+                {quote.asset}: {quote.amountAtomic} atomic · gross {quote.grossFiatMicros} · discount {quote.discountFiatMicros} · net {quote.netFiatMicros}
+                {quote.rate ? ` · ${quote.rate.price} ${quote.rate.quoteCurrency} · ${quote.rate.source} · snapshot ${quote.rate.id} observed ${quote.rate.observedAt}` : ""}
+              </span>
+            ))}
           </div>
         ))}
       </div>
+      {record.adjustments?.length ? (
+        <div className="allocation-list">
+          {record.adjustments.map((adjustment: any) => (
+            <span key={adjustment.id}>
+              {adjustment.kind.replaceAll("_", " ")} · {adjustment.fiatAmountMicros} µ{adjustment.fiatCurrency} · {adjustment.reason} · ID {adjustment.id} · reverses {adjustment.reversesAdjustmentId ?? "—"} · created {adjustment.createdAt}
+            </span>
+          ))}
+        </div>
+      ) : null}
     </article>
   );
 }
@@ -250,6 +281,7 @@ function WebhookCard({ record, csrfToken }: { record: any; csrfToken: string }) 
         <Field label="Delivered" value={record.deliveredAt} />
         <Field label="Last error" value={record.lastError} />
       </dl>
+      {record.payload ? <pre>{JSON.stringify(record.payload, null, 2)}</pre> : null}
       {record.deliveryAttempts?.length ? (
         <div className="allocation-list">
           {record.deliveryAttempts.map((attempt: any) => (
@@ -393,11 +425,11 @@ export function renderAdminOverview(input: {
     <AdminShell {...input} title="Operations overview">
       <section className="metrics" aria-label="Operational totals">
         <a href="/admin/orders"><span>Orders</span><strong>{counts.orders}</strong></a>
-        <a href="/admin/recovery"><span>Open recovery</span><strong>{counts.openRecovery}</strong></a>
+        <a href="/admin/recovery"><span>Unresolved recovery</span><strong>{counts.openRecovery}</strong></a>
         <a href="/admin/sweeps"><span>Failed sweeps</span><strong>{counts.failedSweeps}</strong></a>
         <a href="/admin/webhooks"><span>Webhook backlog</span><strong>{counts.pendingWebhooks}</strong></a>
       </section>
-      <section className="section-heading"><div><span className="eyebrow">Needs attention</span><h2>Oldest open recovery</h2></div></section>
+      <section className="section-heading"><div><span className="eyebrow">Needs attention</span><h2>Oldest unresolved recovery</h2></div></section>
       <div className="records">
         {input.overview.recovery.length
           ? input.overview.recovery.map((record) => <RecoveryCard key={record.id} record={record} csrfToken={input.csrfToken} />)
