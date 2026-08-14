@@ -107,7 +107,7 @@ test("mainnet adapter verifies the official master wallet and journals productio
       if (url.pathname.endsWith("/transactions")) {
         return new Response(JSON.stringify({ transactions: [] }), { status: 200 });
       }
-      if (!url.searchParams.has("jetton_wallet")) {
+      if (!url.searchParams.has("jetton_master")) {
         return new Response(JSON.stringify({ jetton_transfers: [] }), { status: 200 });
       }
       return new Response(JSON.stringify({
@@ -142,6 +142,7 @@ test("mainnet adapter verifies the official master wallet and journals productio
   assert.equal(accounts[0]?.assetWalletAddress, assetWalletRaw);
   assert.equal(urls[0]?.hostname, "toncenter.com");
   assert.equal(urls[0]?.searchParams.get("address"), officialMainnetUsdtMasterAddress);
+  assert.equal(urls[2]?.searchParams.has("jetton_wallet"), false);
   assert.equal(urls[2]?.searchParams.get("jetton_master"), officialMainnetUsdtMasterAddress);
   assert.deepEqual(observed[0], {
     fingerprint: `ton:mainnet:jetton-in:${transactionHash}:42:${officialMainnetUsdtMasterAddress}`,

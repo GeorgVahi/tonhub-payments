@@ -129,7 +129,7 @@ test("internal testnet jetton config is explicit, disabled by default, and never
   );
 });
 
-test("internal adapter verifies one testnet asset wallet and journals incoming test jetton evidence", async () => {
+test("internal adapter journals an incoming jetton when the first-deployment recipient transaction aborts", async () => {
   const accounts: any[] = [];
   const observed: any[] = [];
   const urls: URL[] = [];
@@ -185,7 +185,14 @@ test("internal adapter verifies one testnet asset wallet and journals incoming t
       }), { status: 200 });
     }
     if (url.pathname.endsWith("/transactions")) {
-      return new Response(JSON.stringify({ transactions: [] }), { status: 200 });
+      return new Response(JSON.stringify({
+        transactions: [notificationTransaction({
+          traceId: "b2".repeat(32),
+          walletAddress: assetWalletFriendly,
+          body: notificationBody(jettonTransferNotificationOpcode),
+          aborted: true,
+        })],
+      }), { status: 200 });
     }
     return new Response(JSON.stringify({
       jetton_transfers: [transfer()],
@@ -260,6 +267,13 @@ test("internal adapter verifies one testnet asset wallet and journals incoming t
         transactionLt: "900001",
         transactionNow: 1_786_615_800,
       },
+      notification: {
+        body: notificationBody(jettonTransferNotificationOpcode),
+        opcode: "0x7362d09c",
+        queryId: "42",
+        amount: "5000000",
+        sender: senderRaw,
+      },
     },
   });
   assert.equal(urls[0]?.pathname, "/api/v3/jetton/masters");
@@ -269,7 +283,7 @@ test("internal adapter verifies one testnet asset wallet and journals incoming t
   assert.equal(urls[1]?.searchParams.get("jetton_address"), masterRaw);
   assert.equal(urls[2]?.pathname, "/api/v3/jetton/transfers");
   assert.equal(urls[2]?.searchParams.get("owner_address"), ownerRaw);
-  assert.equal(urls[2]?.searchParams.get("jetton_wallet"), assetWalletRaw);
+  assert.equal(urls[2]?.searchParams.has("jetton_wallet"), false);
   assert.equal(urls[2]?.searchParams.get("jetton_master"), masterRaw);
   assert.equal(urls[2]?.searchParams.get("direction"), "in");
   assert.equal(urls[3]?.pathname, "/api/v3/jetton/transfers");
@@ -360,6 +374,16 @@ test("jetton parser rejects fake identity, malformed transfers, aborted executio
     amount: "5000000",
     sender: senderRaw,
   });
+
+  const acceptedFirstDeployment = scan([transfer()], [{
+    traceId: "b2".repeat(32),
+    walletAddress: assetWalletFriendly,
+    destinationAddress: ownerFriendly,
+    transactionAborted: true,
+    body: validNotification,
+  }]);
+  assert.equal(acceptedFirstDeployment.rejections.length, 0);
+  assert.equal(acceptedFirstDeployment.movements.length, 1);
 });
 
 test("adapter journals fake-master and wrong-wallet transfers only as rejected recovery candidates", async () => {
@@ -428,8 +452,14 @@ test("adapter journals fake-master and wrong-wallet transfers only as rejected r
           }],
         }), { status: 200 });
       }
-      if (url.searchParams.has("jetton_wallet")) {
-        return new Response(JSON.stringify({ jetton_transfers: [] }), { status: 200 });
+      if (url.searchParams.has("jetton_master")) {
+        return new Response(JSON.stringify({
+          jetton_transfers: [transfer({
+            transaction_hash: "c4".repeat(32),
+            query_id: "43",
+            trace_id: "c5".repeat(32),
+          })],
+        }), { status: 200 });
       }
       if (url.pathname.endsWith("/transactions")) {
         return new Response(JSON.stringify({
@@ -468,20 +498,24 @@ test("adapter journals fake-master and wrong-wallet transfers only as rejected r
   });
 
   assert.equal(result.movementsObserved, 0);
-  assert.equal(result.transfersScanned, 0);
+  assert.equal(result.transfersScanned, 1);
   assert.equal(result.discoveryTransfersScanned, 2);
   assert.equal(result.rejectionsRecorded, 2);
-  assert.deepEqual(result.rejections.map(({ code }) => code), ["MASTER_MISMATCH", "WALLET_MISMATCH"]);
+  assert.deepEqual(
+    [...new Set(result.rejections.map(({ code }) => code))].sort(),
+    ["MASTER_MISMATCH", "WALLET_MISMATCH"],
+  );
   assert.equal(observed.length, 0);
   assert.equal(rejected.length, 2);
-  assert.equal(rejected[0]?.movement.jettonMasterAddress, fakeMasterRaw);
-  assert.equal(rejected[0]?.movement.jettonWalletAddress, fakeWalletRaw);
-  assert.equal(rejected[0]?.movement.rawPayload.untrustedJettonCandidate, true);
-  assert.equal(rejected[0]?.validationCode, "JETTON_MASTER_NOT_ALLOWLISTED");
-  assert.equal(rejected[0]?.reason, "UNSUPPORTED_JETTON_MASTER");
-  assert.equal(rejected[1]?.movement.jettonMasterAddress, masterRaw);
-  assert.equal(rejected[1]?.movement.jettonWalletAddress, wrongWalletRaw);
-  assert.equal(rejected[1]?.validationCode, "JETTON_WALLET_NOT_VERIFIED");
+  const fakeMasterRejection = rejected.find(({ reason }) => reason === "UNSUPPORTED_JETTON_MASTER");
+  assert.equal(fakeMasterRejection?.movement.jettonMasterAddress, fakeMasterRaw);
+  assert.equal(fakeMasterRejection?.movement.jettonWalletAddress, fakeWalletRaw);
+  assert.equal(fakeMasterRejection?.movement.rawPayload.untrustedJettonCandidate, true);
+  assert.equal(fakeMasterRejection?.validationCode, "JETTON_MASTER_NOT_ALLOWLISTED");
+  const wrongWalletRejection = rejected.find(({ reason }) => reason === "UNVERIFIED_JETTON_WALLET");
+  assert.equal(wrongWalletRejection?.movement.jettonMasterAddress, masterRaw);
+  assert.equal(wrongWalletRejection?.movement.jettonWalletAddress, wrongWalletRaw);
+  assert.equal(wrongWalletRejection?.validationCode, "JETTON_WALLET_NOT_VERIFIED");
 });
 
 test("adapter never overwrites a stored verified account with a different jetton wallet", async () => {

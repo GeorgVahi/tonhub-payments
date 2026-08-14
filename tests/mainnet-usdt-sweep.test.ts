@@ -234,7 +234,7 @@ test("TEP-74 body fixes opcode, deterministic uint64 query, amount and response 
   assert.equal(slice.remainingBits, 0);
 });
 
-test("low TON balance persists an exact merchant-funded top-up before broadcasting it", async () => {
+test("low TON balance includes a delivery margin in the merchant-funded top-up", async () => {
   const state = harness();
   const topups: Array<{ amountNano: bigint; seqno: number }> = [];
   const result = await processMainnetUsdtSweep({
@@ -252,9 +252,9 @@ test("low TON balance persists an exact merchant-funded top-up before broadcasti
     now: () => new Date("2026-08-13T12:00:00.000Z"),
   });
   assert.equal(result.status, "gas-topup-sent");
-  assert.deepEqual(topups, [{ amountNano: 110_000_000n, seqno: 19 }]);
+  assert.deepEqual(topups, [{ amountNano: 111_000_000n, seqno: 19 }]);
   assert.equal(state.current().status, "GAS_TOPUP_SENT");
-  assert.equal(state.current().gasTopupAmountNano, "110000000");
+  assert.equal(state.current().gasTopupAmountNano, "111000000");
   assert.equal(state.current().gasTopupSeqno, 19);
   assert.ok(state.events.indexOf("status:GAS_TOPUP_REQUIRED") < state.events.indexOf("status:GAS_TOPUP_SENT"));
 });
@@ -281,8 +281,37 @@ test("a persisted top-up plan is reduced if TON arrived before its seqno was bro
     now: () => new Date("2026-08-13T12:00:00.000Z"),
   });
   assert.equal(result.status, "gas-topup-sent");
-  assert.deepEqual(sent, [50_000_000n]);
-  assert.equal(state.current().gasTopupAmountNano, "50000000");
+  assert.deepEqual(sent, [51_000_000n]);
+  assert.equal(state.current().gasTopupAmountNano, "51000000");
+});
+
+test("an accepted top-up that lands below target replans the residual with a new seqno", async () => {
+  const initial = record("GAS_TOPUP_SENT");
+  initial.gasTopupAmountNano = "110000000";
+  initial.gasTopupSeqno = 25;
+  initial.gasServicePlanKey = `${config().gasServiceAddressRaw}:25`;
+  initial.attempts = 2;
+  const state = harness(initial);
+  const topups: Array<{ amountNano: bigint; seqno: number }> = [];
+  const result = await processMainnetUsdtSweep({
+    record: state.current(),
+    config: config(),
+    repository: state.repository,
+    blockchain: blockchain({
+      getTonBalance: async () => 149_999_998n,
+      getWalletSeqno: async (wallet) => wallet.address.equals(gasWallet.address) ? 26 : 7,
+      sendGasTopup: async ({ amountNano, seqno }) => {
+        topups.push({ amountNano, seqno });
+      },
+    }),
+    workerId: "worker-residual-topup",
+    now: () => new Date("2026-08-13T12:01:00.000Z"),
+  });
+  assert.equal(result.status, "gas-topup-sent");
+  assert.deepEqual(topups, [{ amountNano: 1_000_002n, seqno: 26 }]);
+  assert.equal(state.current().gasTopupAmountNano, "1000002");
+  assert.equal(state.current().gasTopupSeqno, 26);
+  assert.equal(state.current().gasServicePlanKey, `${config().gasServiceAddressRaw}:26`);
 });
 
 test("two sweeps in one batch cannot reuse a retained central gas-wallet seqno lease", async () => {
@@ -451,8 +480,8 @@ test("an unexpectedly expensive sweep repairs the TON reserve before marking CON
     now: () => new Date("2026-08-13T12:00:10.000Z"),
   });
   assert.equal(result.status, "confirmed");
-  assert.deepEqual(repairs, [30_000_000n]);
-  assert.equal(state.current().reserveTopupAmountNano, "30000000");
+  assert.deepEqual(repairs, [31_000_000n]);
+  assert.equal(state.current().reserveTopupAmountNano, "31000000");
   assert.equal(state.current().reserveTopupSeqno, 19);
   assert.equal(state.current().status, "CONFIRMED");
 });

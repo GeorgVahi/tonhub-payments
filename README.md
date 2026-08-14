@@ -128,7 +128,9 @@ extra operational wallet: its standard V5R1 address, derived from
 `TON_MAINNET_GAS_SERVICE_SECRET_KEY`, must exactly equal
 `TON_MAINNET_SWEEP_RECIPIENT_ADDRESS`. Keep this secret in the isolated sweep
 worker only. The gas service tops each deposit wallet up to 0.15 TON by default,
-the deposit attaches 0.05 TON to the TEP-74 transfer, requests a 1-nanoton
+adding a 0.001 TON delivery margin so storage or inbound-message fees cannot
+leave a first-deployment wallet a few nanotons below the operational target.
+The deposit attaches 0.05 TON to the TEP-74 transfer, requests a 1-nanoton
 notification, reserves another 0.05 TON as an explicit wallet-fee cushion, and
 is expected to retain at least 0.05 TON. These values are configurable, but the
 target must cover the transfer value, a positive fee cushion, and the reserve.
@@ -404,9 +406,14 @@ npm run worker:scan:jetton-testnet -- --deposit-id=<id> --not-before=<ISO date>
 
 Use `--not-after`, `--limit`, and `--offset` for a bounded historical page.
 The adapter follows TON Center's `/jetton/masters`, `/jetton/wallets`, and
-wallet-bound `/jetton/transfers` contracts. It correlates the official
-`/transactions` response by trace to verify the destination wallet and raw
-notification when present. Fake-master and malformed-transfer hardening rejects
+owner/master-bound `/jetton/transfers` contracts. TON Center's `jetton_wallet`
+filter identifies the sender wallet for inbound transfers, so it is not used as
+destination evidence. Instead, the adapter verifies the unique wallet derived
+from the deposit owner and master, and correlates `/transactions` by trace to
+verify the destination wallet and raw notification when present. The receiving
+owner transaction may abort when a first-deployment wallet has no code yet; the
+successful jetton transfer and its verified master/owner wallet remain the
+authoritative credit evidence. Fake-master and malformed-transfer hardening rejects
 aborted or malformed transfers, wrong master-to-wallet identity, and malformed
 raw notifications. A raw notification must have opcode `0x7362d09c` and matching
 query, amount, and sender facts. Symbol, name, image, and other token metadata

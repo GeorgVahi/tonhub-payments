@@ -49,6 +49,7 @@ const defaultDepositReserveNano = 50_000_000n;
 const defaultJettonTransferValueNano = 50_000_000n;
 const defaultWalletFeeCushionNano = 50_000_000n;
 const defaultForwardTonNano = 1n;
+const gasTopupDeliveryMarginNano = 1_000_000n;
 
 export type MainnetUsdtSweepConfig = {
   enabled: true;
@@ -866,6 +867,10 @@ function gasServicePlanKey(config: MainnetUsdtSweepConfig, seqno: number) {
   return `${config.gasServiceAddressRaw}:${seqno}`;
 }
 
+function gasTopupAmountForDeficit(deficit: bigint) {
+  return deficit > 0n ? deficit + gasTopupDeliveryMarginNano : 0n;
+}
+
 async function requiredTransition(
   repository: MainnetUsdtSweepRepository,
   record: MainnetUsdtSweepRecord,
@@ -936,13 +941,14 @@ async function sendPlannedTopup(input: {
     const currentDeficit = depositBalance < input.config.gasTargetNano
       ? input.config.gasTargetNano - depositBalance
       : 0n;
-    if (currentDeficit !== amountNano && currentDeficit > 0n) {
+    const currentTopupAmount = gasTopupAmountForDeficit(currentDeficit);
+    if (currentTopupAmount !== amountNano && currentDeficit > 0n) {
       current = await requiredTransition(
         input.repository,
         current,
         input.leaseOwner,
         ["GAS_TOPUP_REQUIRED"],
-        { gasTopupAmountNano: currentDeficit.toString() },
+        { gasTopupAmountNano: currentTopupAmount.toString() },
       );
     }
     if (currentDeficit === 0n) {
@@ -964,7 +970,7 @@ async function sendPlannedTopup(input: {
       wallet,
       secretKey: input.config.gasServiceSecretKey,
       destination: Address.parse(input.record.depositAddressRaw),
-      amountNano: currentDeficit,
+      amountNano: currentTopupAmount,
       seqno: plannedSeqno,
     });
   }
@@ -1081,7 +1087,9 @@ async function repairConfirmedReserve(input: {
       input.leaseOwner,
       ["SENT"],
       {
-        reserveTopupAmountNano: (input.config.depositReserveNano - input.currentBalance).toString(),
+        reserveTopupAmountNano: gasTopupAmountForDeficit(
+          input.config.depositReserveNano - input.currentBalance,
+        ).toString(),
         reserveTopupSeqno: plannedSeqno,
         gasServiceAddress: input.config.gasServiceAddressRaw,
         gasServicePlanKey: gasServicePlanKey(input.config, plannedSeqno),
@@ -1114,20 +1122,21 @@ async function repairConfirmedReserve(input: {
     return { ready: false, sent: false };
   }
   const deficit = input.config.depositReserveNano - currentBalance;
-  if (current.reserveTopupAmountNano !== deficit.toString()) {
+  const topupAmount = gasTopupAmountForDeficit(deficit);
+  if (current.reserveTopupAmountNano !== topupAmount.toString()) {
     current = await requiredTransition(
       input.repository,
       current,
       input.leaseOwner,
       ["SENT"],
-      { reserveTopupAmountNano: deficit.toString() },
+      { reserveTopupAmountNano: topupAmount.toString() },
     );
   }
   await input.blockchain.sendGasTopup({
     wallet: serviceWallet,
     secretKey: input.config.gasServiceSecretKey,
     destination: input.depositWallet.address,
-    amountNano: deficit,
+    amountNano: topupAmount,
     seqno: plannedSeqno,
   });
   await releaseIfAccepted({
@@ -1246,7 +1255,6 @@ async function advanceSweep(input: {
       if (current.attempts >= input.config.maxAttempts) {
         throw new SweepInvariantError("Gas top-up was accepted but the deposit balance never reached its target.");
       }
-      return { sweepId: current.id, status: "deferred" };
     }
   }
 
@@ -1259,7 +1267,7 @@ async function advanceSweep(input: {
   }
   const tonBalance = await input.blockchain.getTonBalance(depositWallet.address);
   if (tonBalance < input.config.gasTargetNano) {
-    const topupNano = input.config.gasTargetNano - tonBalance;
+    const topupNano = gasTopupAmountForDeficit(input.config.gasTargetNano - tonBalance);
     const serviceWallet = gasWallet(input.config);
     const signingOwner = signingLeaseOwner(input.leaseOwner, current, "gas");
     if (!await input.repository.acquireWalletLease({

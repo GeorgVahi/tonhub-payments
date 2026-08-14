@@ -372,7 +372,6 @@ function scanVerifiedJettonTransfers(input: {
     if (
       notificationEvidence &&
       (
-        notificationEvidence.transactionAborted !== false ||
         canonicalTonAddress(notificationEvidence.accountAddress) !== ownerAddress ||
         canonicalTonAddress(notificationEvidence.destinationAddress) !== ownerAddress ||
         !notificationWallet
@@ -824,7 +823,6 @@ export function createVerifiedJettonAdapter(
         path: "jetton/transfers",
         search: {
           owner_address: ownerAddressRaw,
-          jetton_wallet: assetWalletAddress,
           jetton_master: configuredMaster,
           direction: "in",
           start_utime: startUtime,
