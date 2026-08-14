@@ -251,6 +251,42 @@ test("mixed settlement expires an empty invoice only after exhausting on-chain c
   assert.deepEqual(testHarness.creditCalls, []);
 });
 
+test("an under-minimum payment expires in the background after its window without another movement", async () => {
+  const expiredAt = new Date("2026-08-13T10:20:00.000Z");
+  const testHarness = harness({ current: invoice({ expiresAt: expiredAt }) });
+  let selectedWhere: any = null;
+  const scheduledAttempts: Date[] = [];
+  const db = {
+    tonhubDepositAddress: {
+      findMany: async ({ where }: any) => {
+        selectedWhere = where;
+        return [{ id: "deposit-1", invoice: { id: "mixed-invoice" }, _count: { movements: 0 } }];
+      },
+      updateMany: async ({ data }: any) => {
+        if (data.settlementNextAttemptAt instanceof Date) {
+          scheduledAttempts.push(data.settlementNextAttemptAt);
+        }
+        return { count: 1 };
+      },
+    },
+  };
+
+  const result = await runMixedSettlementBatch({
+    db: db as any,
+    settlement: testHarness.service,
+    now,
+    limit: 1,
+  });
+
+  assert.equal(selectedWhere.OR[1].movements.some.status, "HELD_UNDER_MINIMUM");
+  assert.equal(selectedWhere.OR[1].invoice.is.partialPaymentExpiresAt, undefined);
+  assert.equal(selectedWhere.OR[1].invoice.is.OR[1].expiresAt.lte.toISOString(), now.toISOString());
+  assert.ok(scheduledAttempts[0] instanceof Date);
+  assert.equal(result.invoicesSettled, 1);
+  assert.equal(result.settled[0]?.invoice.status, "EXPIRED");
+  assert.equal(testHarness.expired(), 1);
+});
+
 test("mixed settlement leaves zero-threshold legacy attempts on the characterized rollback path", async () => {
   const testHarness = harness({
     current: invoice({ activationThresholdFiatMicros: "0" }),
@@ -366,7 +402,7 @@ test("mixed settlement worker rotates poison deposits so later invoices run on t
     tonhubDepositAddress: {
       findMany: async ({ take, where }: any) => {
         assert.equal(take, 2);
-        assert.ok(where.movements?.some);
+        assert.ok(where.OR[0].movements?.some);
         const dueAt = where.AND.OR[1].settlementNextAttemptAt.lte as Date;
         return deposits
           .filter(({ settlementNextAttemptAt }) =>
@@ -449,4 +485,43 @@ test("mixed settlement worker rotates poison deposits so later invoices run on t
   assert.equal(second.invoicesSelected, 1);
   assert.equal(second.invoicesSettled, 1);
   assert.deepEqual(second.errors, []);
+});
+
+test("background settlement schedules one thousand active attempts without browser polling", async () => {
+  const deposits = Array.from({ length: 1_000 }, (_, index) => ({
+    id: `load-deposit-${index}`,
+    invoice: { id: `load-invoice-${index}` },
+    _count: { movements: 1 },
+  }));
+  const settledIds: string[] = [];
+  const result = await runMixedSettlementBatch({
+    db: {
+      tonhubDepositAddress: {
+        findMany: async ({ take, where }: any) => {
+          assert.equal(take, 1_000);
+          assert.ok(where.OR[0].movements.some);
+          return deposits;
+        },
+        updateMany: async () => ({ count: 1 }),
+      },
+    } as any,
+    settlement: {
+      settleInvoice: async ({ invoiceId }: any) => {
+        settledIds.push(invoiceId);
+        return {
+          invoice: invoice({ id: invoiceId, status: "PAID" }),
+          outcomes: [],
+          ratePending: false,
+          deferred: false,
+        };
+      },
+    },
+    now,
+    limit: 1_000,
+  });
+
+  assert.equal(result.invoicesSelected, 1_000);
+  assert.equal(result.invoicesSettled, 1_000);
+  assert.equal(result.errors.length, 0);
+  assert.equal(new Set(settledIds).size, 1_000);
 });

@@ -12,10 +12,21 @@ const env = {
   TON_RATE_SNAPSHOT_MAX_AGE_SECONDS: "300",
 };
 
-function db(input: { orders?: any[]; rates?: Record<string, any>; migration?: boolean; failedWebhooks?: number } = {}) {
+function db(input: {
+  orders?: any[];
+  rates?: Record<string, any>;
+  migration?: boolean;
+  appliedMigrations?: string[];
+  failedWebhooks?: number;
+} = {}) {
   const now = new Date("2026-08-13T12:00:00.000Z");
   return {
-    $queryRawUnsafe: async () => input.migration === false ? [] : [{ finished_at: now, rolled_back_at: null }],
+    $queryRawUnsafe: async (_query: string, migrationName: string) => (
+      input.migration === false ||
+      (input.appliedMigrations && !input.appliedMigrations.includes(migrationName))
+        ? []
+        : [{ finished_at: now, rolled_back_at: null }]
+    ),
     tonhubRateSnapshot: {
       findFirst: async (query: any) => input.rates?.[`${query.where.asset}/${query.where.quoteCurrency}`] ?? {
         price: query.where.asset === "GRAM"
@@ -103,6 +114,20 @@ test("mainnet canary preflight requires the GRAM snapshots used by the alternate
   });
   assert.equal(report.ok, false);
   assert.ok(report.blockers.some((value) => value.includes("GRAM/USD")));
+});
+
+test("mainnet canary preflight rejects a database missing the latest operational migration", async () => {
+  const report = await inspectMainnetUsdtCanary({
+    db: db({
+      appliedMigrations: ["20260814103000_cumulative_held_and_sweep_policy"],
+    }) as any,
+    env,
+    now: new Date("2026-08-13T12:00:00.000Z"),
+  });
+
+  assert.equal(report.ok, false);
+  assert.ok(report.blockers.some((value) =>
+    value.includes("20260814105000_operational_payment_visibility")));
 });
 
 test("mainnet canary preflight blocks reviewed recovery and a recovery order until resolution", async () => {

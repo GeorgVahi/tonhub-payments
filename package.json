@@ -35,6 +35,7 @@
     "worker:settlement": "bun run worker/src/mixed-settlement-worker.ts",
     "worker:webhooks": "bun run worker/src/webhook-worker.ts",
     "canary:usdt-mainnet:status": "tsx scripts/check-mainnet-usdt-canary.ts",
+    "rollout:validate": "npm test && npm run typecheck && npm run build && prisma validate",
     "admin:hash-password": "tsx scripts/hash-admin-password.ts",
     "db:generate": "prisma generate",
     "db:migrate": "prisma migrate dev",

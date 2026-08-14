@@ -1822,6 +1822,39 @@ test("a movement after the active payment window is accounted only in recovery",
   assert.equal(memory.recoveryCases[0]?.reason, "LATE_MOVEMENT");
 });
 
+test("a payment made before TTL remains payable when scanners discover it after TTL", async () => {
+  const memory = createMemoryLedgerDb();
+  memory.rates.push({
+    id: "pre-expiry-rate-gram-usd",
+    asset: "GRAM",
+    baseCurrency: "GRAM",
+    quoteCurrency: "USD",
+    price: { toString: () => "2.5" },
+    source: "coingecko",
+    observedAt: new Date("2026-08-13T10:59:30.000Z"),
+    fetchedAt: new Date("2026-08-13T10:59:31.000Z"),
+    createdAt: new Date("2026-08-13T10:59:31.500Z"),
+  });
+  const ledger = createMovementLedger(memory.db);
+  const observed = await ledger.recordObserved(movement({
+    amountAtomic: "2000000000",
+    blockchainAt: new Date("2026-08-13T10:59:59.000Z"),
+  }));
+  const paid = await ledger.creditMovement({
+    movementId: observed.id,
+    orderId: "order-1",
+    invoiceId: "invoice-1",
+    validationCode: "NATIVE_INBOUND_V1",
+    maxRateAgeMs: 300_000,
+    settlementAt: new Date("2026-08-13T11:30:00.000Z"),
+  });
+
+  assert.equal(paid.outcome, "credited");
+  assert.equal(paid.order.status, "PAID");
+  assert.equal(memory.invoices[0].status, "PAID");
+  assert.equal(memory.recoveryCases.length, 0);
+});
+
 test("rate lookup never looks ahead, parks stale evidence, and can retry", async () => {
   const memory = createMemoryLedgerDb();
   memory.rates.splice(0, memory.rates.length, {

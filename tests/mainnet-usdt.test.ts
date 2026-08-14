@@ -589,3 +589,14 @@ test("mainnet USDT scheduler reserves terminal capacity for every supported batc
     /at least 2/,
   );
 });
+
+test("mainnet USDT scheduler stays bounded and fair across ten thousand due attempts", () => {
+  const active = Array.from({ length: 9_000 }, (_, index) => `active-${index}`);
+  const terminal = Array.from({ length: 1_000 }, (_, index) => `terminal-${index}`);
+  const scheduled = scheduleMainnetUsdtDueIds(active, terminal, 100).slice(0, 100);
+
+  assert.equal(scheduled.length, 100);
+  assert.equal(new Set(scheduled).size, 100);
+  assert.equal(scheduled.filter((id) => id.startsWith("active-")).length, 75);
+  assert.equal(scheduled.filter((id) => id.startsWith("terminal-")).length, 25);
+});

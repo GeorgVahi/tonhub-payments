@@ -365,6 +365,51 @@ test("GRAM shadow batch paginates until its cursor and records only newer succes
   assert.equal(harness.calls.complete[0].cursor.hash, "55".repeat(32));
 });
 
+test("GRAM shadow restart resumes from its persisted cursor without replaying a movement", async () => {
+  let storedCursor: GramShadowScanTarget["cursor"] = { hash: null, lt: null, timestamp: null };
+  const observed: string[] = [];
+  const repository: GramShadowScannerRepository = {
+    claimDueTargets: async ({ workerId }) => [{
+      ...target({ cursor: storedCursor }),
+      leaseOwner: workerId,
+    }],
+    renewLease: async () => true,
+    completeScan: async ({ cursor }) => {
+      if (cursor) storedCursor = cursor;
+      return true;
+    },
+    failScan: async () => true,
+  };
+  const run = (workerId: string) => runGramShadowScanBatch({
+    network: "testnet",
+    workerId,
+    repository,
+    ledger: {
+      recordObserved: async (movement) => {
+        observed.push(movement.fingerprint);
+      },
+    },
+    now: scanNow,
+    clock: () => scanNow,
+    pageSize: 10,
+    fetchTransactions: async () => ({ transactions: [transaction()] }),
+    resolveConfig: () => ({
+      network: "testnet",
+      baseUrl: "https://testnet.toncenter.com/api/v3",
+      address: destinationFriendly,
+      addressEnvName: "TON_TESTNET_ADDRESS",
+    }),
+  });
+
+  const first = await run("restart-worker-1");
+  const second = await run("restart-worker-2");
+
+  assert.equal(first.outcomes[0]?.movementsObserved, 1);
+  assert.equal(second.outcomes[0]?.movementsObserved, 0);
+  assert.deepEqual(observed, [`ton:testnet:native-in:${hashHex}:0`]);
+  assert.equal(storedCursor.hash, hashHex);
+});
+
 test("GRAM shadow batch keeps settlement untouched and releases a failed scan for retry", async () => {
   const harness = repositoryHarness();
   const settlement = {

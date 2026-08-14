@@ -72,10 +72,31 @@ export async function runMixedSettlementBatch(input: {
     ],
     blockchainAt: { lte: now },
   };
+  const expiredHeldPaymentWhere: Prisma.TonhubDepositAddressWhereInput = {
+    movements: {
+      some: {
+        direction: "INCOMING",
+        status: "HELD_UNDER_MINIMUM",
+        blockchainAt: { lte: now },
+      },
+    },
+    invoice: {
+      is: {
+        status: { in: ["PENDING", "PARTIAL"] },
+        OR: [
+          { partialPaymentExpiresAt: { lte: now } },
+          { partialPaymentExpiresAt: null, expiresAt: { lte: now } },
+        ],
+      },
+    },
+  };
   const deposits = await db.tonhubDepositAddress.findMany({
     where: {
       invoice: { is: { activationThresholdFiatMicros: { not: "0" } } },
-      movements: { some: eligibleMovementWhere },
+      OR: [
+        { movements: { some: eligibleMovementWhere } },
+        expiredHeldPaymentWhere,
+      ],
       AND: dueDepositWhere,
     },
     select: {

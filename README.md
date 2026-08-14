@@ -87,6 +87,11 @@ settlement, native sweep, USDT sweep, and webhook workers, then run:
 npm run canary:usdt-mainnet:status
 ```
 
+The complete migration order, automated evidence matrix, live-wallet canary,
+safe-stop procedure, and accepted residual risks are recorded in
+[`PRODUCTION_ROLLOUT.md`](./PRODUCTION_ROLLOUT.md). Treat that checklist as a
+release gate; automated tests do not replace the listed real-wallet transfers.
+
 The read-only command prints no keys or blockchain addresses and exits non-zero
 if the required migration or fresh USD/EUR snapshots are missing, public USDT
 was accidentally enabled, mainnet/ledger prerequisites are wrong, or an
